@@ -9,9 +9,22 @@ import argparse
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    import time
+
+    import pricer
     import watcher
 
-    watcher.run(once=args.once, dry_run=args.dry_run)
+    cfg = watcher.load_config()
+    w = watcher.Watcher(cfg, dry_run=args.dry_run)
+    p = pricer.Pricer(cfg, w.con, dry_run=args.dry_run)
+    interval = int(cfg["common"].get("poll_interval_sec", 30))
+    while True:
+        started = time.monotonic()
+        w.run_once()             # 시트 감시 → 상태(입력중/확정/기존건 …)
+        p.run_once(w.snapshots)  # 확정 행 단가 산출
+        if args.once:
+            return
+        time.sleep(max(0.0, interval - (time.monotonic() - started)))
 
 
 def cmd_import(args: argparse.Namespace) -> None:
