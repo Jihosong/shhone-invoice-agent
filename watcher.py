@@ -268,16 +268,17 @@ class Watcher:
                       legacy=False):
         """None = 사람이 처리(상태 비움).
 
-        작성자가 사람 값이면 기존건이어도 사람처리가 우선. '기존건-확인필요'는 작성자 빈칸인 기존건에만.
+        월말 일괄 거래처(skip_clients)는 작성자·기존건·완료/출고 여부와 무관하게 항상 '제외-월말일괄'.
+        그 외: 작성자가 사람 값이면 기존건이어도 사람처리가 우선. '기존건-확인필요'는 작성자 빈칸인 기존건에만.
         (작성자 AI인 기존건은 아래 일반 규칙 — 발행 후보 여부는 work_end_flipped_at으로 이미 막혀 있음)
         """
+        nclient = norm_text(client) or ""
+        if any(s and s in nclient for s in skip_clients):
+            return ST_SKIP
         if author and author != ai:
             return None
         if legacy and not author:
             return ST_LEGACY
-        nclient = norm_text(client) or ""
-        if any(s and s in nclient for s in skip_clients):
-            return ST_SKIP
         if status == ST_ISSUED:
             if changed:
                 logger.warning("sheet={} row={} client={} 발행후수정", label, rownum, client)

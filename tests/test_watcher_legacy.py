@@ -41,11 +41,11 @@ class FakeGC:
         return [self.ws]
 
 
-def make_watcher(rows):
+def make_watcher(rows, skip_clients=()):
     w = Watcher.__new__(Watcher)
     w.cfg = {"sheets": {"t": SCFG}}
     w.common = {"month_tab_pattern": r"^\d{1,2}월$", "quote_settle_min": 5, "author_ai_value": "AI",
-                "skip_clients": [], "status_values": STATUS_VALUES}
+                "skip_clients": list(skip_clients), "status_values": STATUS_VALUES}
     w.dry_run = False
     w.ws = FakeWS(rows)
     w.gc = FakeGC(w.ws)
@@ -152,3 +152,26 @@ def test_non_legacy_rows_unaffected(author):
     w = make_watcher([row("가", author=author)])
     snap = poll(w)
     assert not snap["가"]["legacy"] and snap["가"]["status"] == ST_TYPING
+
+
+@pytest.mark.parametrize("work_end,shipped,author", [
+    ("TRUE", "FALSE", ""),       # 기존건(작업완료) — 기존건-확인필요보다 우선
+    ("FALSE", "TRUE", ""),       # 기존건(출고완료)
+    ("TRUE", "TRUE", "팀장"),    # 사람 작성 기존건 — 사람처리보다 우선
+    ("FALSE", "FALSE", ""),      # 신규
+    ("FALSE", "FALSE", "AI"),
+])
+def test_skip_client_always_skipped(work_end, shipped, author):
+    w = make_watcher([row("월말상사", work_end=work_end, shipped=shipped, author=author)],
+                     skip_clients=["월말상사"])
+    snap = poll(w)
+    assert snap["월말상사"]["status"] == ST_SKIP
+    assert w.ws.values[1][5] == ST_SKIP
+
+
+def test_skip_client_stays_skipped_after_flip():
+    w = make_watcher([row("월말상사")], skip_clients=["월말상사"])
+    poll(w)
+    w.ws.values[1][2] = "TRUE"
+    snap = poll(w)
+    assert snap["월말상사"]["status"] == ST_SKIP
