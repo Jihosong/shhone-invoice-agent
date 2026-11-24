@@ -7,6 +7,8 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
 - 기존건 규칙: 처음 발견했을 때 이미 작업완료/출고완료가 TRUE인 행은 '기존건-확인필요'로
   고정(견적·발행 대상 아님). 알고 있던 행의 작업완료가 FALSE→TRUE로 바뀐 순간만
   work_end_flipped_at에 기록 → 발행 대상은 이 값이 있는 행뿐.
+  기존건 판정은 rows.legacy에 고정 저장하고, 시트 상태는 작성자 우선:
+  작성자가 사람 값이면 기존건이어도 상태를 비움(사람처리), 빈칸일 때만 '기존건-확인필요'.
 시트 쓰기는 탭당 batch_update 한 번으로 모은다.
 """
 from __future__ import annotations
@@ -46,7 +48,8 @@ CREATE TABLE IF NOT EXISTS rows(
   status TEXT, author TEXT, issued_at TEXT);
 """
 # 기존 DB에는 없을 수 있는 열 → 없으면 ALTER
-EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT"}
+EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT",
+                 "legacy": "INTEGER"}
 
 
 def ensure_columns(con: sqlite3.Connection) -> None:
@@ -193,7 +196,8 @@ class Watcher:
 
             # --- DB 갱신 ---
             rec = self.con.execute(
-                "SELECT fingerprint, last_change, status, work_end_state, work_end_flipped_at FROM rows WHERE row_id=?",
+                "SELECT fingerprint, last_change, status, work_end_state, work_end_flipped_at, legacy"
+                " FROM rows WHERE row_id=?",
                 (row_id,)).fetchone()
             if rec is None:
                 changed = False  # 최초 발견은 '변경'으로 보지 않음
@@ -205,11 +209,13 @@ class Watcher:
                     " VALUES(?,?,?,?,?,?,?,?,?)",
                     (row_id, key, ws.title, rownum, fp, now_iso(), now_iso(), status, author))
             else:
-                db_fp, db_last, db_status, prev_work_end, flipped_at = rec
+                db_fp, db_last, db_status, prev_work_end, flipped_at, db_legacy = rec
                 changed = db_fp != fp
                 last_change = now if changed else datetime.fromisoformat(db_last)
-                if db_status == ST_LEGACY:
-                    legacy = True  # 한 번 기존건이면 계속 (지문이 바뀌어도)
+                if db_legacy or db_status == ST_LEGACY:
+                    # 한 번 기존건이면 계속 (지문·작성자가 바뀌어도). 상태는 작성자에 따라 비어 있을 수
+                    # 있으므로 rows.legacy로 판정; status 비교는 legacy 열 도입 전 DB 호환용
+                    legacy = True
                 elif prev_work_end is None:
                     # 이 규칙 이전에 발견된 행: 이전 상태를 모르므로 최초 발견처럼 판정 (이미 발행된 건 제외)
                     legacy = db_status != ST_ISSUED and "TRUE" in (work_end, shipped)
@@ -226,15 +232,12 @@ class Watcher:
             if legacy:
                 flipped_at = None  # 기존건은 절대 발행 대상 아님
             self.con.execute(
-                "UPDATE rows SET work_end_state=?, shipped_state=?, work_end_flipped_at=? WHERE row_id=?",
-                (work_end, shipped, flipped_at, row_id))
+                "UPDATE rows SET work_end_state=?, shipped_state=?, work_end_flipped_at=?, legacy=? WHERE row_id=?",
+                (work_end, shipped, flipped_at, int(legacy), row_id))
 
             # --- 상태 결정 ---
-            if legacy:
-                new_status = ST_LEGACY
-            else:
-                new_status = self.decide_status(label, rownum, client, author, status, changed,
-                                                now - last_change, settle, ai, skip_clients)
+            new_status = self.decide_status(label, rownum, client, author, status, changed,
+                                            now - last_change, settle, ai, skip_clients, legacy=legacy)
             if new_status is None:  # 사람 처리
                 counts["사람처리"] += 1
                 new_status = ""
@@ -261,10 +264,17 @@ class Watcher:
             f" (dry-run, 미기록 쓰기 {len(updates)}건)" if self.dry_run else f" 쓰기={len(updates)}",
         )
 
-    def decide_status(self, label, rownum, client, author, status, changed, age, settle, ai, skip_clients):
-        """None = 사람이 처리(상태 비움)."""
+    def decide_status(self, label, rownum, client, author, status, changed, age, settle, ai, skip_clients,
+                      legacy=False):
+        """None = 사람이 처리(상태 비움).
+
+        작성자가 사람 값이면 기존건이어도 사람처리가 우선. '기존건-확인필요'는 작성자 빈칸인 기존건에만.
+        (작성자 AI인 기존건은 아래 일반 규칙 — 발행 후보 여부는 work_end_flipped_at으로 이미 막혀 있음)
+        """
         if author and author != ai:
             return None
+        if legacy and not author:
+            return ST_LEGACY
         nclient = norm_text(client) or ""
         if any(s and s in nclient for s in skip_clients):
             return ST_SKIP
