@@ -29,6 +29,13 @@ common:
     - 제외-월말일괄
     - 기존건-확인필요            # 최초 발견 시 이미 작업완료/출고완료 → 견적·발행 대상 아님
 
+# 묶음(block) 규칙 — 두 시트 공통 (watcher.py)
+#   날짜 칸이 있는 행 = 묶음 첫 행. 거래처는 이 행의 거래처 칸에서만 해석(거래처 마스터 최장 일치,
+#   ㈜/(주)/주식회사/공백 무시), 일치 뒤 남은 글자는 client_note.
+#   날짜 없는 행 = 바로 위 묶음의 이어지는 줄. 거래처 칸은 통째로 client_note.
+#   item_columns 중 하나라도 있으면 품목 행, 없으면 메모 행(건너뜀, 상태 비움).
+#   첫 행 작성자가 사람 → 묶음 전체 사람처리. 첫 행 거래처 미해석 → 묶음 전체 '보류-미등록'.
+
 sheets:
 
   imgagong:                       # 임가공 작업현황표
@@ -67,6 +74,7 @@ sheets:
       statement_no: 27            # AA 명세표번호
       row_id: 28                  # AB 행ID (에이전트가 최초 발견 시 기록)
     hash_columns: [client, main_msg, spec_qty, difficulty, stock_removal]
+    item_columns: [spec_qty, main_msg]   # 하나라도 있으면 품목 행, 없으면 메모 행
     issue_trigger: work_end
     spec_format_hint: 'Ø내경 공차 / 길이 × 수량  (예: Ø30 +0.0~+0.03 / 720 × 2개)'
 
@@ -100,7 +108,6 @@ sheets:
       statement_no: 21            # U 명세표번호
       row_id: 22                  # V 행ID
     hash_columns: [client, pipe_type, size, length, qty]
+    item_columns: [size, length, qty]    # 하나라도 있으면 품목 행, 없으면 메모 행
     issue_trigger: work_end
     price_table: data/price_table.xlsx
-    continuation_row_rule: >
-      날짜(A)가 비어 있고 회사(B)가 거래처 마스터에 없으면 윗 행의 메모로 취급하고 건너뜀.

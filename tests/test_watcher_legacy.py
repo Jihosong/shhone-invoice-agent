@@ -17,8 +17,8 @@ class FakeWS:
     title = "11월"
     index = 0
 
-    def __init__(self, rows):
-        self.values = [["날짜", "거래처", "작업완료", "출고완료", "작성자", "상태", "행ID"]] + rows
+    def __init__(self, rows, header=None):
+        self.values = [header or ["날짜", "거래처", "작업완료", "출고완료", "작성자", "상태", "행ID"]] + rows
 
     def get_all_values(self):
         return [list(r) for r in self.values]
@@ -41,16 +41,20 @@ class FakeGC:
         return [self.ws]
 
 
-def make_watcher(rows, skip_clients=()):
+def make_watcher(rows, skip_clients=(), clients=("가", "나", "다"), scfg=SCFG, header=None):
     w = Watcher.__new__(Watcher)
-    w.cfg = {"sheets": {"t": SCFG}}
+    w.cfg = {"sheets": {"t": scfg}}
     w.common = {"month_tab_pattern": r"^\d{1,2}월$", "quote_settle_min": 5, "author_ai_value": "AI",
                 "skip_clients": list(skip_clients), "status_values": STATUS_VALUES}
     w.dry_run = False
-    w.ws = FakeWS(rows)
+    w.ws = FakeWS(rows, header)
     w.gc = FakeGC(w.ws)
     w.con = sqlite3.connect(":memory:")
     ensure_columns(w.con)
+    w.con.execute("CREATE TABLE clients(name TEXT, reg_no TEXT, n_statements INTEGER, first_date TEXT,"
+                  " last_date TEXT)")
+    w.con.executemany("INSERT INTO clients(name, reg_no, n_statements) VALUES(?,?,?)",
+                      [c if isinstance(c, tuple) else (c, "", 1) for c in clients])
     w.snapshots = {}
     w.post_quote = set(STATUS_VALUES[STATUS_VALUES.index("견적완료"):]) - {ST_SKIP, ST_LEGACY}
     return w
