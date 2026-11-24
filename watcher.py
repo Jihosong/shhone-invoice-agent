@@ -4,6 +4,9 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
 - 행 지문(hash_columns)으로 변경을 감지해 SQLite rows 테이블에 기록
 - 비어 있는 row_id 칸에 ID 부여
 - 상태 열(입력중/확정/제외-월말일괄 …) 갱신
+- 기존건 규칙: 처음 발견했을 때 이미 작업완료/출고완료가 TRUE인 행은 '기존건-확인필요'로
+  고정(견적·발행 대상 아님). 알고 있던 행의 작업완료가 FALSE→TRUE로 바뀐 순간만
+  work_end_flipped_at에 기록 → 발행 대상은 이 값이 있는 행뿐.
 시트 쓰기는 탭당 batch_update 한 번으로 모은다.
 """
 from __future__ import annotations
@@ -33,6 +36,7 @@ ST_CONFIRMED = "확정"
 ST_QUOTED = "견적완료"
 ST_ISSUED = "AI발행"
 ST_SKIP = "제외-월말일괄"
+ST_LEGACY = "기존건-확인필요"
 ROW_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 SCHEMA = """
@@ -41,6 +45,22 @@ CREATE TABLE IF NOT EXISTS rows(
   fingerprint TEXT, first_seen TEXT, last_change TEXT,
   status TEXT, author TEXT, issued_at TEXT);
 """
+# 기존 DB에는 없을 수 있는 열 → 없으면 ALTER
+EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT"}
+
+
+def ensure_columns(con: sqlite3.Connection) -> None:
+    con.executescript(SCHEMA)
+    have = {r[1] for r in con.execute("PRAGMA table_info(rows)")}
+    for name, typ in EXTRA_COLUMNS.items():
+        if name not in have:
+            con.execute(f"ALTER TABLE rows ADD COLUMN {name} {typ}")
+    con.commit()
+
+
+def bool_state(value: str) -> str:
+    """체크박스 셀 값 → 'TRUE'/'FALSE'."""
+    return "TRUE" if value.strip().upper() == "TRUE" else "FALSE"
 
 
 def load_config(path: Path = SHEETS_YAML) -> dict:
@@ -83,10 +103,13 @@ class Watcher:
         self.gc = gspread.service_account(filename=self.common["credentials_file"])
         Path(settings.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
         self.con = sqlite3.connect(settings.DB_PATH)
-        self.con.executescript(SCHEMA)
+        ensure_columns(self.con)
+        # 시트별 마지막 바퀴 결과 (pricer 등 후속 단계가 사용)
+        self.snapshots: dict[str, dict] = {}
         st = self.common["status_values"]
         # '견적완료' 이후 단계로 보는 상태들 (제외는 별도 규칙)
-        self.post_quote = set(st[st.index(ST_QUOTED):]) - {ST_SKIP}
+        # 기존건은 시트 값이 아니라 DB(rows.status)로만 판정한다
+        self.post_quote = set(st[st.index(ST_QUOTED):]) - {ST_SKIP, ST_LEGACY}
 
     # ------------------------------------------------------------------
     def run_once(self) -> None:
@@ -130,6 +153,8 @@ class Watcher:
         updates: list[dict] = []
         counts = Counter()
         seen_ids: set[str] = set()
+        snap_rows: list[dict] = []
+        self.snapshots[key] = {"ws": ws, "values": values, "rows": snap_rows, "label": label}
 
         def cell(row: list[str], name: str) -> str:
             return row[cols[name] - 1].strip()
@@ -163,25 +188,53 @@ class Watcher:
                 set_cell(rownum, "row_id", row_id)
             seen_ids.add(row_id)
 
+            work_end = bool_state(cell(row, "work_end")) if "work_end" in cols else "FALSE"
+            shipped = bool_state(cell(row, "shipped")) if "shipped" in cols else "FALSE"
+
             # --- DB 갱신 ---
-            rec = self.con.execute("SELECT fingerprint, last_change FROM rows WHERE row_id=?", (row_id,)).fetchone()
+            rec = self.con.execute(
+                "SELECT fingerprint, last_change, status, work_end_state, work_end_flipped_at FROM rows WHERE row_id=?",
+                (row_id,)).fetchone()
             if rec is None:
                 changed = False  # 최초 발견은 '변경'으로 보지 않음
                 last_change = now
+                legacy = "TRUE" in (work_end, shipped)
+                flipped_at = None
                 self.con.execute(
                     "INSERT INTO rows(row_id, sheet, tab, row_number, fingerprint, first_seen, last_change, status, author)"
                     " VALUES(?,?,?,?,?,?,?,?,?)",
                     (row_id, key, ws.title, rownum, fp, now_iso(), now_iso(), status, author))
             else:
-                changed = rec[0] != fp
-                last_change = now if changed else datetime.fromisoformat(rec[1])
+                db_fp, db_last, db_status, prev_work_end, flipped_at = rec
+                changed = db_fp != fp
+                last_change = now if changed else datetime.fromisoformat(db_last)
+                if db_status == ST_LEGACY:
+                    legacy = True  # 한 번 기존건이면 계속 (지문이 바뀌어도)
+                elif prev_work_end is None:
+                    # 이 규칙 이전에 발견된 행: 이전 상태를 모르므로 최초 발견처럼 판정 (이미 발행된 건 제외)
+                    legacy = db_status != ST_ISSUED and "TRUE" in (work_end, shipped)
+                else:
+                    legacy = False
+                    if prev_work_end == "FALSE" and work_end == "TRUE":
+                        flipped_at = now_iso()
+                        logger.info("sheet={} row={} client={} 작업완료 체크 → 발행 후보", label, rownum, client)
+                    elif work_end == "FALSE" and flipped_at and db_status != ST_ISSUED:
+                        flipped_at = None  # 체크 해제 → 발행 후보에서 빠짐
                 self.con.execute(
                     "UPDATE rows SET sheet=?, tab=?, row_number=?, fingerprint=?, last_change=?, author=? WHERE row_id=?",
                     (key, ws.title, rownum, fp, last_change.isoformat(timespec="seconds"), author, row_id))
+            if legacy:
+                flipped_at = None  # 기존건은 절대 발행 대상 아님
+            self.con.execute(
+                "UPDATE rows SET work_end_state=?, shipped_state=?, work_end_flipped_at=? WHERE row_id=?",
+                (work_end, shipped, flipped_at, row_id))
 
             # --- 상태 결정 ---
-            new_status = self.decide_status(label, rownum, client, author, status, changed,
-                                            now - last_change, settle, ai, skip_clients)
+            if legacy:
+                new_status = ST_LEGACY
+            else:
+                new_status = self.decide_status(label, rownum, client, author, status, changed,
+                                                now - last_change, settle, ai, skip_clients)
             if new_status is None:  # 사람 처리
                 counts["사람처리"] += 1
                 new_status = ""
@@ -192,6 +245,8 @@ class Watcher:
             if new_status != status:
                 set_cell(rownum, "status", new_status)
             self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, row_id))
+            snap_rows.append({"rownum": rownum, "row_id": row_id, "row": row, "status": new_status,
+                              "author": author, "legacy": legacy, "work_end_flipped_at": flipped_at})
 
         if updates and not self.dry_run:
             ws.batch_update(updates, value_input_option="RAW")
