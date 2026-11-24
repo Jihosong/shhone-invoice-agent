@@ -1,0 +1,16 @@
+gspread
+google-auth
+anthropic
+pandas
+openpyxl
+xlrd
+pyyaml
+pydantic-settings
+python-dotenv
+apscheduler
+pyautogui
+mss
+pyperclip
+pywinauto
+loguru
+requests

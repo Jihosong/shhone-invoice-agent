@@ -1,0 +1,105 @@
+# shhone-invoice-agent — 시트 설정 (config/sheets.yaml)
+# 열은 A=1 기준 숫자. 헤더/데이터 시작행, 월 탭 규칙, 에이전트 전용 열을 여기서만 관리한다.
+# 시트 구조가 바뀌면 코드가 아니라 이 파일만 고친다.
+
+common:
+  credentials_file: C:/dev/secrets/gcp-service-account.json
+  poll_interval_sec: 30
+  quote_settle_min: 5            # 마지막 수정 후 N분 무변화 → 가견적
+  active_tab_rule: leftmost_month   # 가장 왼쪽의 "N월" 탭 하나만 감시
+  month_tab_pattern: '^\d{1,2}월$'
+  author_ai_value: AI            # 작성자 칸에 에이전트가 쓰는 값
+  skip_clients:                  # 월말 일괄 처리 거래처 → 에이전트 제외 (상태: 제외-월말일괄)
+    - 대성연마
+    - 삼화연마
+    - 한국유압
+    - 한국하이드로릭
+    - 영성기공
+  status_values:
+    - 입력중
+    - 확정
+    - 견적완료
+    - 견적확인필요
+    - 발행대기
+    - 진행중
+    - AI발행
+    - 보류-동명
+    - 보류-미등록
+    - 보류-화면이상
+    - 제외-월말일괄
+
+sheets:
+
+  imgagong:                       # 임가공 작업현황표
+    spreadsheet_id: 1dovejbcRaBFha0ywtrGfwzig74caFzAs1ExUmLQReWU
+    kind: job                     # 견적 엔진: DB 사례 + 규칙 + AI
+    header_rows: 2                # 1행 인니어, 2행 한국어
+    data_start_row: 3
+    client_master_tab: 거래처번호   # (거래처명, 연락처) — 참고용
+    columns:
+      date: 1                     # A 날짜 (텍스트 '8/20', 연도 없음)
+      client: 2                   # B 거래처
+      photo: 3                    # C 물품사진 (셀 내 이미지, v1 미사용)
+      main_msg: 4                 # D 주요 메시지
+      spec_qty: 5                 # E 공차x갯수, 조도
+      difficulty: 6               # F 난이도
+      operator: 7                 # G 작업자
+      stock_removal: 8            # H 연마량/치대 (드롭다운, 비면 일반)
+      work_start: 9               # I 작업시작
+      work_end: 10                # J 작업완료  <- 발행 트리거
+      inspect_done: 11            # K 검수완료
+      inspector: 12               # L 검수자
+      client_phone: 13            # M 거래처 연락처
+      client_sms: 14              # N 거래처 문자 알림
+      author: 15                  # O 거래명세표 (작성자 드롭다운: 사장/팀장/…/AI) <- 잠금
+      shipped: 16                 # P 출고완료
+      sms_status: 17              # Q
+      sms_time: 18                # R
+      pre_note: 19                # S 호닝 전 매니저 노트
+      post_size: 20               # T 호닝 후 치수
+      post_note: 21               # U 호닝 후 매니저 노트
+      work_start_time: 22         # V
+      work_duration: 23           # W
+      status: 24                  # X 상태
+      unit_price: 25              # Y 단가 (원 단위 정수)
+      basis: 26                   # Z 산출근거
+      statement_no: 27            # AA 명세표번호
+      row_id: 28                  # AB 행ID (에이전트가 최초 발견 시 기록)
+    hash_columns: [client, main_msg, spec_qty, difficulty, stock_removal]
+    issue_trigger: work_end
+    spec_format_hint: 'Ø내경 공차 / 길이 × 수량  (예: Ø30 +0.0~+0.03 / 720 × 2개)'
+
+  pipe:                           # 호닝파이프 작업현황표
+    spreadsheet_id: 1NgKVHX2aJyE4yMB2QQmpFZpYuyGm7Y_Y6ZeB1rmNwDk
+    kind: pipe                    # 견적 엔진: 단가표 결정적 계산
+    header_rows: 1
+    data_start_row: 2
+    ignore_tabs: [재고, 재고현황]
+    columns:
+      date: 1                     # A 날짜
+      client: 2                   # B 회사
+      pipe_type: 3                # C H.P/소관 (비어 있으면 견적확인필요)
+      size: 4                     # D 규격 (I.D/O.D) '45x55'
+      length: 5                   # E 길이 (mm)
+      qty: 6                      # F 갯수 '144개'
+      work_end: 7                 # G 작업완료  <- 발행 트리거
+      shipped: 8                  # H 출고완료
+      author: 9                   # I 거래명세표 (작성자 드롭다운) <- 잠금
+      worker_sms: 10              # J
+      client_phone: 11            # K
+      client_sms: 12              # L
+      note1: 13                   # M 비고1
+      note2: 14                   # N 비고2
+      sms_status: 15              # O
+      sms_time: 16                # P
+      month_end_toggle: 17        # Q (Q1 = 월말 일괄 토글, 데이터 행에선 미사용)
+      status: 18                  # R 상태
+      unit_price: 19              # S 단가
+      basis: 20                   # T 산출근거
+      statement_no: 21            # U 명세표번호
+      row_id: 22                  # V 행ID
+    hash_columns: [client, pipe_type, size, length, qty]
+    issue_trigger: work_end
+    price_table: data/price_table.xlsx
+    continuation_row_rule: >
+      날짜(A)가 비어 있고 회사(B)가 거래처 마스터에 없으면 윗 행의 메모로 취급하고 건너뜀.

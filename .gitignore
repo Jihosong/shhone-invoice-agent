@@ -1,0 +1,10 @@
+.env
+data/agent.db
+data/import/*
+!data/import/.gitkeep
+data/screenshots/*
+!data/screenshots/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+secrets/
