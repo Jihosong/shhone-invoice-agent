@@ -8,3 +8,4 @@ __pycache__/
 *.pyc
 .venv/
 secrets/
+data/거래내역_마스터.xlsx
