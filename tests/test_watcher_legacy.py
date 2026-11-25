@@ -53,8 +53,9 @@ def make_watcher(rows, skip_clients=(), clients=("가", "나", "다"), scfg=SCFG
     ensure_columns(w.con)
     w.con.execute("CREATE TABLE clients(name TEXT, reg_no TEXT, n_statements INTEGER, first_date TEXT,"
                   " last_date TEXT)")
-    w.con.executemany("INSERT INTO clients(name, reg_no, n_statements) VALUES(?,?,?)",
-                      [c if isinstance(c, tuple) else (c, "", 1) for c in clients])
+    # 거래처: 이름 | (이름, 번호, 명세표수) | (이름, 번호, 명세표수, 최근거래일)
+    w.con.executemany("INSERT INTO clients(name, reg_no, n_statements, last_date) VALUES(?,?,?,?)",
+                      [(c + (None,))[:4] if isinstance(c, tuple) else (c, "", 1, None) for c in clients])
     w.snapshots = {}
     w.post_quote = set(STATUS_VALUES[STATUS_VALUES.index("견적완료"):]) - {ST_SKIP, ST_LEGACY}
     return w

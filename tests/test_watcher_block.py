@@ -1,4 +1,6 @@
 """묶음(block) 규칙: 날짜 열로 묶음 판정, 첫 행에서만 거래처 해석 (파이프 시트 모양으로 구동)."""
+from datetime import date, timedelta
+
 import pytest
 
 from tests.test_watcher_legacy import make_watcher
@@ -10,9 +12,11 @@ COLS = {"date": 1, "client": 2, "size": 3, "length": 4, "qty": 5, "work_end": 6,
 SCFG = {"spreadsheet_id": "x", "label": "파이프", "data_start_row": 2, "columns": COLS,
         "hash_columns": ["client", "size", "length", "qty"], "item_columns": ["size", "length", "qty"]}
 HEADER = ["날짜", "회사", "규격", "길이", "갯수", "작업완료", "출고완료", "작성자", "상태", "행ID"]
+RECENT = (date.today() - timedelta(days=30)).isoformat()
 SKIP = ["대성연마", "삼화연마", "한국유압", "한국하이드로릭", "영성기공"]
 MASTER = [("영성기공", "1", 5), ("영성정밀", "2", 5), ("오성기계공구", "3", 4),
-          ("(주)대양상사", "134-81-32293", 15), ("대양상사", "127-14-79906", 2),
+          # 정규화 키가 같은 두 등록 → 최근 12개월 거래가 있는 (주)대양상사로 확정
+          ("(주)대양상사", "134-81-32293", 15, RECENT), ("대양상사", "127-14-79906", 2, "2023-12-01"),
           ("주식회사 대성정밀", "4", 3), ("대성ENG", "5", 1)]
 
 
@@ -103,5 +107,5 @@ def test_human_author_on_first_row_covers_block():
     ("대성", None, "대성"),
 ])
 def test_master_longest_match(text, name, note):
-    m = ClientMaster([(n, w) for n, _, w in MASTER])
+    m = ClientMaster([(n, w) for n, _, w, *_ in MASTER])
     assert m.resolve(text) == (name, note)

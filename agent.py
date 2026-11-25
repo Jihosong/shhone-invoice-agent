@@ -4,6 +4,9 @@
     python agent.py run         # 시트 감시 → 단가 산출 → 거래명세표 발행 루프
     python agent.py import <거래명세표목록.xls> <품목별판매현황.xls>  # 경리나라 내려받기 → DB 적재
     python agent.py blocks      # 현재 월 탭의 묶음 목록 출력 (dry-run, 시트 수정 없음)
+    python agent.py aliases check     # config/client_aliases.yaml 검사 (틀린 줄 표시)
+    python agent.py aliases suggest   # 시트의 미해석 거래처 → 마스터 후보 (yaml 주석 형식)
+    python agent.py clients find <검색어>  # 마스터 이름 부분일치: 정식명/사업자번호/최근거래/올해 건수
     python agent.py calibrate   # 화면 좌표/비전 보정
 """
 import argparse
@@ -74,6 +77,49 @@ def cmd_blocks(args: argparse.Namespace) -> None:
             print("  " + line)
 
 
+def _db():
+    import sqlite3
+
+    from config.settings import settings
+
+    return sqlite3.connect(settings.DB_PATH)
+
+
+def cmd_aliases_check(args: argparse.Namespace) -> None:
+    import sys
+    from pathlib import Path
+
+    import clients_cli
+    import watcher
+
+    path = Path(args.file) if args.file else watcher.ALIASES_YAML
+    if not path.exists():
+        sys.exit(f"{path} 없음")
+    problems = clients_cli.check_aliases(path, _db())
+    for line, level, msg in problems:
+        print(f"{path.name}:{line}  [{level}] {msg}")
+    n_err = sum(1 for _, level, _ in problems if level == "오류")
+    print(f"검사 끝: 오류 {n_err}, 경고·안내 {len(problems) - n_err}")
+    sys.exit(1 if n_err else 0)
+
+
+def cmd_aliases_suggest(args: argparse.Namespace) -> None:
+    import clients_cli
+
+    texts = args.text or clients_cli.unresolved_from_sheets()
+    con = _db()
+    for t in texts:
+        print(clients_cli.suggestion_line(con, t))
+
+
+def cmd_clients_find(args: argparse.Namespace) -> None:
+    from datetime import date
+
+    import clients_cli
+
+    clients_cli.print_find(_db(), " ".join(args.query), args.year or str(date.today().year))
+
+
 def cmd_calibrate(args: argparse.Namespace) -> None:
     print("calibrate: TODO")
 
@@ -90,6 +136,18 @@ def main() -> None:
     p_imp.add_argument("lines", help="품목별판매현황 (.xls)")
     p_imp.set_defaults(func=cmd_import)
     sub.add_parser("blocks", help="현재 월 탭 묶음 목록 출력 (dry-run)").set_defaults(func=cmd_blocks)
+    p_al = sub.add_parser("aliases", help="거래처 별칭표").add_subparsers(dest="aliases_cmd", required=True)
+    p_chk = p_al.add_parser("check", help="client_aliases.yaml 검사")
+    p_chk.add_argument("--file", help="검사할 yaml (기본 config/client_aliases.yaml)")
+    p_chk.set_defaults(func=cmd_aliases_check)
+    p_sug = p_al.add_parser("suggest", help="미해석 거래처 후보 (기본: 두 시트 활성 탭에서 수집)")
+    p_sug.add_argument("text", nargs="*", help="직접 줄 시트 표기 (없으면 시트에서 수집)")
+    p_sug.set_defaults(func=cmd_aliases_suggest)
+    p_cl = sub.add_parser("clients", help="거래처 마스터").add_subparsers(dest="clients_cmd", required=True)
+    p_find = p_cl.add_parser("find", help="이름 부분일치 검색")
+    p_find.add_argument("query", nargs="+")
+    p_find.add_argument("--year", help="건수 집계 연도 (기본 올해)")
+    p_find.set_defaults(func=cmd_clients_find)
     sub.add_parser("calibrate", help="화면 좌표/비전 보정").set_defaults(func=cmd_calibrate)
     args = parser.parse_args()
     args.func(args)
