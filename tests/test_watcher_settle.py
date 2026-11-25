@@ -5,7 +5,8 @@ from decimal import Decimal
 from agent import format_blocks
 from pricer import ST_QUOTED, PriceEntry, Pricer
 from tests.test_watcher_legacy import make_watcher
-from watcher import ST_CONFIRMED, ST_ISSUED, ST_SKIP, ST_TYPING, ST_UNREG, strip_block_tag, with_block_tag
+from watcher import (ST_CONFIRMED, ST_HOMONYM, ST_ISSUED, ST_SCREEN, ST_SKIP, ST_TYPING, ST_UNREG, strip_block_tag,
+                     with_block_tag)
 
 # A 날짜, B 회사, C 구분, D 규격, E 길이, F 갯수, G 작업완료, H 출고완료, I 작성자, J 상태, K 단가, L 산출근거, M 행ID
 COLS = {"date": 1, "client": 2, "pipe_type": 3, "size": 4, "length": 5, "qty": 6, "work_end": 7, "shipped": 8,
@@ -26,7 +27,7 @@ BLOCK3 = [r("11/25", "선기산업"), r("", "", "50x60"), r("", "", "60x70")]
 
 def make(rows):
     w = make_watcher(rows, skip_clients=["영성기공"], clients=MASTER, scfg=SCFG, header=HEADER)
-    w.post_quote |= {"보류-동명", "보류-화면이상"}  # 실제 sheets.yaml status_values처럼 견적 이후 단계
+    w.post_quote |= {ST_SCREEN}  # 실제 sheets.yaml status_values처럼 견적 이후 단계 (보류-동명은 매 바퀴 재검사)
     return w
 
 
@@ -136,20 +137,100 @@ def test_unregistered_block_all_held():
 
 
 def test_one_held_row_holds_whole_block():
-    """후속 단계가 한 행에 보류-동명을 달면 나머지 행도 같은 보류 (확정·견적으로 넘어가지 않음)."""
+    """후속 단계가 한 행에 보류-화면이상을 달면 나머지 행도 같은 보류 (확정·견적으로 넘어가지 않음)."""
     w = settled_block()
-    w.ws.values[2][C["status"]] = "보류-동명"
+    w.ws.values[2][C["status"]] = ST_SCREEN
     poll(w)
-    assert statuses(w) == ["보류-동명"] * 3
+    assert statuses(w) == [ST_SCREEN] * 3
+    poll(w)
+    assert statuses(w) == [ST_SCREEN] * 3  # 사람이 손대기 전까지 유지
 
 
 def test_hold_does_not_override_human_or_skip():
-    w = make([r("11/25", "선기산업"), r("", "", "50x60", author="팀장"), r("", "", "60x70", status="보류-동명")])
+    w = make([r("11/25", "선기산업"), r("", "", "50x60", author="팀장"), r("", "", "60x70", status=ST_SCREEN)])
     poll(w)
-    assert statuses(w) == ["보류-동명", "", "보류-동명"]
-    w2 = make([r("11/25", "영성기공"), r("", "", "50x60", status="보류-동명")])
+    assert statuses(w) == [ST_SCREEN, "", ST_SCREEN]
+    w2 = make([r("11/25", "영성기공"), r("", "", "50x60", status=ST_SCREEN)])
     poll(w2)
     assert statuses(w2, (2, 3)) == [ST_SKIP, ST_SKIP]
+
+
+# ---------------------------------------------------------------- 보류 해제
+def add_client(w, name, reg_no):
+    w.con.execute("INSERT INTO clients(name, reg_no, n_statements) VALUES(?,?,1)", (name, reg_no))
+
+
+def test_homonym_block_held_and_auto_released():
+    w = settled_block()
+    add_client(w, "선기산업", "999-99-99999")  # 같은 이름, 다른 사업자번호 → 동명
+    poll(w)
+    assert statuses(w) == [ST_HOMONYM] * 3
+    age_all(w)
+    poll(w)
+    assert statuses(w) == [ST_HOMONYM] * 3  # 시간이 지나도 확정 안 됨
+    w.con.execute("DELETE FROM clients WHERE reg_no='999-99-99999'")  # 마스터 정리 → 다음 폴링에 자동 해제
+    poll(w)
+    assert statuses(w) == [ST_CONFIRMED] * 3
+
+
+def test_homonym_same_reg_no_twice_is_not_homonym():
+    w = make([list(x) for x in BLOCK3])
+    add_client(w, "선기산업", "1")
+    poll(w)
+    assert statuses(w) == [ST_TYPING] * 3
+
+
+def test_stale_homonym_status_on_sheet_released():
+    """동명 조건이 없는데 시트에 보류-동명이 남아 있으면 (예: 예전 판정) 다음 폴링에 풀림."""
+    w = settled_block()
+    w.ws.values[2][C["status"]] = ST_HOMONYM
+    poll(w)
+    assert statuses(w) == [ST_CONFIRMED] * 3
+
+
+def test_homonym_beats_screen_priority():
+    w = make([r("11/25", "선기산업"), r("", "", "50x60", status=ST_SCREEN)])
+    add_client(w, "선기산업", "999")
+    poll(w)
+    assert statuses(w, (2, 3)) == [ST_HOMONYM, ST_HOMONYM]  # 동명 > 화면이상
+
+
+def screen_held_block():
+    w = settled_block()
+    w.ws.values[1][C["status"]] = ST_SCREEN
+    poll(w)
+    assert statuses(w) == [ST_SCREEN] * 3
+    return w
+
+
+def test_screen_hold_released_when_any_row_cleared():
+    w = screen_held_block()
+    w.ws.values[3][C["status"]] = ""  # 사람이 3번째 행 상태 칸만 비움
+    poll(w)
+    assert statuses(w) == [ST_CONFIRMED] * 3  # 묶음 전체 재평가 (5분 지났으므로 함께 확정)
+
+
+def test_screen_hold_cleared_recent_edit_goes_typing():
+    w = screen_held_block()
+    w.ws.values[2][C["status"]] = ""
+    w.ws.values[2][C["length"]] = "1500"  # 비우면서 내용도 고침
+    poll(w)
+    assert statuses(w) == [ST_TYPING] * 3
+
+
+def test_screen_hold_not_released_by_other_value():
+    w = screen_held_block()
+    w.ws.values[3][C["status"]] = ST_CONFIRMED  # 비운 게 아님 → 해제 아님
+    poll(w)
+    assert statuses(w) == [ST_SCREEN] * 3
+
+
+def test_screen_hold_release_still_respects_homonym():
+    w = screen_held_block()
+    add_client(w, "선기산업", "999")
+    w.ws.values[2][C["status"]] = ""
+    poll(w)
+    assert statuses(w) == [ST_HOMONYM] * 3
 
 
 # ---------------------------------------------------------------- 산출근거 묶음 표시
@@ -166,6 +247,18 @@ def test_block_tag_written_to_basis():
     w.ws.values.insert(2, r("", "", "80x90"))
     poll(w)
     assert w.ws.values[5][C["basis"]] == "[선기산업(TEST) 11/25 4/4] 사람 메모"
+
+
+def test_block_tag_not_written_to_human_or_skip_rows():
+    w = make([r("11/25", "선기산업", basis="사람 근거"), r("", "", "50x60", author="팀장", basis="팀장 메모"),
+              r("", "", "60x70"),
+              r("11/25", "영성기공", basis="월말 메모"), r("", "", "50x60"),
+              r("11/26", "오성기계공구", author="사장"), r("", "", "50x60", basis="[예전 11/1 1/1] 그대로")])
+    snap = poll(w)
+    basis = [w.ws.values[n - 1][C["basis"]] for n in range(2, 9)]
+    assert basis == ["[선기산업 11/25 1/3] 사람 근거", "팀장 메모", "[선기산업 11/25 3/3]",
+                     "월말 메모", "", "", "[예전 11/1 1/1] 그대로"]
+    assert snap[3]["block_tag"] == "[선기산업 11/25 2/3]"  # blocks 출력·순번은 그대로
 
 
 def test_block_tag_helpers():

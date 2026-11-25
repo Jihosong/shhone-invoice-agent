@@ -20,7 +20,10 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   quote_settle_min이 안 지났으면 묶음 전체 '입력중', 지났으면 묶음 전체 함께 '확정'.
   한 행이라도 바뀌면(알던 묶음에 행이 추가돼도) 견적 이후 단계 행까지 묶음 전체가 다시 입력중.
   보류-* 행이 하나라도 있으면 제외·사람처리·AI발행 행을 뺀 묶음 전체를 같은 보류로.
-  산출근거 칸 맨 앞에 "[거래처(비고) 날짜 n/총줄수]" 묶음 표시 (품목 행 기준 순번).
+  보류-미등록·보류-동명(같은 이름에 사업자번호 둘 이상)은 매 바퀴 재검사 → 풀리면 자동 해제.
+  보류-화면이상은 유지, 사람이 묶음 안 아무 행의 상태 칸을 비우면 묶음 전체 재평가.
+  산출근거 칸 맨 앞에 "[거래처(비고) 날짜 n/총줄수]" 묶음 표시 (품목 행 기준 순번) —
+  에이전트가 처리하는 행에만 (사람처리·제외-월말일괄 행은 안 건드림).
 시트 쓰기는 탭당 batch_update 한 번으로 모은다.
 """
 from __future__ import annotations
@@ -53,6 +56,8 @@ ST_ISSUED = "AI발행"
 ST_SKIP = "제외-월말일괄"
 ST_LEGACY = "기존건-확인필요"
 ST_UNREG = "보류-미등록"
+ST_HOMONYM = "보류-동명"
+ST_SCREEN = "보류-화면이상"
 HOLD_PREFIX = "보류-"
 # 산출근거 칸 맨 앞 묶음 표시 "[거래처(비고) 날짜 n/총줄수] "
 BLOCK_TAG_RE = re.compile(r"^\[[^\[\]]* \d+/\d+\] ?")
@@ -140,6 +145,7 @@ class ClientMaster:
 
     def __init__(self, entries):
         self.by_key: dict[str, tuple[str, float]] = {}
+        self.dup_names: set[str] = set()  # 같은 이름에 사업자번호가 둘 이상 (보류-동명)
         for name, weight in entries:
             key, _ = compact_name(name or "")
             if key and (key not in self.by_key or weight > self.by_key[key][1]):
@@ -164,9 +170,13 @@ def load_client_master(con: sqlite3.Connection, extra_names=()) -> ClientMaster:
     """DB clients(경리나라 import) + skip_clients(월말일괄 — 마스터에 없을 수 있음)."""
     try:
         rows = con.execute("SELECT name, COALESCE(n_statements, 0) FROM clients").fetchall()
+        dups = con.execute("SELECT name FROM clients WHERE COALESCE(reg_no, '') != ''"
+                           " GROUP BY name HAVING COUNT(DISTINCT reg_no) > 1").fetchall()
     except sqlite3.OperationalError:  # import 전이라 테이블 없음
-        rows = []
-    return ClientMaster(list(rows) + [(n, -1) for n in extra_names])
+        rows, dups = [], []
+    master = ClientMaster(list(rows) + [(n, -1) for n in extra_names])
+    master.dup_names = {n for (n,) in dups}
+    return master
 
 
 class Watcher:
@@ -183,8 +193,9 @@ class Watcher:
         st = self.common["status_values"]
         # '견적완료' 이후 단계로 보는 상태들 (제외는 별도 규칙)
         # 기존건은 시트 값이 아니라 DB(rows.status)로만 판정한다
-        # 보류-미등록은 매 바퀴 거래처 해석으로 다시 판정 (마스터에 등록되면 풀림)
-        self.post_quote = set(st[st.index(ST_QUOTED):]) - {ST_SKIP, ST_LEGACY, ST_UNREG}
+        # 보류-미등록/보류-동명은 매 바퀴 거래처 마스터로 다시 판정 (조건이 풀리면 자동 해제)
+        # 보류-화면이상은 유지 — 사람이 묶음 안 한 행의 상태 칸을 비우면 묶음 전체 재평가
+        self.post_quote = set(st[st.index(ST_QUOTED):]) - {ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM}
 
     # ------------------------------------------------------------------
     def run_once(self) -> None:
@@ -256,7 +267,8 @@ class Watcher:
         def finish_block(blk: dict | None) -> None:
             """묶음 단위 상태 결정: 묶음 last_change(행들 중 최신) 기준으로 함께 입력중/확정.
             우선순위(제외 > 사람처리 > 보류 > 기존건 > 일반)는 행별 decide_status 그대로,
-            그 뒤 보류 행이 하나라도 있으면 (제외·사람처리·AI발행 행을 뺀) 묶음 전체를 보류로."""
+            그 뒤 보류 행이 하나라도 있으면 (제외·사람처리·AI발행 행을 뺀) 묶음 전체를 보류로.
+            보류 우선순위: 미등록 > 동명 > 화면이상."""
             if not blk or not blk["entries"]:
                 return
             entries = blk["entries"]
@@ -264,14 +276,21 @@ class Watcher:
             # 묶음 안 한 행이라도 바뀌었거나, 알던 묶음에 새 행이 붙으면 묶음 전체가 '변경'
             news = [e["is_new"] for e in entries]
             block_changed = any(e["changed"] for e in entries) or (any(news) and not all(news))
+            # 보류-화면이상이던 행의 상태 칸을 사람이 비웠으면 → 묶음 안 보류-화면이상 모두 풀고 재평가
+            screen_cleared = any(e["db_status"] == ST_SCREEN and not e["status"] for e in entries)
+            if screen_cleared:
+                logger.info("sheet={} row={} client={} 보류-화면이상 해제 → 묶음 재평가",
+                            label, blk["rownum"], entries[0]["client_log"])
+            homonym = blk["client"] in master.dup_names
             for e in entries:
+                status = "" if screen_cleared and e["status"] == ST_SCREEN else e["status"]
                 e["new_status"] = self.decide_status(
-                    label, e["rownum"], e["client_log"], e["author"], e["status"], block_changed,
+                    label, e["rownum"], e["client_log"], e["author"], status, block_changed,
                     now - block_last, settle, ai, skip_clients, legacy=e["legacy"],
-                    unregistered=blk["client"] is None)
+                    unregistered=blk["client"] is None, homonym=homonym)
             holds = [e["new_status"] for e in entries if (e["new_status"] or "").startswith(HOLD_PREFIX)]
             if holds:
-                hold = ST_UNREG if ST_UNREG in holds else holds[0]
+                hold = next((h for h in (ST_UNREG, ST_HOMONYM, ST_SCREEN) if h in holds), holds[0])
                 for e in entries:
                     if e["new_status"] not in (None, ST_SKIP, ST_ISSUED):
                         e["new_status"] = hold
@@ -283,7 +302,8 @@ class Watcher:
             for pos, e in enumerate(entries, 1):
                 rownum, row_id, row = e["rownum"], e["row_id"], e["row"]
                 tag = f"[{tag_client} {blk['date']} {pos}/{len(entries)}]"
-                if "basis" in cols:
+                # 묶음 표시는 에이전트가 처리하는 행에만 — 사람처리·제외-월말일괄 행의 산출근거는 안 건드림
+                if "basis" in cols and e["new_status"] not in (None, ST_SKIP):
                     basis = cell(row, "basis")
                     new_basis = with_block_tag(tag, basis)
                     if new_basis != basis:
@@ -394,7 +414,7 @@ class Watcher:
             # 상태는 묶음이 끝날 때 함께 결정 (finish_block)
             block["entries"].append({
                 "rownum": rownum, "row_id": row_id, "row": row, "author": author, "status": status,
-                "changed": changed, "is_new": rec is None, "last_change": last_change, "legacy": legacy,
+                "changed": changed, "is_new": rec is None, "db_status": rec[2] if rec else None, "last_change": last_change, "legacy": legacy,
                 "flipped_at": flipped_at, "client_log": client_log, "client_note": client_note})
         finish_block(block)
 
@@ -412,11 +432,11 @@ class Watcher:
         )
 
     def decide_status(self, label, rownum, client, author, status, changed, age, settle, ai, skip_clients,
-                      legacy=False, unregistered=False):
+                      legacy=False, unregistered=False, homonym=False):
         """None = 사람이 처리(상태 비움).
 
         client는 묶음 첫 행에서 해석한 거래처명(미등록이면 원문). 우선순위:
-        제외-월말일괄 > 사람처리 > 보류-미등록 > 기존건-확인필요 > 일반 규칙.
+        제외-월말일괄 > 사람처리 > 보류-미등록 > 보류-동명 > 기존건-확인필요 > 일반 규칙.
 
         월말 일괄 거래처(skip_clients)는 작성자·기존건·완료/출고 여부와 무관하게 항상 '제외-월말일괄'.
         그 외: 작성자가 사람 값이면 기존건이어도 사람처리가 우선. '기존건-확인필요'는 작성자 빈칸인 기존건에만.
@@ -430,6 +450,8 @@ class Watcher:
             return None
         if unregistered:
             return ST_UNREG
+        if homonym:
+            return ST_HOMONYM
         if legacy and not author:
             return ST_LEGACY
         if status == ST_ISSUED:
