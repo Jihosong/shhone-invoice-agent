@@ -14,6 +14,9 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   (별칭표 config/client_aliases.yaml > 마스터 정확일치 > 최장 일치, ㈜/(주)/주식회사/공백 무시),
   일치 뒤 남은 글자는 client_note. 동명(같은 이름에 사업자번호 둘 이상)은 별칭 사업자번호 >
   최근 12개월 거래가 있는 번호가 하나뿐이면 그쪽(산출근거 '동명→최근거래 번호') > 보류-동명.
+  homonyms(별칭표의 동명 규칙) 이름: 원문의 (주)/(개인) 표시로 확정, 표시 없으면 묶음 전체 '동명확인'
+  (기본 쪽으로 단가만, 발행 안 함). 거래처 칸만 고치면 다음 바퀴에 바로 확정.
+  manual_clients 표기: 해석 없이 묶음 전체 사람처리, 산출근거에 '[수동처리: 사유]'.
   날짜 없는 행 = 바로 위 묶음의 이어지는 줄 — 거래처 칸은 통째로 client_note.
   item_columns 중 하나라도 있으면 품목 행(견적·발행 대상), 없으면 메모 행(건너뜀, 상태 비움).
   첫 행 작성자가 사람이면 묶음 전체 사람처리, 첫 행 거래처를 못 찾으면 묶음 전체 '보류-미등록'.
@@ -65,10 +68,12 @@ ST_LEGACY = "기존건-확인필요"
 ST_UNREG = "보류-미등록"
 ST_HOMONYM = "보류-동명"
 ST_SCREEN = "보류-화면이상"
+ST_HCHECK = "동명확인"  # homonyms 이름인데 법인/개인 표시 없음 → 기본 쪽으로 가견적만, 발행 안 함
 ST_DELETED = "삭제됨"  # DB 전용 (시트에 쓰지 않음): 시트에서 row_id가 사라진 행
 HOLD_PREFIX = "보류-"
 # 산출근거 칸 맨 앞 묶음 표시 "[거래처(비고) 날짜 n/총줄수] "
-BLOCK_TAG_RE = re.compile(r"^\[[^\[\]]* \d+/\d+\] ?")
+# 뒤에 붙는 안내 "[동명확인: …]" / "[수동처리: …]"도 에이전트 표시로 함께 뗀다
+BLOCK_TAG_RE = re.compile(r"^(?:\[(?:[^\[\]]* \d+/\d+|(?:동명확인|수동처리):[^\[\]]*)\] ?)+")
 ROW_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 SCHEMA = """
@@ -80,7 +85,7 @@ CREATE TABLE IF NOT EXISTS rows(
 # 기존 DB에는 없을 수 있는 열 → 없으면 ALTER
 EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT",
                  "legacy": "INTEGER", "block_id": "TEXT", "client_resolved": "TEXT", "client_note": "TEXT",
-                 "deleted_at": "TEXT", "client_reg_no": "TEXT"}
+                 "deleted_at": "TEXT", "client_reg_no": "TEXT", "item_fp": "TEXT"}
 
 
 def ensure_columns(con: sqlite3.Connection) -> None:
@@ -161,13 +166,32 @@ def warn_once(msg: str) -> None:
         logger.warning(msg)
 
 
-def load_aliases(path: Path | None) -> dict[str, str]:
-    """config/client_aliases.yaml의 aliases: {시트 표기: 정식 등록명 또는 사업자번호}. 없으면 {}."""
-    if not path or not Path(path).exists():
-        return {}
-    with open(path, encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return {str(k): str(v) for k, v in (data.get("aliases") or {}).items() if k is not None and v is not None}
+def load_client_rules(path: Path | None) -> dict:
+    """config/client_aliases.yaml → {'aliases': {표기: 정식명|번호}, 'homonyms': {이름: {법인, 개인, 기본}},
+    'manual': {표기: 사유}}. 파일이 없으면 모두 빈 dict."""
+    data = {}
+    if path and Path(path).exists():
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+    def strmap(section):
+        return {str(k): str(v) for k, v in (data.get(section) or {}).items() if k is not None and v is not None}
+
+    homonyms = {str(k): {str(a): str(b) for a, b in (v or {}).items() if b is not None}
+                for k, v in (data.get("homonyms") or {}).items() if isinstance(v, dict) or v is None}
+    return {"aliases": strmap("aliases"), "homonyms": homonyms, "manual": strmap("manual_clients")}
+
+
+_CORP_MARK_RE = re.compile(r"\(주\)|주\)|주식회사")  # NFKC 후 (㈜ → (주))
+_INDIV_MARK_RE = re.compile(r"\(\s*개인\s*\)")
+NOTE_LEAD_RE = re.compile(r"^\s*(\(주\)|㈜|주식회사|주\)|\(\s*개인\s*\))")
+
+
+def entity_mark(raw: str) -> str | None:
+    """정규화 전 원문의 법인/개인 표시: '법인' / '개인' / None(없음) / '둘다'."""
+    t = unicodedata.normalize("NFKC", raw or "")
+    corp, indiv = bool(_CORP_MARK_RE.search(t)), bool(_INDIV_MARK_RE.search(t))
+    return "둘다" if corp and indiv else "법인" if corp else "개인" if indiv else None
 
 
 @dataclass
@@ -184,26 +208,37 @@ class Resolution:
     name: str | None
     note: str
     reg_no: str | None = None
-    hold: str | None = None  # None / ST_UNREG / ST_HOMONYM
-    how: str = ""  # 별칭 / 마스터
+    hold: str | None = None  # None / ST_UNREG / ST_HOMONYM / ST_HCHECK(동명확인: 기본 쪽 번호로 가견적, 발행 안 함)
+    how: str = ""  # 별칭 / 마스터 / 동명규칙 / 수동
     basis: str = ""  # 산출근거 묶음 표시에 붙일 말 (예: '동명→최근거래 140-04-14907')
     candidates: list[ClientRecord] = field(default_factory=list)  # 보류 시 후보 (로그용)
+    notice: str = ""  # 산출근거 묶음 표시 뒤 별도 [..] (동명확인 안내)
+    manual: str | None = None  # manual_clients 사유 → 묶음 전체 사람처리
 
 
 class ClientMaster:
-    """거래처 해석: 별칭표 > 마스터 정확일치 > 마스터 최장(앞부분) 일치 (긴 쪽 우선, 같은 길이면 별칭 우선).
+    """거래처 해석: 별칭표 > 마스터 정확일치 > 마스터 최장(앞부분) 일치 (긴 쪽 우선,
+    같은 길이면 manual_clients > 별칭 > homonyms > 마스터).
+
+    manual_clients: 해석 없이 묶음 전체 사람처리 (사유는 산출근거에).
+    homonyms(동명 규칙): 원문에 (주)/주)/㈜/주식회사 → 법인 번호, (개인) → 개인 번호로 확정.
+    표시가 없거나 둘 다면 '동명확인' — 기본 쪽 번호로 가견적만, 발행 안 함.
+    아래 최근거래·보류-동명 규칙은 homonyms에 없는 이름에만.
 
     정규화 키(compact_name)가 같은 등록이 여럿이면(같은 이름의 동명, 또는 '(주)대양상사'/'대양상사'):
     사업자번호가 하나뿐이면 확정, 둘 이상이면 최근 12개월(last_date) 거래가 있는 번호가 정확히
     하나일 때만 그쪽으로 확정('동명→최근거래 번호'). 아니면 이름이 하나 → 보류-동명,
     표기가 다른 등록 여럿 → 추측하지 않고 보류-미등록(후보는 로그). 별칭에 사업자번호를 적으면 그게 최우선."""
 
-    def __init__(self, entries, aliases: dict[str, str] | None = None, today: date | None = None):
+    def __init__(self, entries, aliases: dict[str, str] | None = None, today: date | None = None,
+                 homonyms: dict[str, dict] | None = None, manual: dict[str, str] | None = None):
         self.by_key: dict[str, list[ClientRecord]] = {}
         self.by_reg: dict[str, ClientRecord] = {}
         self.by_name: dict[str, list[ClientRecord]] = {}
         self.alias: dict[str, tuple[str, str]] = {}  # 키 → ('reg', 번호) | ('name', 정식명)
         self.alias_errors: list[str] = []
+        self.homonym: dict[str, tuple[str, dict[str, ClientRecord], str]] = {}  # 키 → (이름, {법인/개인: 등록}, 기본)
+        self.manual: dict[str, str] = {}  # 키 → 사유
         today = today or date.today()
         self.cutoff = (today - timedelta(days=365)).isoformat()
         for e in entries:
@@ -234,6 +269,28 @@ class ClientMaster:
                     self.alias[akey] = ("name", name)
                 else:
                     self.alias_errors.append(f"별칭 {alias!r}: 등록명 {target!r} 가 마스터에 없음")
+        for name, spec in (homonyms or {}).items():
+            hkey, _ = compact_name(name)
+            sides, bad = {}, []
+            for side in ("법인", "개인"):
+                reg = (spec.get(side) or "").strip()
+                if not reg:
+                    continue
+                if REG_NO_RE.match(reg) and reg in self.by_reg:
+                    sides[side] = self.by_reg[reg]
+                else:
+                    bad.append(f"{side} {reg!r}")
+            default = (spec.get("기본") or "").strip()
+            if bad:
+                self.alias_errors.append(f"동명 {name!r}: 사업자번호 형식 아님/마스터에 없음 ({', '.join(bad)})")
+            elif default not in sides:
+                self.alias_errors.append(f"동명 {name!r}: 기본 {default!r} 는 법인/개인 중 적힌 쪽이어야 함")
+            elif hkey:
+                self.homonym[hkey] = (name, sides, default)
+        for text, reason in (manual or {}).items():
+            mkey, _ = compact_name(text)
+            if mkey:
+                self.manual[mkey] = reason.strip() or "수동처리"
         for msg in self.alias_errors:
             warn_once("client_aliases.yaml " + msg + " → 무시")
 
@@ -265,19 +322,40 @@ class ClientMaster:
             return Resolution(names[0], note, None, ST_HOMONYM, how, candidates=cands)
         return Resolution(None, note, None, ST_UNREG, how, candidates=cands)
 
+    def _homonym(self, entry, text: str, note: str) -> Resolution:
+        name, sides, default = entry
+        mark = entity_mark(text)
+        if mark in sides:
+            rec = sides[mark]
+            return Resolution(rec.name, note, rec.reg_no, how="동명규칙")
+        rec = sides[default]
+        others = " / ".join(f"{r.name} {r.reg_no}" for s, r in sides.items() if s != default)
+        notice = (f"동명확인: 기본 {rec.name} {rec.reg_no}" + (f" / 다른 후보 {others}" if others else "")
+                  + " → 거래처에 주) 또는 (개인) 붙여주세요")
+        return Resolution(rec.name, note, rec.reg_no, ST_HCHECK, "동명규칙", notice=notice,
+                          candidates=list(sides.values()))
+
     def resolve_full(self, text: str) -> Resolution:
         text = text or ""
         key, idx = compact_name(text)
         for n in range(len(key), 0, -1):
-            alias, cands = self.alias.get(key[:n]), self.by_key.get(key[:n])
-            if not alias and not cands:
+            k = key[:n]
+            manual, alias, hom, cands = self.manual.get(k), self.alias.get(k), self.homonym.get(k), self.by_key.get(k)
+            if not (manual or alias or hom or cands):
                 continue
-            note = re.sub(r"^\s*(\(주\)|㈜|주식회사)", "", text[idx[n - 1] + 1:]).strip()  # '대성정밀(주) 급함'
+            note = NOTE_LEAD_RE.sub("", text[idx[n - 1] + 1:]).strip()  # '대성정밀(주) 급함', '대양상사(개인)'
+            if manual:
+                return Resolution(text.strip(), "", how="수동", manual=manual)
+            if hom and not alias:
+                return self._homonym(hom, text, note)
             if alias:
                 kind, target = alias
                 if kind == "reg":
                     rec = self.by_reg[target]
                     return Resolution(rec.name, note, rec.reg_no, how="별칭")
+                hom_target = self.homonym.get(compact_name(target)[0])
+                if hom_target:  # 별칭이 homonyms 이름을 가리키면 동명 규칙 (최근거래 규칙 아님)
+                    return self._homonym(hom_target, text, note)
                 return self._decide(self.by_name[target], note, "별칭")
             return self._decide(cands, note, "마스터")
         return Resolution(None, text.strip(), hold=ST_UNREG)
@@ -367,14 +445,16 @@ class SheetWriter:
 
 
 def load_client_master(con: sqlite3.Connection, extra_names=(), aliases: dict[str, str] | None = None,
-                       today: date | None = None) -> ClientMaster:
+                       today: date | None = None, rules: dict | None = None) -> ClientMaster:
     """DB clients(경리나라 import) + skip_clients(월말일괄 — 마스터에 없을 수 있음) + 별칭표."""
     try:
         rows = con.execute("SELECT name, COALESCE(reg_no, ''), COALESCE(n_statements, 0), last_date"
                            " FROM clients").fetchall()
     except sqlite3.OperationalError:  # import 전이라 테이블 없음
         rows = []
-    return ClientMaster(list(rows) + [(n, "", -1, None) for n in extra_names], aliases, today)
+    rules = rules or {}
+    return ClientMaster(list(rows) + [(n, "", -1, None) for n in extra_names], aliases or rules.get("aliases"),
+                        today, rules.get("homonyms"), rules.get("manual"))
 
 
 class Watcher:
@@ -394,7 +474,8 @@ class Watcher:
         # 기존건은 시트 값이 아니라 DB(rows.status)로만 판정한다
         # 보류-미등록/보류-동명은 매 바퀴 거래처 마스터로 다시 판정 (조건이 풀리면 자동 해제)
         # 보류-화면이상은 유지 — 사람이 묶음 안 한 행의 상태 칸을 비우면 묶음 전체 재평가
-        self.post_quote = set(st[st.index(ST_QUOTED):]) - {ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM}
+        # 동명확인은 매 바퀴 다시 판정 (거래처 칸을 고치면 확정으로)
+        self.post_quote = set(st[st.index(ST_QUOTED):]) - {ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM, ST_HCHECK}
 
     # ------------------------------------------------------------------
     def run_once(self) -> None:
@@ -430,7 +511,8 @@ class Watcher:
         values = ws.get_all_values()
         width = max(cols.values())
         master = load_client_master(self.con, self.common.get("skip_clients") or [],
-                                    load_aliases(getattr(self, "alias_path", None)))
+                                    rules=load_client_rules(getattr(self, "alias_path", None)))
+        item_hash_cols = [c for c in scfg["hash_columns"] if c != "client"]
         item_cols = scfg.get("item_columns") or []
         settle = timedelta(minutes=float(self.common["quote_settle_min"]))
         ai = self.common["author_ai_value"]
@@ -466,7 +548,11 @@ class Watcher:
             """묶음 단위 상태 결정: 묶음 last_change(행들 중 최신) 기준으로 함께 입력중/확정.
             우선순위(제외 > 사람처리 > 보류 > 기존건 > 일반)는 행별 decide_status 그대로,
             그 뒤 보류 행이 하나라도 있으면 (제외·사람처리·AI발행 행을 뺀) 묶음 전체를 보류로.
-            보류 우선순위: 미등록 > 동명 > 화면이상."""
+            보류 우선순위: 미등록 > 동명 > 화면이상.
+            manual_clients 묶음: 해석·판정 없이 전체 사람처리, 산출근거에 '[수동처리: 사유]'.
+            동명확인 묶음(homonyms 이름, 법인/개인 표시 없음): 확정 이후 단계(AI발행 제외) → '동명확인'.
+            pricer가 기본 쪽 번호로 단가만 적고 상태는 동명확인 그대로 (발행 대상 아님).
+            동명확인이던 묶음에서 거래처 칸만 고쳐 확정되면(품목 칸 지문 그대로) 안정화 대기 없이 바로 확정."""
             if not blk or not blk["entries"]:
                 return
             entries = blk["entries"]
@@ -480,12 +566,27 @@ class Watcher:
                 logger.info("sheet={} row={} client={} 보류-화면이상 해제 → 묶음 재평가",
                             label, blk["rownum"], entries[0]["client_log"])
             homonym = blk["hold"] == ST_HOMONYM
+            hcheck = blk["hold"] == ST_HCHECK
+            # 동명확인 → 거래처 칸만 고쳐 확정된 경우: 바뀐 건 이름뿐이니 안정화 대기 없이 재판정
+            client_fix = (blk["hold"] is None and not blk["manual"] and not any(news)
+                          and any(e["db_status"] == ST_HCHECK for e in entries)
+                          and not any(e["items_changed"] for e in entries))
+            if client_fix:
+                logger.info("sheet={} row={} 거래처 수정 {!r} → {} {} (동명확인 해제)",
+                            label, blk["rownum"], blk["client_text"], blk["client"], blk["reg_no"])
             for e in entries:
+                if blk["manual"]:
+                    e["new_status"] = None  # 사람처리
+                    continue
                 status = "" if screen_cleared and e["status"] == ST_SCREEN else e["status"]
-                e["new_status"] = self.decide_status(
-                    label, e["rownum"], e["client_log"], e["author"], status, block_changed,
-                    now - block_last, settle, ai, skip_clients, legacy=e["legacy"],
+                new_status = self.decide_status(
+                    label, e["rownum"], e["client_log"], e["author"], status, block_changed and not client_fix,
+                    settle if client_fix else now - block_last, settle, ai, skip_clients, legacy=e["legacy"],
                     unregistered=blk["client"] is None or blk["hold"] == ST_UNREG, homonym=homonym)
+                if hcheck and new_status and new_status not in (ST_TYPING, ST_SKIP, ST_ISSUED, ST_LEGACY) \
+                        and not new_status.startswith(HOLD_PREFIX):
+                    new_status = ST_HCHECK
+                e["new_status"] = new_status
             holds = [e["new_status"] for e in entries if (e["new_status"] or "").startswith(HOLD_PREFIX)]
             if holds:
                 hold = next((h for h in (ST_UNREG, ST_HOMONYM, ST_SCREEN) if h in holds), holds[0])
@@ -500,9 +601,15 @@ class Watcher:
             for pos, e in enumerate(entries, 1):
                 rownum, row_id, row = e["rownum"], e["row_id"], e["row"]
                 extra = f" {blk['basis']}" if blk["basis"] else ""  # '동명→최근거래 번호'
-                tag = f"[{tag_client}{extra} {blk['date']} {pos}/{len(entries)}]"
+                if blk["manual"]:
+                    tag = f"[수동처리: {blk['manual']}]"
+                else:
+                    tag = f"[{tag_client}{extra} {blk['date']} {pos}/{len(entries)}]"
+                    if hcheck:
+                        tag += f" [{blk['notice']}]"
                 # 묶음 표시는 에이전트가 처리하는 행에만 — 사람처리·제외-월말일괄 행의 산출근거는 안 건드림
-                if "basis" in cols and e["new_status"] not in (None, ST_SKIP):
+                # (manual_clients 묶음은 사람처리지만 사유를 적음)
+                if "basis" in cols and (e["new_status"] not in (None, ST_SKIP) or blk["manual"]):
                     basis = cell(row, "basis")
                     new_basis = with_block_tag(tag, basis)
                     if new_basis != basis:  # 태그 n/m 갱신은 '변경'이 아님 — 지문(hash_columns)에 없는 칸
@@ -524,6 +631,7 @@ class Watcher:
                                   "client_resolved": blk["client"], "client_reg_no": blk["reg_no"],
                                   "client_note": e["client_note"],
                                   "block_date": blk["date"], "block_label": tag_client,
+                                  "needs_quote": e["new_status"] == ST_HCHECK and e["status"] != ST_HCHECK,
                                   "block_tag": tag})
 
         block: dict | None = None
@@ -535,14 +643,19 @@ class Watcher:
                 finish_block(block)
                 res = master.resolve_full(client_text) if client_text else Resolution(None, "", hold=ST_UNREG)
                 client_note = res.note
-                resolved = None if res.hold == ST_UNREG else res.name
+                resolved = None if res.hold == ST_UNREG or res.manual else res.name
                 block = {"rownum": rownum, "row": row, "client": resolved, "author": cell(row, "author"),
                          "id": None, "date": cell(row, "date"), "client_text": client_text,
                          "client_note": client_note, "entries": [], "reg_no": res.reg_no, "hold": res.hold,
-                         "basis": res.basis}
+                         "basis": res.basis, "notice": res.notice, "manual": res.manual}
                 counts["묶음"] += 1
                 cands = " | ".join(f"{c.name} {c.reg_no or '-'} 최근{c.last_date or '-'}" for c in res.candidates)
-                if client_text and res.hold == ST_UNREG:
+                if res.manual:
+                    logger.info("sheet={} row={} 거래처 {!r} 수동처리 ({}) → 묶음 사람처리",
+                                label, rownum, client_text, res.manual)
+                elif res.hold == ST_HCHECK:
+                    logger.info("sheet={} row={} 거래처 {!r} {}", label, rownum, client_text, res.notice)
+                elif client_text and res.hold == ST_UNREG:
                     if res.candidates:
                         logger.info("sheet={} row={} 거래처 후보 여럿 {!r} → 보류-미등록 (후보: {})",
                                     label, rownum, client_text, cands)
@@ -573,6 +686,7 @@ class Watcher:
 
             counts["rows"] += 1
             fp = fingerprint([cell(row, c) for c in scfg["hash_columns"]])
+            item_fp = fingerprint([cell(row, c) for c in item_hash_cols])  # 거래처 칸 뺀 지문
             # 묶음 첫 행(또는 이 행)의 작성자가 사람 값이면 사람처리
             author = next((a for a in (block["author"], cell(row, "author")) if a and a != ai),
                           cell(row, "author"))
@@ -583,11 +697,12 @@ class Watcher:
 
             # --- DB 갱신 ---
             rec = self.con.execute(
-                "SELECT fingerprint, last_change, status, work_end_state, work_end_flipped_at, legacy"
+                "SELECT fingerprint, last_change, status, work_end_state, work_end_flipped_at, legacy, item_fp"
                 " FROM rows WHERE row_id=?",
                 (row_id,)).fetchone()
             if rec is None:
                 changed = False  # 최초 발견은 '변경'으로 보지 않음
+                items_changed = True
                 last_change = now
                 legacy = "TRUE" in (work_end, shipped)
                 flipped_at = None
@@ -596,9 +711,10 @@ class Watcher:
                     " VALUES(?,?,?,?,?,?,?,?,?)",
                     (row_id, key, ws.title, rownum, fp, now_iso(), now_iso(), status, author))
             else:
-                db_fp, db_last, db_status, prev_work_end, flipped_at, db_legacy = rec
+                db_fp, db_last, db_status, prev_work_end, flipped_at, db_legacy, db_item_fp = rec
                 # 정체성은 row_id, 변경 여부는 hash_columns 지문으로만 — 행 번호·묶음 위치·n/m은 보지 않음
                 changed = db_fp != fp
+                items_changed = db_item_fp != item_fp  # 예전 DB(값 없음)면 변경으로 봄
                 if db_status == ST_DELETED:
                     logger.info("sheet={} row={} row_id={} client={} 삭제됨 → 다시 나타남 (복원)",
                                 label, rownum, row_id, client_log)
@@ -626,14 +742,14 @@ class Watcher:
                 flipped_at = None  # 기존건은 절대 발행 대상 아님
             self.con.execute(
                 "UPDATE rows SET work_end_state=?, shipped_state=?, work_end_flipped_at=?, legacy=?,"
-                " block_id=?, client_resolved=?, client_reg_no=?, client_note=? WHERE row_id=?",
+                " block_id=?, client_resolved=?, client_reg_no=?, client_note=?, item_fp=? WHERE row_id=?",
                 (work_end, shipped, flipped_at, int(legacy), block["id"], client, block["reg_no"], client_note,
-                 row_id))
+                 item_fp, row_id))
 
             # 상태는 묶음이 끝날 때 함께 결정 (finish_block)
             block["entries"].append({
                 "rownum": rownum, "row_id": row_id, "row": row, "author": author, "status": status,
-                "fp": fp, "changed": changed, "is_new": rec is None, "db_status": db_status if rec else None, "last_change": last_change, "legacy": legacy,
+                "fp": fp, "changed": changed, "items_changed": items_changed, "is_new": rec is None, "db_status": db_status if rec else None, "last_change": last_change, "legacy": legacy,
                 "flipped_at": flipped_at, "client_log": client_log, "client_note": client_note})
         finish_block(block)
         self.mark_deleted(key, label, ws.title, values, cols, scfg["data_start_row"], seen_ids)

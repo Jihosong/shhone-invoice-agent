@@ -44,5 +44,6 @@ python agent.py run
 ```bash
 python agent.py clients find 에스티엠   # 정식명 / 사업자번호 / 최근거래 / 올해 건수
 python agent.py aliases suggest         # 두 시트의 미해석 거래처 → 후보 (yaml 주석 형식)
-python agent.py aliases check           # 별칭표 검사 (없는 등록명·번호 형식·약칭 중복)
+python agent.py aliases check           # 별칭표 검사 (없는 등록명·번호 형식·약칭 중복, homonyms 번호)
+python agent.py clients add "QMESYS(큐머시스)" 108-12-95838   # import에 없는 거래처 수동 등록
 ```

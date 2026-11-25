@@ -73,20 +73,28 @@ def print_find(con: sqlite3.Connection, query: str, year: str) -> None:
 
 
 # ---------------------------------------------------------------- aliases check
+SECTIONS = ("aliases", "homonyms", "manual_clients")
+EMPTY = ("", "~", "null")
+
+
 def check_aliases(path: Path, con: sqlite3.Connection) -> list[tuple[int, str, str]]:
-    """틀린 줄 찾기. 한 등록명에 약칭 여럿은 OK, 한 약칭(정규화 후)이 두 곳을 가리키면 오류."""
+    """틀린 줄 찾기 → [(줄번호, 오류|경고|안내, 설명)].
+    aliases: 한 등록명에 약칭 여럿은 OK, 한 약칭(정규화 후)이 두 곳을 가리키면 오류.
+    homonyms: 법인/개인 번호 형식·존재, 기본은 법인/개인 중 적힌 쪽.
+    manual_clients: 사유. 세 구역을 통틀어 같은 표기(정규화 후)가 두 번 나오면 오류."""
     text = Path(path).read_text(encoding="utf-8")
     root = yaml.compose(text)
-    problems: list[tuple[int, str, str]] = []
     if root is None or not isinstance(root, yaml.MappingNode):
-        return [(1, "오류", "최상위에 'aliases:' 가 없음")]
-    node = next((v for k, v in root.value if k.value == "aliases"), None)
-    if node is None:
-        return [(1, "오류", "최상위에 'aliases:' 가 없음")]
-    if isinstance(node, yaml.ScalarNode) and node.value in ("", "~", "null"):
-        return []  # 아직 빈 표
-    if not isinstance(node, yaml.MappingNode):
-        return [(node.start_mark.line + 1, "오류", "'aliases:' 아래는 \"약칭\": \"등록명\" 목록이어야 함")]
+        return [(1, "오류", "최상위에 aliases:/homonyms:/manual_clients: 구역이 없음")]
+    problems: list[tuple[int, str, str]] = []
+    nodes = {}
+    for k, v in root.value:
+        if k.value in SECTIONS:
+            nodes[k.value] = v
+        else:
+            problems.append((k.start_mark.line + 1, "경고", f"모르는 구역 '{k.value}' (무시됨)"))
+    if not nodes:
+        return [(1, "오류", "최상위에 aliases:/homonyms:/manual_clients: 구역이 없음")]
 
     rows = _clients(con)
     names: dict[str, set[str]] = {}
@@ -97,9 +105,44 @@ def check_aliases(path: Path, con: sqlite3.Connection) -> list[tuple[int, str, s
     for n in names:
         by_key.setdefault(compact_name(n)[0], []).append(n)
     regs = {reg: name for name, reg, _ in rows if reg}
+    hom_keys = set()
+    if isinstance(nodes.get("homonyms"), yaml.MappingNode):
+        hom_keys = {compact_name(str(k.value))[0] for k, _ in nodes["homonyms"].value}
 
-    seen: dict[str, tuple[int, str, str]] = {}  # 약칭 키 → (줄, 원래 약칭, 가리키는 곳)
-    for knode, vnode in node.value:
+    seen: dict[str, tuple[int, str, str]] = {}  # 표기 키 → (줄, 원래 표기, 가리키는 곳)
+
+    def mapping(section):
+        node = nodes.get(section)
+        if node is None or (isinstance(node, yaml.ScalarNode) and node.value in EMPTY):
+            return []
+        if not isinstance(node, yaml.MappingNode):
+            problems.append((node.start_mark.line + 1, "오류", f"'{section}:' 아래는 '표기: 값' 목록이어야 함"))
+            return []
+        return node.value
+
+    def reg_ok(line, who, reg) -> bool:
+        if not REG_NO_RE.match(reg):
+            problems.append((line, "오류", f"{who}: 사업자번호 형식 아님 {reg!r} (000-00-00000)"))
+            return False
+        if reg not in regs:
+            problems.append((line, "오류", f"{who}: 사업자번호 {reg} 가 clients에 없음"))
+            return False
+        return True
+
+    def register(line, label, key, dest):
+        """세 구역 공통: 같은 표기가 다른 곳을 가리키면 오류."""
+        if key in seen:
+            pline, plabel, pdest = seen[key]
+            if pdest == dest:
+                problems.append((line, "경고", f"'{label}' 중복 ({pline}행과 같은 대상)"))
+            else:
+                problems.append((line, "오류", f"'{label}' 가 두 곳을 가리킴 ({pline}행 '{plabel}' → "
+                                              f"{pdest.split(':', 1)[1]}, 여기 → {dest.split(':', 1)[1]})"))
+            return
+        seen[key] = (line, label, dest)
+
+    # ---- aliases
+    for knode, vnode in mapping("aliases"):
         line = knode.start_mark.line + 1
         alias = str(knode.value or "").strip()
         target = str(vnode.value or "").strip() if isinstance(vnode, yaml.ScalarNode) else ""
@@ -111,11 +154,7 @@ def check_aliases(path: Path, con: sqlite3.Connection) -> list[tuple[int, str, s
             problems.append((line, "오류", f"'{alias}': 대상(등록명 또는 사업자번호)이 비어 있음"))
             continue
         if REG_LIKE_RE.match(target):
-            if not REG_NO_RE.match(target):
-                problems.append((line, "오류", f"'{alias}': 사업자번호 형식 아님 {target!r} (000-00-00000)"))
-                continue
-            if target not in regs:
-                problems.append((line, "오류", f"'{alias}': 사업자번호 {target} 가 clients에 없음"))
+            if not reg_ok(line, f"'{alias}'", target):
                 continue
             dest, dest_name = "reg:" + target, regs[target]
         else:
@@ -127,22 +166,66 @@ def check_aliases(path: Path, con: sqlite3.Connection) -> list[tuple[int, str, s
                 continue
             dest, dest_name = "name:" + name, name
             nreg = {r for r in names[name] if r}
-            if len(nreg) > 1:
+            if len(nreg) > 1 and compact_name(name)[0] not in hom_keys:
                 problems.append((line, "안내", f"'{alias}' → '{name}' 은 동명 ({', '.join(sorted(nreg))}) — "
-                                              "최근거래 규칙 적용. 고정하려면 사업자번호로"))
+                                              "최근거래 규칙 적용. 고정하려면 사업자번호나 homonyms로"))
         clash = [n for n in by_key.get(akey, []) if n != dest_name]
         if clash:
             problems.append((line, "안내", f"약칭 '{alias}' 가 등록명 '{clash[0]}' 과 같은 표기 — "
                                           "시트에 그 이름을 써도 이 별칭 대상으로 감"))
-        if akey in seen:
-            pline, palias, pdest = seen[akey]
-            if pdest == dest:
-                problems.append((line, "경고", f"약칭 '{alias}' 중복 ({pline}행과 같은 대상)"))
-            else:
-                problems.append((line, "오류", f"약칭 '{alias}' 가 두 곳을 가리킴 ({pline}행 '{palias}' → "
-                                              f"{pdest.split(':', 1)[1]}, 여기 → {dest.split(':', 1)[1]})"))
+        register(line, alias, akey, dest)
+
+    # ---- homonyms
+    for knode, vnode in mapping("homonyms"):
+        line = knode.start_mark.line + 1
+        name = str(knode.value or "").strip()
+        hkey = compact_name(name)[0]
+        if not hkey:
+            problems.append((line, "오류", "동명 이름이 비어 있음"))
             continue
-        seen[akey] = (line, alias, dest)
+        if not isinstance(vnode, yaml.MappingNode):
+            problems.append((line, "오류", f"동명 '{name}': 아래에 법인/개인/기본을 적어야 함"))
+            continue
+        fields = {}
+        for fk, fv in vnode.value:
+            fline = fk.start_mark.line + 1
+            if fk.value not in ("법인", "개인", "기본"):
+                problems.append((fline, "오류", f"동명 '{name}': 모르는 항목 '{fk.value}' (법인/개인/기본)"))
+                continue
+            fields[fk.value] = (fline, str(fv.value or "").strip() if isinstance(fv, yaml.ScalarNode) else "")
+        sides = {}
+        for side in ("법인", "개인"):
+            if side in fields and fields[side][1]:
+                fline, reg = fields[side]
+                if reg_ok(fline, f"동명 '{name}' {side}", reg):
+                    sides[side] = reg
+                    if compact_name(regs[reg])[0] != hkey:
+                        problems.append((fline, "안내", f"동명 '{name}' {side} {reg} 의 등록명은 '{regs[reg]}'"))
+        if not any(fields.get(s, (0, ""))[1] for s in ("법인", "개인")):
+            problems.append((line, "오류", f"동명 '{name}': 법인/개인 번호가 하나도 없음"))
+        if len(set(sides.values())) < len(sides):
+            problems.append((line, "오류", f"동명 '{name}': 법인과 개인이 같은 번호"))
+        dline, default = fields.get("기본", (line, ""))
+        if default not in ("법인", "개인"):
+            problems.append((dline, "오류", f"동명 '{name}': 기본은 법인 또는 개인 ({default!r})"))
+        elif not fields.get(default, (0, ""))[1]:
+            problems.append((dline, "오류", f"동명 '{name}': 기본 {default} 인데 {default} 번호가 없음"))
+        register(line, name, hkey, "homonym:" + name)
+
+    # ---- manual_clients
+    for knode, vnode in mapping("manual_clients"):
+        line = knode.start_mark.line + 1
+        label = str(knode.value or "").strip()
+        reason = str(vnode.value or "").strip() if isinstance(vnode, yaml.ScalarNode) else ""
+        mkey = compact_name(label)[0]
+        if not mkey:
+            problems.append((line, "오류", "수동처리 표기가 비어 있음"))
+            continue
+        if not reason:
+            problems.append((line, "경고", f"수동처리 '{label}': 사유가 비어 있음 (산출근거에 '수동처리'만 적힘)"))
+        if by_key.get(mkey):
+            problems.append((line, "안내", f"수동처리 '{label}' 가 등록명 '{by_key[mkey][0]}' 과 같은 표기 — 수동처리가 우선"))
+        register(line, label, mkey, "manual:" + label)
     return sorted(problems)
 
 

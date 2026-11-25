@@ -170,6 +170,7 @@ CREATE INDEX IF NOT EXISTS ix_stm_key ON statements(date, reg_no);
 """
 
 LINES_EXTRA = {"reg_no": "TEXT", "spec_norm": "TEXT", "category": "TEXT"}
+CLIENTS_EXTRA = {"source": "TEXT"}  # 'manual' = agent.py clients add (경리나라 import에 아직 없는 거래처)
 
 
 def ensure_columns(con):
@@ -178,6 +179,41 @@ def ensure_columns(con):
     for name, typ in LINES_EXTRA.items():
         if name not in have:
             con.execute(f"ALTER TABLE lines ADD COLUMN {name} {typ}")
+    have = {r[1] for r in con.execute("PRAGMA table_info(clients)")}
+    for name, typ in CLIENTS_EXTRA.items():
+        if name not in have:
+            con.execute(f"ALTER TABLE clients ADD COLUMN {name} {typ}")
+
+
+def replace_clients(con, imported):
+    """import 거래처로 clients 교체. 수동 등록(source='manual')은 남기되, 같은 사업자번호가 import에
+    들어오면 import 정보로 덮어씀. imported = [(이름, 번호, 명세표수, 첫거래, 최근거래)] → (덮어쓴 수, 남은 수동 수)"""
+    con.execute("DELETE FROM clients WHERE COALESCE(source, '') != 'manual'")
+    regs = {r[1] for r in imported}
+    replaced = [reg for (reg,) in con.execute("SELECT reg_no FROM clients WHERE source='manual'") if reg in regs]
+    con.executemany("DELETE FROM clients WHERE source='manual' AND reg_no=?", [(r,) for r in replaced])
+    con.executemany("INSERT INTO clients(name, reg_no, n_statements, first_date, last_date, source)"
+                    " VALUES(?,?,?,?,?,'import')", imported)
+    kept = con.execute("SELECT COUNT(*) FROM clients WHERE source='manual'").fetchone()[0]
+    return len(replaced), kept
+
+
+def add_manual_client(con, name, reg_no):
+    """clients에 수동 등록 (source='manual'). 같은 번호가 이미 있으면: 수동이면 이름 갱신, import면 거절.
+    반환 (결과 문구, 성공 여부)."""
+    ensure_columns(con)
+    name = norm_text(name)
+    row = con.execute("SELECT name, COALESCE(source, '') FROM clients WHERE reg_no=?", (reg_no,)).fetchone()
+    if row and row[1] != "manual":
+        return f"이미 등록됨 (경리나라 import): {row[0]} {reg_no}", False
+    if row:
+        con.execute("UPDATE clients SET name=? WHERE reg_no=? AND source='manual'", (name, reg_no))
+        con.commit()
+        return f"수동 등록 이름 변경: {row[0]} → {name} {reg_no}", True
+    con.execute("INSERT INTO clients(name, reg_no, n_statements, first_date, last_date, source)"
+                " VALUES(?,?,0,NULL,NULL,'manual')", (name, reg_no))
+    con.commit()
+    return f"수동 등록: {name} {reg_no} (다음 월간 import에 같은 번호가 들어오면 import 정보로 덮어씀)", True
 
 
 def write_master(con, out_path):
@@ -209,10 +245,11 @@ def main(stm_path, line_path, db_path, master_path=None):
     ln = load_lines(line_path)
     con = sqlite3.connect(db_path)
     ensure_columns(con)
-    con.execute("DELETE FROM clients"); con.execute("DELETE FROM statements WHERE source='export'"); con.execute("DELETE FROM lines WHERE source='export'")
+    con.execute("DELETE FROM statements WHERE source='export'"); con.execute("DELETE FROM lines WHERE source='export'")
     g = st.groupby(["거래처명", "등록번호"]).agg(n=("거래일", "size"), f=("거래일", "min"), l=("거래일", "max")).reset_index()
-    con.executemany("INSERT INTO clients VALUES(?,?,?,?,?)",
-                    [(norm_text(r.거래처명), str(r.등록번호), int(r.n), r.f, r.l) for r in g.itertuples()])
+    n_rep, n_manual = replace_clients(con, [(norm_text(r.거래처명), str(r.등록번호), int(r.n), r.f, r.l)
+                                           for r in g.itertuples()])
+    print("수동 등록 거래처: import로 덮어씀=%d 남음=%d" % (n_rep, n_manual))
     con.executemany("INSERT INTO statements(date,client,reg_no,item,spec,extra_lines,supply,tax,total,color,memo) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         [(r.거래일, norm_text(r.거래처명), str(r.등록번호), r.item, r.spec, int(r.extra),
           int(r.공급가액) if pd.notna(r.공급가액) else None, int(r.세액) if pd.notna(r.세액) else None,

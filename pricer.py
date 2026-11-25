@@ -17,7 +17,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from watcher import SheetWriter, strip_block_tag, with_block_tag
+from watcher import ST_HCHECK, SheetWriter, strip_block_tag, with_block_tag
 
 ROOT = Path(__file__).parent
 PRICE_SHEET = "삼화호닝"
@@ -191,7 +191,10 @@ class Pricer:
             return row[cols[name] - 1].strip()
 
         for r in snap["rows"]:
-            if r["status"] != ST_CONFIRMED or r["author"] or r.get("legacy"):
+            # 동명확인: 기본 쪽 거래처로 가견적만 (동명확인에 막 들어온 바퀴에 한 번). 상태는 동명확인 그대로
+            # → 견적완료가 안 되므로 발행 대상이 아님. 거래처 칸을 고치면 watcher가 확정 → 여기서 정식 견적.
+            hcheck = r["status"] == ST_HCHECK and r.get("needs_quote")
+            if (r["status"] != ST_CONFIRMED and not hcheck) or r["author"] or r.get("legacy"):
                 continue
             row, rownum = r["row"], r["rownum"]
 
@@ -214,7 +217,11 @@ class Pricer:
                     set_cell(rownum, "unit_price", "")
                     set_cell(rownum, "basis", with_block_tag(tag, str(e)) if tag else str(e))
                     new_status, msg = ST_CHECK, str(e)
-            set_cell(rownum, "status", new_status)
+            if hcheck:
+                new_status = ST_HCHECK  # 단가만 적고 발행 보류
+                msg += " (동명확인 — 발행 안 함)"
+            else:
+                set_cell(rownum, "status", new_status)
             counts[new_status] += 1
             r["status"] = new_status
             logger.info("pricer sheet={} row={} client={} {} : {}", label, rownum, cell(row, "client"), new_status, msg)
@@ -222,5 +229,6 @@ class Pricer:
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
 
         written = writer.flush(snap["ws"], self.dry_run)
-        logger.info("pricer sheet={} 견적완료={} 견적확인필요={}{}", label, counts[ST_QUOTED], counts[ST_CHECK],
+        logger.info("pricer sheet={} 견적완료={} 견적확인필요={} 동명확인가견적={}{}", label, counts[ST_QUOTED],
+                    counts[ST_CHECK], counts[ST_HCHECK],
                     f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run else f" 쓰기={written}")

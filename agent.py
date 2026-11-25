@@ -7,6 +7,7 @@
     python agent.py aliases check     # config/client_aliases.yaml 검사 (틀린 줄 표시)
     python agent.py aliases suggest   # 시트의 미해석 거래처 → 마스터 후보 (yaml 주석 형식)
     python agent.py clients find <검색어>  # 마스터 이름 부분일치: 정식명/사업자번호/최근거래/올해 건수
+    python agent.py clients add "<정식명>" <사업자번호>  # 경리나라 import에 없는 거래처 수동 등록
     python agent.py calibrate   # 화면 좌표/비전 보정
 """
 import argparse
@@ -120,6 +121,19 @@ def cmd_clients_find(args: argparse.Namespace) -> None:
     clients_cli.print_find(_db(), " ".join(args.query), args.year or str(date.today().year))
 
 
+def cmd_clients_add(args: argparse.Namespace) -> None:
+    import sys
+
+    import feedback
+    import watcher
+
+    if not watcher.REG_NO_RE.match(args.reg_no):
+        sys.exit(f"사업자번호 형식 아님: {args.reg_no!r} (000-00-00000)")
+    msg, ok = feedback.add_manual_client(_db(), args.name, args.reg_no)
+    print(msg)
+    sys.exit(0 if ok else 1)
+
+
 def cmd_calibrate(args: argparse.Namespace) -> None:
     print("calibrate: TODO")
 
@@ -148,6 +162,10 @@ def main() -> None:
     p_find.add_argument("query", nargs="+")
     p_find.add_argument("--year", help="건수 집계 연도 (기본 올해)")
     p_find.set_defaults(func=cmd_clients_find)
+    p_add = p_cl.add_parser("add", help="거래처 수동 등록 (source=manual)")
+    p_add.add_argument("name", help="정식명")
+    p_add.add_argument("reg_no", help="사업자번호 000-00-00000")
+    p_add.set_defaults(func=cmd_clients_add)
     sub.add_parser("calibrate", help="화면 좌표/비전 보정").set_defaults(func=cmd_calibrate)
     args = parser.parse_args()
     args.func(args)
