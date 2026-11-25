@@ -16,6 +16,11 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   item_columns 중 하나라도 있으면 품목 행(견적·발행 대상), 없으면 메모 행(건너뜀, 상태 비움).
   첫 행 작성자가 사람이면 묶음 전체 사람처리, 첫 행 거래처를 못 찾으면 묶음 전체 '보류-미등록'.
   첫 묶음보다 위의 날짜 없는 행은 건너뜀. block_id = 묶음 첫 행의 row_id.
+  확정 판정도 묶음 단위: 묶음 last_change = 묶음 안 품목 행 last_change 중 최신.
+  quote_settle_min이 안 지났으면 묶음 전체 '입력중', 지났으면 묶음 전체 함께 '확정'.
+  한 행이라도 바뀌면(알던 묶음에 행이 추가돼도) 견적 이후 단계 행까지 묶음 전체가 다시 입력중.
+  보류-* 행이 하나라도 있으면 제외·사람처리·AI발행 행을 뺀 묶음 전체를 같은 보류로.
+  산출근거 칸 맨 앞에 "[거래처(비고) 날짜 n/총줄수]" 묶음 표시 (품목 행 기준 순번).
 시트 쓰기는 탭당 batch_update 한 번으로 모은다.
 """
 from __future__ import annotations
@@ -48,6 +53,9 @@ ST_ISSUED = "AI발행"
 ST_SKIP = "제외-월말일괄"
 ST_LEGACY = "기존건-확인필요"
 ST_UNREG = "보류-미등록"
+HOLD_PREFIX = "보류-"
+# 산출근거 칸 맨 앞 묶음 표시 "[거래처(비고) 날짜 n/총줄수] "
+BLOCK_TAG_RE = re.compile(r"^\[[^\[\]]* \d+/\d+\] ?")
 ROW_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 SCHEMA = """
@@ -73,6 +81,16 @@ def ensure_columns(con: sqlite3.Connection) -> None:
 def bool_state(value: str) -> str:
     """체크박스 셀 값 → 'TRUE'/'FALSE'."""
     return "TRUE" if value.strip().upper() == "TRUE" else "FALSE"
+
+
+def strip_block_tag(basis: str) -> str:
+    """산출근거에서 맨 앞 묶음 표시를 뗀 나머지."""
+    return BLOCK_TAG_RE.sub("", basis or "", count=1)
+
+
+def with_block_tag(tag: str, basis: str) -> str:
+    rest = strip_block_tag(basis)
+    return f"{tag} {rest}" if rest else tag
 
 
 def load_config(path: Path = SHEETS_YAML) -> dict:
@@ -235,15 +253,70 @@ class Watcher:
         if not len(master):
             logger.warning("sheet={} 거래처 마스터 비어 있음 → 모든 묶음 보류-미등록 (agent.py import 필요)", label)
 
+        def finish_block(blk: dict | None) -> None:
+            """묶음 단위 상태 결정: 묶음 last_change(행들 중 최신) 기준으로 함께 입력중/확정.
+            우선순위(제외 > 사람처리 > 보류 > 기존건 > 일반)는 행별 decide_status 그대로,
+            그 뒤 보류 행이 하나라도 있으면 (제외·사람처리·AI발행 행을 뺀) 묶음 전체를 보류로."""
+            if not blk or not blk["entries"]:
+                return
+            entries = blk["entries"]
+            block_last = max(e["last_change"] for e in entries)
+            # 묶음 안 한 행이라도 바뀌었거나, 알던 묶음에 새 행이 붙으면 묶음 전체가 '변경'
+            news = [e["is_new"] for e in entries]
+            block_changed = any(e["changed"] for e in entries) or (any(news) and not all(news))
+            for e in entries:
+                e["new_status"] = self.decide_status(
+                    label, e["rownum"], e["client_log"], e["author"], e["status"], block_changed,
+                    now - block_last, settle, ai, skip_clients, legacy=e["legacy"],
+                    unregistered=blk["client"] is None)
+            holds = [e["new_status"] for e in entries if (e["new_status"] or "").startswith(HOLD_PREFIX)]
+            if holds:
+                hold = ST_UNREG if ST_UNREG in holds else holds[0]
+                for e in entries:
+                    if e["new_status"] not in (None, ST_SKIP, ST_ISSUED):
+                        e["new_status"] = hold
+
+            tag_client = blk["client"] or blk["client_text"] or "?"
+            note = blk["client_note"]
+            if blk["client"] and note:  # '오성기계공구(택배)' 처럼 이미 괄호면 그대로
+                tag_client += note if note.startswith("(") and note.endswith(")") else f"({note})"
+            for pos, e in enumerate(entries, 1):
+                rownum, row_id, row = e["rownum"], e["row_id"], e["row"]
+                tag = f"[{tag_client} {blk['date']} {pos}/{len(entries)}]"
+                if "basis" in cols:
+                    basis = cell(row, "basis")
+                    new_basis = with_block_tag(tag, basis)
+                    if new_basis != basis:
+                        set_cell(rownum, "basis", new_basis)
+                new_status = e["new_status"]
+                if new_status is None:  # 사람 처리
+                    counts["사람처리"] += 1
+                    new_status = ""
+                elif new_status == ST_SKIP:
+                    counts["제외"] += 1
+                else:
+                    counts[new_status] += 1
+                if new_status != e["status"]:
+                    set_cell(rownum, "status", new_status)
+                self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, row_id))
+                snap_rows.append({"rownum": rownum, "row_id": row_id, "row": row, "status": new_status,
+                                  "author": e["author"], "legacy": e["legacy"],
+                                  "work_end_flipped_at": e["flipped_at"], "block_id": blk["id"],
+                                  "client_resolved": blk["client"], "client_note": e["client_note"],
+                                  "block_date": blk["date"], "block_label": tag_client,
+                                  "block_tag": tag})
+
         block: dict | None = None
         for idx in range(scfg["data_start_row"] - 1, len(values)):
             rownum = idx + 1
             row = values[idx] + [""] * (width - len(values[idx]))
             client_text = cell(row, "client")
             if cell(row, "date"):  # 묶음 첫 행
+                finish_block(block)
                 resolved, client_note = master.resolve(client_text) if client_text else (None, "")
                 block = {"rownum": rownum, "row": row, "client": resolved, "author": cell(row, "author"),
-                         "id": None}
+                         "id": None, "date": cell(row, "date"), "client_text": client_text,
+                         "client_note": client_note, "entries": []}
                 counts["묶음"] += 1
                 if client_text and resolved is None:
                     logger.info("sheet={} row={} 거래처 미등록 {!r}", label, rownum, client_text)
@@ -318,23 +391,12 @@ class Watcher:
                 " block_id=?, client_resolved=?, client_note=? WHERE row_id=?",
                 (work_end, shipped, flipped_at, int(legacy), block["id"], client, client_note, row_id))
 
-            # --- 상태 결정 ---
-            new_status = self.decide_status(label, rownum, client_log, author, status, changed,
-                                            now - last_change, settle, ai, skip_clients, legacy=legacy,
-                                            unregistered=client is None)
-            if new_status is None:  # 사람 처리
-                counts["사람처리"] += 1
-                new_status = ""
-            elif new_status == ST_SKIP:
-                counts["제외"] += 1
-            else:
-                counts[new_status] += 1
-            if new_status != status:
-                set_cell(rownum, "status", new_status)
-            self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, row_id))
-            snap_rows.append({"rownum": rownum, "row_id": row_id, "row": row, "status": new_status,
-                              "author": author, "legacy": legacy, "work_end_flipped_at": flipped_at,
-                              "block_id": block["id"], "client_resolved": client, "client_note": client_note})
+            # 상태는 묶음이 끝날 때 함께 결정 (finish_block)
+            block["entries"].append({
+                "rownum": rownum, "row_id": row_id, "row": row, "author": author, "status": status,
+                "changed": changed, "is_new": rec is None, "last_change": last_change, "legacy": legacy,
+                "flipped_at": flipped_at, "client_log": client_log, "client_note": client_note})
+        finish_block(block)
 
         if updates and not self.dry_run:
             ws.batch_update(updates, value_input_option="RAW")
@@ -359,6 +421,7 @@ class Watcher:
         월말 일괄 거래처(skip_clients)는 작성자·기존건·완료/출고 여부와 무관하게 항상 '제외-월말일괄'.
         그 외: 작성자가 사람 값이면 기존건이어도 사람처리가 우선. '기존건-확인필요'는 작성자 빈칸인 기존건에만.
         (작성자 AI인 기존건은 아래 일반 규칙 — 발행 후보 여부는 work_end_flipped_at으로 이미 막혀 있음)
+        changed·age는 묶음 단위 값(묶음 안 어느 행이든 변경 / 묶음 최신 last_change 이후 경과).
         """
         nclient = norm_text(client) or ""
         if any(s and s in nclient for s in skip_clients):

@@ -17,6 +17,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from watcher import strip_block_tag, with_block_tag
+
 ROOT = Path(__file__).parent
 PRICE_SHEET = "삼화호닝"
 SOGWAN_RATE = Decimal("0.9")
@@ -196,7 +198,9 @@ class Pricer:
             if r["status"] != ST_CONFIRMED or r["author"] or r.get("legacy"):
                 continue
             row, rownum = r["row"], r["rownum"]
-            if cell(row, "unit_price") and not cell(row, "basis"):
+            tag = r.get("block_tag") or ""
+            # 산출근거의 묶음 표시는 watcher가 붙인 것 — 그것만 있으면 근거 없는 것으로 봄
+            if cell(row, "unit_price") and not strip_block_tag(cell(row, "basis")):
                 # 사람이 적은 가격 → 건드리지 않음
                 new_status, msg = ST_QUOTED, "사람 입력 가격 유지"
             else:
@@ -204,11 +208,11 @@ class Pricer:
                     price, basis = quote_pipe(table, cell(row, "size"), cell(row, "length"),
                                               cell(row, "qty"), cell(row, "pipe_type"))
                     set_cell(rownum, "unit_price", price)
-                    set_cell(rownum, "basis", basis)
+                    set_cell(rownum, "basis", with_block_tag(tag, basis) if tag else basis)
                     new_status, msg = ST_QUOTED, f"{price:,} ({basis})"
                 except QuoteError as e:
                     set_cell(rownum, "unit_price", "")
-                    set_cell(rownum, "basis", str(e))
+                    set_cell(rownum, "basis", with_block_tag(tag, str(e)) if tag else str(e))
                     new_status, msg = ST_CHECK, str(e)
             set_cell(rownum, "status", new_status)
             counts[new_status] += 1
