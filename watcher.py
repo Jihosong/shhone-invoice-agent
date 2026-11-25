@@ -24,7 +24,11 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   보류-화면이상은 유지, 사람이 묶음 안 아무 행의 상태 칸을 비우면 묶음 전체 재평가.
   산출근거 칸 맨 앞에 "[거래처(비고) 날짜 n/총줄수]" 묶음 표시 (품목 행 기준 순번) —
   에이전트가 처리하는 행에만 (사람처리·제외-월말일괄 행은 안 건드림).
-시트 쓰기는 탭당 batch_update 한 번으로 모은다.
+행 정체성 = row_id(V열 등)만, 변경 여부 = hash_columns 지문만. 행 번호 이동, 묶음 안 순번/총줄수 변화,
+  위쪽 행 삭제는 '변경'이 아님 (산출근거 태그 n/m만 갱신). 시트에서 row_id가 사라진 행은 DB status
+  '삭제됨'(시트에는 안 씀) → 스냅샷·pricer 대상 아님. 같은 row_id가 다시 나타나면(실행 취소) 복원.
+시트 쓰기는 탭당 batch_update 한 번으로 모으되, 행 번호가 아니라 row_id 기준(SheetWriter):
+  쓰기 직전 다시 읽어 현재 행 번호로 옮겨 쓰고, 그 사이 삭제·수정된 행에는 쓰지 않음.
 """
 from __future__ import annotations
 
@@ -58,6 +62,7 @@ ST_LEGACY = "기존건-확인필요"
 ST_UNREG = "보류-미등록"
 ST_HOMONYM = "보류-동명"
 ST_SCREEN = "보류-화면이상"
+ST_DELETED = "삭제됨"  # DB 전용 (시트에 쓰지 않음): 시트에서 row_id가 사라진 행
 HOLD_PREFIX = "보류-"
 # 산출근거 칸 맨 앞 묶음 표시 "[거래처(비고) 날짜 n/총줄수] "
 BLOCK_TAG_RE = re.compile(r"^\[[^\[\]]* \d+/\d+\] ?")
@@ -71,7 +76,8 @@ CREATE TABLE IF NOT EXISTS rows(
 """
 # 기존 DB에는 없을 수 있는 열 → 없으면 ALTER
 EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT",
-                 "legacy": "INTEGER", "block_id": "TEXT", "client_resolved": "TEXT", "client_note": "TEXT"}
+                 "legacy": "INTEGER", "block_id": "TEXT", "client_resolved": "TEXT", "client_note": "TEXT",
+                 "deleted_at": "TEXT"}
 
 
 def ensure_columns(con: sqlite3.Connection) -> None:
@@ -166,6 +172,84 @@ class ClientMaster:
         return None, text.strip()
 
 
+class SheetWriter:
+    """시트 쓰기 모음 — 행 번호가 아니라 row_id로 묶어 두었다가, 쓰기 직전 시트를 다시 읽어
+    현재 행 번호로 옮겨 쓴다.
+
+    읽기(get_all_values)와 batch_update 사이(watcher → pricer 포함 수 초)에 사람이 위쪽 행을
+    지우거나 끼워 넣으면, 읽을 때의 행 번호로 쓰는 값(상태·단가·산출근거·row_id)이 엉뚱한 행에
+    떨어진다. 그래서:
+    - row_id가 있는 행: 다시 읽은 시트에서 그 row_id가 있는 행으로 옮겨 씀. 없어졌으면(삭제) 버림.
+    - row_id가 아직 없는/새로 부여하는 행: 같은 행 번호의 내용이 읽을 때와 똑같을 때만 씀.
+    - expect_fp(hash_columns 지문)를 주면 다시 읽은 행의 지문이 같을 때만 씀
+      (읽은 뒤 내용이 바뀌었으면 낡은 판단을 쓰지 않음 — 다음 바퀴가 다시 판단).
+    """
+
+    def __init__(self, cols: dict, data_start_row: int, hash_columns: list[str], label: str = ""):
+        self.cols = cols
+        self.data_start_row = data_start_row
+        self.hash_columns = hash_columns
+        self.label = label
+        self.width = max(cols.values())
+        # (anchor_id, rownum, snapshot_row, col_name, value, expect_fp)
+        self.items: list[tuple] = []
+        self.new_ids: set[str] = set()  # 이번 바퀴에 새로 부여해 아직 시트에 없는 row_id
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def _pad(self, row: list[str]) -> list[str]:
+        return list(row) + [""] * (self.width - len(row))
+
+    def fp(self, row: list[str]) -> str:
+        row = self._pad(row)
+        return fingerprint([row[self.cols[c] - 1].strip() for c in self.hash_columns])
+
+    def add(self, rownum: int, name: str, value, row: list[str], row_id: str | None = None,
+            expect_fp: str | None = None) -> None:
+        self.items.append((row_id, rownum, self._pad(row), name, value, expect_fp))
+
+    def mark_new_id(self, row_id: str) -> None:
+        self.new_ids.add(row_id)
+
+    def resolve(self, fresh: list[list[str]]) -> tuple[list[dict], int]:
+        """다시 읽은 값으로 각 쓰기의 현재 행 번호를 찾음 → (batch_update 목록, 버린 건수)."""
+        id_col = self.cols["row_id"] - 1
+        where: dict[str, int] = {}
+        for idx in range(self.data_start_row - 1, len(fresh)):
+            rid = (fresh[idx][id_col] if id_col < len(fresh[idx]) else "").strip()
+            if ROW_ID_RE.match(rid) and rid not in where:  # 중복이면 위쪽이 주인 (ensure_row_id와 같은 규칙)
+                where[rid] = idx + 1
+        updates, dropped = [], 0
+        for row_id, rownum, snap_row, name, value, expect_fp in self.items:
+            if row_id and row_id not in self.new_ids:
+                target = where.get(row_id)
+            else:  # 시트에 아직 row_id가 없는 행 → 같은 자리에 같은 내용이 있을 때만
+                same = rownum <= len(fresh) and self._pad(fresh[rownum - 1])[:self.width] == snap_row[:self.width]
+                target = rownum if same else None
+            if target is not None and expect_fp is not None and self.fp(fresh[target - 1]) != expect_fp:
+                target = None
+            if target is None:
+                dropped += 1
+                logger.info("sheet={} row={} row_id={} {} 쓰기 보류 — 읽은 뒤 행이 삭제·이동·수정됨 (다음 바퀴에 재판정)",
+                            self.label, rownum, row_id or "-", name)
+                continue
+            if target != rownum:
+                logger.info("sheet={} row_id={} 행 이동 {}→{} ({} 쓰기를 새 위치로)",
+                            self.label, row_id, rownum, target, name)
+            updates.append({"range": rowcol_to_a1(target, self.cols[name]), "values": [[value]]})
+        return updates, dropped
+
+    def flush(self, ws, dry_run: bool = False) -> int:
+        """쓰기 직전 다시 읽고 row_id 기준으로 옮겨 batch_update. 실제 쓴 건수 반환."""
+        if not self.items or dry_run:
+            return 0
+        updates, _ = self.resolve(ws.get_all_values())
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        return len(updates)
+
+
 def load_client_master(con: sqlite3.Connection, extra_names=()) -> ClientMaster:
     """DB clients(경리나라 import) + skip_clients(월말일괄 — 마스터에 없을 수 있음)."""
     try:
@@ -237,7 +321,7 @@ class Watcher:
         skip_clients = [norm_text(c) for c in self.common.get("skip_clients") or []]
         now = datetime.now()
 
-        updates: list[dict] = []
+        writer = SheetWriter(cols, scfg["data_start_row"], scfg["hash_columns"], label)
         counts = Counter()
         seen_ids: set[str] = set()
         snap_rows: list[dict] = []
@@ -245,9 +329,6 @@ class Watcher:
 
         def cell(row: list[str], name: str) -> str:
             return row[cols[name] - 1].strip()
-
-        def set_cell(rownum: int, name: str, value: str) -> None:
-            updates.append({"range": rowcol_to_a1(rownum, cols[name]), "values": [[value]]})
 
         def ensure_row_id(rownum: int, row: list[str]) -> str:
             row_id = cell(row, "row_id")
@@ -257,7 +338,8 @@ class Watcher:
                     why = "중복" if row_id in seen_ids else "형식 아님"
                     logger.warning("sheet={} row={} row_id={!r} {} → 새로 부여", label, rownum, row_id, why)
                 row_id = uuid.uuid4().hex[:8]
-                set_cell(rownum, "row_id", row_id)
+                writer.mark_new_id(row_id)
+                writer.add(rownum, "row_id", row_id, row, row_id=row_id)
             seen_ids.add(row_id)
             return row_id
 
@@ -306,8 +388,8 @@ class Watcher:
                 if "basis" in cols and e["new_status"] not in (None, ST_SKIP):
                     basis = cell(row, "basis")
                     new_basis = with_block_tag(tag, basis)
-                    if new_basis != basis:
-                        set_cell(rownum, "basis", new_basis)
+                    if new_basis != basis:  # 태그 n/m 갱신은 '변경'이 아님 — 지문(hash_columns)에 없는 칸
+                        writer.add(rownum, "basis", new_basis, row, row_id=row_id, expect_fp=e["fp"])
                 new_status = e["new_status"]
                 if new_status is None:  # 사람 처리
                     counts["사람처리"] += 1
@@ -317,9 +399,9 @@ class Watcher:
                 else:
                     counts[new_status] += 1
                 if new_status != e["status"]:
-                    set_cell(rownum, "status", new_status)
+                    writer.add(rownum, "status", new_status, row, row_id=row_id, expect_fp=e["fp"])
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, row_id))
-                snap_rows.append({"rownum": rownum, "row_id": row_id, "row": row, "status": new_status,
+                snap_rows.append({"rownum": rownum, "row_id": row_id, "row": row, "fp": e["fp"], "status": new_status,
                                   "author": e["author"], "legacy": e["legacy"],
                                   "work_end_flipped_at": e["flipped_at"], "block_id": blk["id"],
                                   "client_resolved": blk["client"], "client_note": e["client_note"],
@@ -350,7 +432,8 @@ class Watcher:
                 if client_text:
                     counts["메모"] += 1
                 if cell(row, "status"):
-                    set_cell(rownum, "status", "")
+                    rid = cell(row, "row_id")
+                    writer.add(rownum, "status", "", row, row_id=rid if ROW_ID_RE.match(rid) else None)
                 continue
 
             if block["id"] is None:
@@ -385,7 +468,13 @@ class Watcher:
                     (row_id, key, ws.title, rownum, fp, now_iso(), now_iso(), status, author))
             else:
                 db_fp, db_last, db_status, prev_work_end, flipped_at, db_legacy = rec
+                # 정체성은 row_id, 변경 여부는 hash_columns 지문으로만 — 행 번호·묶음 위치·n/m은 보지 않음
                 changed = db_fp != fp
+                if db_status == ST_DELETED:
+                    logger.info("sheet={} row={} row_id={} client={} 삭제됨 → 다시 나타남 (복원)",
+                                label, rownum, row_id, client_log)
+                    db_status = None
+                    self.con.execute("UPDATE rows SET deleted_at=NULL WHERE row_id=?", (row_id,))
                 last_change = now if changed else datetime.fromisoformat(db_last)
                 if db_legacy or db_status == ST_LEGACY:
                     # 한 번 기존건이면 계속 (지문·작성자가 바뀌어도). 상태는 작성자에 따라 비어 있을 수
@@ -414,12 +503,12 @@ class Watcher:
             # 상태는 묶음이 끝날 때 함께 결정 (finish_block)
             block["entries"].append({
                 "rownum": rownum, "row_id": row_id, "row": row, "author": author, "status": status,
-                "changed": changed, "is_new": rec is None, "db_status": rec[2] if rec else None, "last_change": last_change, "legacy": legacy,
+                "fp": fp, "changed": changed, "is_new": rec is None, "db_status": db_status if rec else None, "last_change": last_change, "legacy": legacy,
                 "flipped_at": flipped_at, "client_log": client_log, "client_note": client_note})
         finish_block(block)
+        self.mark_deleted(key, label, ws.title, values, cols, scfg["data_start_row"], seen_ids)
 
-        if updates and not self.dry_run:
-            ws.batch_update(updates, value_input_option="RAW")
+        written = writer.flush(ws, self.dry_run)
 
         extra = [f"{k}={v}" for k, v in counts.items()
                  if k not in ("rows", "묶음", "메모", ST_TYPING, ST_CONFIRMED, "제외", "사람처리")]
@@ -428,8 +517,28 @@ class Watcher:
             label, ws.title, counts["묶음"], counts["rows"], counts["메모"], counts[ST_TYPING], counts[ST_CONFIRMED],
             counts["제외"], counts["사람처리"],
             (" " + " ".join(extra)) if extra else "",
-            f" (dry-run, 미기록 쓰기 {len(updates)}건)" if self.dry_run else f" 쓰기={len(updates)}",
+            f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run
+            else f" 쓰기={written}" + (f" (보류 {len(writer) - written})" if written != len(writer) else ""),
         )
+
+    def mark_deleted(self, key, label, tab, values, cols, data_start_row, seen_ids) -> None:
+        """이 탭에서 row_id가 더 이상 보이지 않는 행 → DB status '삭제됨' (이후 처리 안 함).
+        메모 행으로 바뀌었어도 V열에 row_id가 남아 있으면 삭제가 아님. 다시 나타나면 process_sheet가 복원."""
+        id_col = cols["row_id"] - 1
+        present = set(seen_ids)
+        for row in values[data_start_row - 1:]:
+            rid = (row[id_col] if id_col < len(row) else "").strip()
+            if ROW_ID_RE.match(rid):
+                present.add(rid)
+        gone = [rid for (rid,) in self.con.execute(
+            "SELECT row_id FROM rows WHERE sheet=? AND tab=? AND COALESCE(status, '') != ?",
+            (key, tab, ST_DELETED)) if rid not in present]
+        if not gone:
+            return
+        self.con.executemany("UPDATE rows SET status=?, deleted_at=? WHERE row_id=?",
+                             [(ST_DELETED, now_iso(), rid) for rid in gone])
+        logger.info("sheet={} tab={} 시트에서 사라진 행 {}개 → 삭제됨 ({})", label, tab, len(gone),
+                    ", ".join(gone[:10]) + (" …" if len(gone) > 10 else ""))
 
     def decide_status(self, label, rownum, client, author, status, changed, age, settle, ai, skip_clients,
                       legacy=False, unregistered=False, homonym=False):

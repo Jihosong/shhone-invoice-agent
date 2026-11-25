@@ -15,6 +15,15 @@ def cmd_run(args: argparse.Namespace) -> None:
     import pricer
     import watcher
 
+    from pathlib import Path
+
+    from loguru import logger
+
+    # 콘솔만으로는 사고 뒤 원인을 못 찾음 → 파일에도 남김 (10MB 회전, 14개 보관)
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    logger.add(log_dir / "agent.log", rotation="10 MB", retention=14, encoding="utf-8", enqueue=True)
+
     cfg = watcher.load_config()
     w = watcher.Watcher(cfg, dry_run=args.dry_run)
     p = pricer.Pricer(cfg, w.con, dry_run=args.dry_run)

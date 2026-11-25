@@ -9,3 +9,4 @@ __pycache__/
 .venv/
 secrets/
 data/거래내역_마스터.xlsx
+logs/

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from watcher import strip_block_tag, with_block_tag
+from watcher import SheetWriter, strip_block_tag, with_block_tag
 
 ROOT = Path(__file__).parent
 PRICE_SHEET = "삼화호닝"
@@ -183,21 +183,21 @@ class Pricer:
         cols = scfg["columns"]
         label = snap.get("label", key)
         table = self.table_for(scfg)
-        updates: list[dict] = []
+        # 쓰기는 row_id 기준 — watcher가 읽은 뒤 행이 삭제·이동되면 새 위치로, 내용이 바뀌었으면 보류
+        writer = SheetWriter(cols, scfg["data_start_row"], scfg["hash_columns"], label)
         counts = Counter()
-
-        from gspread.utils import rowcol_to_a1
 
         def cell(row, name):
             return row[cols[name] - 1].strip()
-
-        def set_cell(rownum, name, value):
-            updates.append({"range": rowcol_to_a1(rownum, cols[name]), "values": [[value]]})
 
         for r in snap["rows"]:
             if r["status"] != ST_CONFIRMED or r["author"] or r.get("legacy"):
                 continue
             row, rownum = r["row"], r["rownum"]
+
+            def set_cell(rownum, name, value, row=row, r=r):
+                writer.add(rownum, name, value, row, row_id=r["row_id"], expect_fp=r.get("fp"))
+
             tag = r.get("block_tag") or ""
             # 산출근거의 묶음 표시는 watcher가 붙인 것 — 그것만 있으면 근거 없는 것으로 봄
             if cell(row, "unit_price") and not strip_block_tag(cell(row, "basis")):
@@ -221,7 +221,6 @@ class Pricer:
             if not self.dry_run:
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
 
-        if updates and not self.dry_run:
-            snap["ws"].batch_update(updates, value_input_option="RAW")
+        written = writer.flush(snap["ws"], self.dry_run)
         logger.info("pricer sheet={} 견적완료={} 견적확인필요={}{}", label, counts[ST_QUOTED], counts[ST_CHECK],
-                    f" (dry-run, 미기록 쓰기 {len(updates)}건)" if self.dry_run else f" 쓰기={len(updates)}")
+                    f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run else f" 쓰기={written}")
