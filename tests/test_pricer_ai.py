@@ -151,50 +151,213 @@ def test_run_ai_scores_samples_pending_only(tmp_path, capsys):
 # ---------------------------------------------------------------- 운영 (pricer.quote_job_row)
 class StubAi:
     def __init__(self, conf="mid", err=None):
-        self.conf, self.err, self.calls = conf, err, 0
+        self.conf, self.err, self.calls, self.kw = conf, err, 0, {}
 
-    def quote(self, inp, index, cutoff, hint="", tag=""):
+    def quote(self, inp, index, cutoff, hint="", tag="", max_conf=None):
         self.calls += 1
+        self.kw = {"hint": hint, "max_conf": max_conf}
         if self.err:
             raise AiError(self.err)
         from pricer_job import Quote
         return Quote("AI-유사품", 61000, self.conf, "근거")
 
 
-def mk_pricer(ai, dry_run=False):
-    p = pricer.Pricer({}, None, dry_run=dry_run)
+def mk_pricer(ai, dry_run=False, con=None):
+    p = pricer.Pricer({}, con, dry_run=dry_run)
     p._ai = ai
     return p
 
 
-@pytest.mark.parametrize("conf,status", [("high", pricer.ST_QUOTED), ("mid", pricer.ST_QUOTED),
-                                         ("low", pricer.ST_CHECK)])
-def test_ops_ai_confidence_to_status(conf, status):
-    price, basis, st = mk_pricer(StubAi(conf)).quote_job_row(job("Ø80 / 1개"), LineIndex.build([]), CUT)
-    assert (price, st) == (61000, status)
-    assert basis.startswith(pricer.LOW_TAG) is (conf == "low")
+@pytest.mark.parametrize("conf,status,tag", [("high", pricer.ST_QUOTED, ""),
+                                             ("mid", pricer.ST_CHECK, "[가견적-mid] "),
+                                             ("low", pricer.ST_CHECK, "[가견적-low] ")])
+def test_ops_only_high_is_quoted(conf, status, tag):
+    price, basis, st, method, c = mk_pricer(StubAi(conf)).quote_job_row(job("Ø80 / 1개"), LineIndex.build([]), CUT)
+    assert (price, st, method, c) == (61000, status, "AI-유사품", conf)
+    assert basis.startswith(tag + "AI-유사품 | 근거")
+
+
+def test_ops_ladder_mid_is_gagyeon_too():
+    price, basis, st, method, _ = mk_pricer(StubAi()).quote_job_row(
+        job("Ø50+0.0~+0.05 / 1개"), LineIndex.build([ln(1, "2025-06-01", 45000)]), CUT)  # 12개월 전 → mid
+    assert (price, st, method) == (45000, pricer.ST_CHECK, "동일품")
+    assert basis.startswith("[가견적-mid] 동일품") and "인상 검토" in basis
+
+
+def test_ops_stale_same_item_passes_hint_and_cap():
+    ai = StubAi("high")
+    mk_pricer(ai).quote_job_row(job("Ø50+0.0~+0.05 / 1개"), LineIndex.build([ln(1, "2023-01-01", 45000)]), CUT)
+    assert ai.kw["max_conf"] == "mid" and "24개월 초과" in ai.kw["hint"]
 
 
 def test_ops_ladder_first_and_ai_failure():
     ai = StubAi()
-    price, basis, st = mk_pricer(ai).quote_job_row(job("Ø50+0.0~+0.05 / 1개"), LineIndex.build(
-        [ln(1, "2026-01-01", 45000)]), CUT)
+    price, _, st, _, _ = mk_pricer(ai).quote_job_row(job("Ø50+0.0~+0.05 / 1개"), LineIndex.build(
+        [ln(1, "2026-05-01", 45000)]), CUT)
     assert (price, st, ai.calls) == (45000, pricer.ST_QUOTED, 0)
-    price, basis, st = mk_pricer(StubAi(err="AI 일일 상한 300건 도달")).quote_job_row(
+    price, basis, st, _, _ = mk_pricer(StubAi(err="AI 일일 상한 60건 도달")).quote_job_row(
         job("Ø80 / 1개"), LineIndex.build([]), CUT)
     assert (price, st) == ("", pricer.ST_CHECK) and "일일 상한" in basis
 
 
 def test_ops_preset_low_and_multi():
     hist = [ln(1, "2025-01-01", 10000, dia=10)]
-    price, basis, st = mk_pricer(StubAi()).quote_job_row(job("Ø50 / 1개", d="20"), LineIndex.build(hist), CUT)
-    assert (price, st) == (200000, pricer.ST_CHECK) and basis.startswith("[가견적-확인필요] 사전단가")
-    price, _, st = mk_pricer(StubAi()).quote_job_row(job("Ø35 / 1개 + Ø40 / 1개", d="4/2.5"),
-                                                     LineIndex.build([]), CUT)
-    assert (price, st) == ("40000/25000", pricer.ST_QUOTED)
+    price, basis, st, _, _ = mk_pricer(StubAi()).quote_job_row(job("Ø50 / 1개", d="20"), LineIndex.build(hist), CUT)
+    assert (price, st) == (200000, pricer.ST_CHECK) and basis.startswith("[가견적-low] 사전단가")
+    price, basis, st, _, _ = mk_pricer(StubAi()).quote_job_row(job("Ø35 / 1개 + Ø40 / 1개", d="4/2.5"),
+                                                               LineIndex.build([]), CUT)
+    assert (price, st) == ("40000/25000", pricer.ST_CHECK) and basis.startswith("[가견적-mid]")  # 과거 없음 → mid
 
 
 def test_ops_dry_run_skips_ai():
     ai = StubAi()
-    _, basis, st = mk_pricer(ai, dry_run=True).quote_job_row(job("Ø80 / 1개"), LineIndex.build([]), CUT)
+    _, basis, st, _, _ = mk_pricer(ai, dry_run=True).quote_job_row(job("Ø80 / 1개"), LineIndex.build([]), CUT)
     assert (ai.calls, st) == (0, pricer.ST_CHECK) and "dry-run" in basis
+
+
+@pytest.mark.parametrize("cell,norm", [("61,000", "61000"), (" 40,000 / 25,000 ", "40000/25000"), ("", ""),
+                                       ("확인중", ""), ("6만", "")])
+def test_norm_price_cell(cell, norm):
+    assert pricer.norm_price_cell(cell) == norm
+
+
+# ---------------------------------------------------------------- 운영 process_job: 사람 확인·수정 흐름
+COLS = {"date": 1, "client": 2, "main_msg": 4, "spec_qty": 5, "difficulty": 6, "stock_removal": 8, "pre_note": 19,
+        "post_size": 20, "post_note": 21, "author": 15, "status": 24, "unit_price": 25, "basis": 26, "row_id": 28}
+
+
+class FakeWriter:
+    last = None
+
+    def __init__(self, cols, *a):
+        self.writes = {}
+        FakeWriter.last = self
+
+    def add(self, rownum, name, value, row, row_id=None, expect_fp=None):
+        self.writes[(rownum, name)] = value
+
+    def flush(self, ws, dry_run):
+        return len(self.writes)
+
+    def __len__(self):
+        return len(self.writes)
+
+
+def sheet_row(e="Ø80 / 1개", d="", status="확정", price="", basis="", h=""):
+    row = [""] * 28
+    row[1], row[3], row[4], row[7], row[23], row[24], row[25] = "가사", d, e, h, status, price, basis
+    return row
+
+
+def snap_of(row, status, fp="fp1"):
+    return {"label": "임가공", "ws": None, "rows": [{"rownum": 5, "row_id": "R1", "row": row, "fp": fp,
+                                                     "status": status, "author": "", "legacy": False,
+                                                     "client_resolved": "가사", "client_reg_no": REG}]}
+
+
+@pytest.fixture
+def job_env(monkeypatch):
+    import sqlite3
+
+    monkeypatch.setattr(pricer, "SheetWriter", FakeWriter)
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE rows (row_id TEXT, status TEXT)")
+    con.execute("CREATE TABLE lines (id INTEGER, kind TEXT)")
+    con.execute("INSERT INTO rows VALUES ('R1', '확정')")
+    ai = StubAi("mid")
+    p = mk_pricer(ai, con=con)
+    monkeypatch.setattr(p, "job_index", lambda: LineIndex.build([]))
+    scfg = {"columns": COLS, "data_start_row": 3, "hash_columns": ["client", "main_msg", "spec_qty"]}
+    return p, ai, scfg, con
+
+
+def test_process_job_flow_gagyeon_then_human_clears_status(job_env, caplog):
+    p, ai, scfg, con = job_env
+    p.process_job("imgagong", scfg, snap_of(sheet_row(), "확정"))
+    w = FakeWriter.last.writes
+    assert (w[(5, "unit_price")], w[(5, "status")]) == (61000, pricer.ST_CHECK)
+    assert w[(5, "basis")].startswith("[가견적-mid] AI-유사품")
+    assert con.execute("SELECT price, fp, confidence FROM job_quotes").fetchone() == ("61000", "fp1", "mid")
+    # 다음 바퀴: 견적확인필요 그대로·단가 그대로 → 아무것도 안 함 (AI도 안 부름)
+    p.process_job("imgagong", scfg, snap_of(sheet_row(status="견적확인필요", price="61,000",
+                                                      basis=w[(5, "basis")]), "견적확인필요"))
+    assert FakeWriter.last.writes == {} and ai.calls == 1
+    # 사람이 상태 칸을 비움 → watcher가 확정으로(지문 같음) → 적힌 단가로 견적완료, AI 안 부름
+    p.process_job("imgagong", scfg, snap_of(sheet_row(price="61,000", basis=w[(5, "basis")]), "확정"))
+    w2 = FakeWriter.last.writes
+    assert w2[(5, "status")] == pricer.ST_QUOTED and ai.calls == 1
+    assert w2[(5, "basis")].startswith("사람 확인 | AI-유사품")
+
+
+def test_process_job_human_edits_price(job_env):
+    p, ai, scfg, con = job_env
+    p.process_job("imgagong", scfg, snap_of(sheet_row(), "확정"))
+    basis = FakeWriter.last.writes[(5, "basis")]
+    p.process_job("imgagong", scfg, snap_of(sheet_row(status="견적확인필요", price="55,000", basis=basis),
+                                            "견적확인필요"))
+    w = FakeWriter.last.writes
+    assert w[(5, "status")] == pricer.ST_QUOTED and (5, "unit_price") not in w  # 사람 값 그대로 둠
+    assert w[(5, "basis")].startswith("사람 수정 55,000 (에이전트 61000) | AI-유사품")
+    assert con.execute("SELECT price FROM job_quotes").fetchone() == ("55000",)
+
+
+def test_process_job_content_change_requotes(job_env):
+    p, ai, scfg, con = job_env
+    p.process_job("imgagong", scfg, snap_of(sheet_row(), "확정"))
+    basis = FakeWriter.last.writes[(5, "basis")]
+    # 내용이 바뀌어 확정으로 돌아옴(지문 다름) → 다시 견적
+    p.process_job("imgagong", scfg, snap_of(sheet_row(e="Ø90 / 1개", price="61000", basis=basis), "확정", fp="fp2"))
+    assert ai.calls == 2 and FakeWriter.last.writes[(5, "status")] == pricer.ST_CHECK
+
+
+def test_process_job_logs_each_item(job_env):
+    from loguru import logger
+
+    p, ai, scfg, con = job_env
+    msgs = []
+    hid = logger.add(lambda m: msgs.append(str(m)), level="INFO")
+    try:
+        p.process_job("imgagong", scfg, snap_of(sheet_row(e="Ø80 / 1개", d="긴급", h="-0.3"), "확정"))
+    finally:
+        logger.remove(hid)
+    line = next(m for m in msgs if "임가공 견적" in m)
+    for part in ("거래처=가사", "main_msg='긴급'", "spec_qty='Ø80 / 1개'", "pre_size='-0.3'", "단가 61000",
+                 "AI-유사품", "mid", "견적확인필요"):
+        assert part in line
+
+
+# ---------------------------------------------------------------- AI 상한·confidence 상한·프롬프트
+def test_first_day_limit_60_then_300(tmp_path):
+    log = tmp_path / "calls.jsonl"
+    ai = AiPricer(client=SimpleNamespace(messages=FakeMessages([])), rules="R", source="ops", log_path=log)
+    today = date.today()
+    assert ai.limit_for(today) == 60  # 운영 호출 기록 없음 = 첫날
+    log.write_text(json.dumps({"ts": "2026-01-01T09:00:00", "source": "ops"}) + "\n", encoding="utf-8")
+    ai2 = AiPricer(client=SimpleNamespace(messages=FakeMessages([])), rules="R", source="ops", log_path=log)
+    assert ai2.limit_for(today) == 300
+    assert ai2.limit_for(date(2026, 1, 1)) == 60
+
+
+def test_max_conf_caps_ai_result(tmp_path):
+    ai = fake_ai(tmp_path, [{"unit_price": 52000, "method": "동일품", "basis": "직전 유지", "confidence": "high"}])
+    q = ai.quote(job("Ø50 / 1개"), LineIndex.build([]), CUT, max_conf="mid")
+    assert q.confidence == "mid" and "최대 mid" in q.basis
+
+
+def test_prompt_lists_all_raw_fields_and_chidae():
+    raw = {"main_msg": "-0.5", "spec_qty": "Ø77+0.0~+0.03 / 1개", "difficulty": "상", "pre_size": "-0.3",
+           "pre_note": "흑피", "post_size": "77.02", "post_note": "OK"}
+    msg = build_user_message(JobInput.from_raw(raw, "가사", REG, CUT), LineIndex.build([]), CUT)
+    for lbl in ("D 주요 메시지: -0.5", "E 공차x갯수·조도", "F 난이도: 상", "H 연마량/치대: -0.3",
+                "S 호닝 전 매니저 노트: 흑피", "T 호닝 후 치수: 77.02", "U 호닝 후 매니저 노트: OK"):
+        assert lbl in msg
+    assert "치대 0.3mm" in msg and "연마량(치대) 표기다. 단가가 아니다" in msg
+    empty = build_user_message(job("Ø77 / 1개"), LineIndex.build([]), CUT)
+    assert "F 난이도" not in empty and "치대 없음" in empty  # 빈 칸 생략
+
+
+def test_prompt_hint_then_tendency_on_top():
+    msg = build_user_message(job("Ø50 / 1개"), LineIndex.build([ln(1, "2026-01-01", 40000)]), CUT,
+                             hint="직전 동일품 1개 500,000 / 이번 1개 (2023-11-02; 24개월 초과)")
+    same = msg.split("# 참고: 같은 거래처")[1]
+    assert same.index("※ 직전 동일품") < same.index("※ 이 거래처 인상 성향") < same.index("40,000")

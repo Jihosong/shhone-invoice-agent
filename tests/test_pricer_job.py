@@ -117,18 +117,64 @@ def test_same_item_criteria(e, line, ok):
     assert (q(job(e), [line]).method == M_SAME) is ok
 
 
+@pytest.mark.parametrize("h,item,ok", [
+    ("-0.3", "시린더 호닝전-0.3mm", True),      # 양쪽 치대 같음
+    ("-0.3", "시린더 치대 0.5", False),         # 양쪽 있고 다름 → 동일품 아님
+    ("-0.3", "시린더호닝", True),               # DB 쪽 치대 없음 → 비교 안 함
+    ("", "시린더 치대 0.5", True),              # 입력 쪽 없음
+])
+def test_same_item_chidae(h, item, ok):
+    inp = JobInput.from_raw({"spec_qty": "Ø50+0.0~+0.05 / 1개", "pre_size": h}, "가사", REG, CUT)
+    assert (q(inp, [ln(1, "2026-01-01", 1000, item=item)]).method == M_SAME) is ok
+
+
+@pytest.mark.parametrize("d", ["-0.5", "+0.3", "- 0.2", "0.3mm", "-0.4mm", "0.5 MM"])
+def test_preset_excludes_stock_removal(d):
+    assert preset_price(d) is None
+    inp = job("Ø77+0.0~+0.03 /1개", d=d)
+    assert inp.chidae == pytest.approx(float(d.lower().replace("mm", "").replace(" ", "").lstrip("+-")))
+
+
+def test_parse_chidae_sources():
+    from job_parse import parse_chidae, row_chidae
+    assert parse_chidae("-0.45") == 0.45 and parse_chidae("0") == 0.0
+    assert parse_chidae("", "CYLINDER 호닝전-0.01mm") == 0.01
+    assert parse_chidae("", "치대 Ø-0.15 남겨올 시") == 0.15
+    assert parse_chidae("", "호닝 전 Ø270") is None        # 치수는 치대 아님
+    assert row_chidae({"pre_size": "-0.3", "main_msg": "-0.5"}) == 0.3   # H 우선
+    assert row_chidae({"pre_note": "치대 0.2 남김"}) == 0.2
+
+
 def test_same_item_by_name_when_no_reg():
     got = q(job("Ø50+0.0~+0.05 / 1개", reg="", client="(주)가사"), [ln(1, "2026-01-01", 1000, reg="")])
     assert got.unit_price == 1000
 
 
-def test_same_item_stale_keeps_price_mid():
-    got = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2024-06-01", 100000)])  # 정확히 730일 = 24개월
-    assert (got.method, got.unit_price, got.confidence) == (M_SAME, 100000, "mid")  # 보정 없음
-    assert "직전 2024-06" in got.basis
-    recent = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2024-06-03", 100000)])  # 728일
-    assert (recent.confidence, recent.unit_price) == ("high", 100000)
-    assert "직전 " not in recent.basis
+@pytest.mark.parametrize("d,method,conf", [
+    ("2025-12-01", M_SAME, "high"),    # 182일 — 6개월 이내
+    ("2025-11-29", M_SAME, "mid"),     # 184일 — 6~24개월
+    ("2024-06-01", M_SAME, "mid"),     # 730일 — 24개월 (초과 아님)
+    ("2024-05-31", M_PENDING, None),   # 731일 — 24개월 초과 → AI
+])
+def test_same_item_period_rules(d, method, conf):
+    got = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, d, 100000)])
+    assert (got.method, got.confidence) == (method, conf)
+    if method == M_SAME:
+        assert got.unit_price == 100000  # 연 % 보정 없음
+
+
+def test_same_item_period_boundary_and_basis():
+    assert q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2025-11-30", 1000)]).confidence == "high"  # 183일 = 6개월 이내
+    mid = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2025-03-15", 100000)])
+    assert "직전 2025-03 — 인상 검토" in mid.basis
+    assert "인상 검토" not in q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2026-05-01", 1000)]).basis
+
+
+def test_same_item_over_24_months_goes_to_ai_with_hint():
+    got = q(job("Ø30+0.0~+0.05 / 2개"), [ln(5, "2023-11-02", 500000, dia=30, qty=1)])
+    assert (got.method, got.unit_price, got.max_conf, got.ref_line_id) == (M_PENDING, None, "mid", 5)
+    assert got.hint.startswith("직전 동일품 1개 500,000 / 이번 2개 (2023-11-02;")
+    assert "24개월 초과" in got.hint
 
 
 @pytest.mark.parametrize("qty,method", [(3, M_PENDING), (2, M_SAME), (1, M_SAME)])

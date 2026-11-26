@@ -3,7 +3,8 @@
 v1: 호닝파이프(kind: pipe) — data/price_table.xlsx '삼화호닝' 시트 단가표로 결정적 계산.
     단가 = round10(1M당단가 × 가격인상상수 × 길이/1000), 소관이면 × 0.9
 임가공(kind: job) — pricer_job 사다리(사전단가·동일품) → 미결은 pricer_ai(Claude, 일일 상한).
-    high/mid → 견적완료, low → 단가 + '[가견적-확인필요]' + 견적확인필要(발행 차단). 발행기 미연결.
+    confidence high만 견적완료. mid/low는 단가 + '[가견적-mid]'/'[가견적-low]' + 견적확인필요(발행 차단).
+    사람이 상태 칸을 비우면 적힌 단가로, 단가를 고치면 고친 값으로 견적완료 (job_quotes 표와 비교). 발행기 미연결.
 
 watcher가 한 바퀴 돈 뒤 그 결과(snapshot)를 받아 처리한다.
 대상: 상태 '확정' + 작성자 빈칸 + 기존건 아님. 시트 쓰기는 시트당 batch_update 한 번.
@@ -28,7 +29,18 @@ ST_CONFIRMED = "확정"
 ST_QUOTED = "견적완료"
 ST_CHECK = "견적확인필요"
 ST_LEGACY = "기존건-확인필요"
-LOW_TAG = "[가견적-확인필요]"   # 임가공 confidence=low: 단가는 적되 발행 차단
+GAGYEON_RE = re.compile(r"^\[가견적-(mid|low)\]\s*")  # 임가공 가견적 표시 (단가는 적되 발행 차단)
+_PRICE_CELL_RE = re.compile(r"\d[\d,]*(?:/\d[\d,]*)*")
+
+
+def gagyeon_tag(conf: str) -> str:
+    return f"[가견적-{conf}]"
+
+
+def norm_price_cell(text) -> str:
+    """'61,000' → '61000', '40,000 / 25,000' → '40000/25000'. 단가 모양이 아니면 ''."""
+    s = re.sub(r"\s+", "", str(text or ""))
+    return s.replace(",", "") if _PRICE_CELL_RE.fullmatch(s) else ""
 
 H_P = "H.P"
 SOGWAN = "소관"
@@ -261,30 +273,52 @@ class Pricer:
                 self._ai = False
         return self._ai or None
 
-    def quote_job_row(self, inp, index, cutoff) -> tuple[str, str, str]:
-        """JobInput → (단가 칸, 산출근거, 상태). 사다리 → 미결이면 Claude → confidence로 상태."""
+    # 에이전트가 적은 임가공 단가·그때 지문 — 사람이 상태를 비웠는지/단가를 고쳤는지 판정용
+    def _job_quotes_table(self) -> None:
+        self.con.execute("CREATE TABLE IF NOT EXISTS job_quotes (row_id TEXT PRIMARY KEY, price TEXT, fp TEXT,"
+                         " method TEXT, confidence TEXT, basis TEXT, quoted_at TEXT)")
+
+    def job_quote_get(self, row_id) -> tuple[str, str] | None:
+        """(에이전트가 적은 단가, 그때 행 지문) 또는 None."""
+        self._job_quotes_table()
+        return self.con.execute("SELECT price, fp FROM job_quotes WHERE row_id=?", (row_id,)).fetchone()
+
+    def job_quote_put(self, row_id, price, fp, method="", conf="", basis="") -> None:
+        if self.dry_run:
+            return
+        from datetime import datetime
+
+        self._job_quotes_table()
+        self.con.execute("INSERT OR REPLACE INTO job_quotes VALUES (?,?,?,?,?,?,?)",
+                         (row_id, norm_price_cell(price), fp or "", method, conf or "", basis,
+                          datetime.now().isoformat(timespec="seconds")))
+
+    def quote_job_row(self, inp, index, cutoff) -> tuple[str, str, str, str, str]:
+        """JobInput → (단가 칸, 산출근거, 상태, method, confidence). 사다리 → 미결이면 Claude.
+        confidence high만 견적완료, mid/low는 '[가견적-mid/low]' + 견적확인필요, 실패는 단가 없이 견적확인필요."""
         from pricer_ai import AiError
         from pricer_job import M_PENDING, quote_ladder
 
         q = quote_ladder(inp, index, cutoff)
         if q.method == M_PENDING:
             if self.dry_run:  # 시트에 안 쓰면 다음 바퀴에 또 미결 → 매 바퀴 API 비용. dry-run은 호출 안 함
-                return "", f"미결 | {q.basis} | dry-run AI 생략", ST_CHECK
+                return "", f"미결 | {q.basis} | dry-run AI 생략", ST_CHECK, M_PENDING, ""
             ai = self.ai()
             if ai is None:
-                return "", f"미결 | {q.basis} | AI 없음", ST_CHECK
+                return "", f"미결 | {q.basis} | AI 없음", ST_CHECK, M_PENDING, ""
             try:
-                q = ai.quote(inp, index, cutoff, hint=q.hint, tag=inp.client)
+                q = ai.quote(inp, index, cutoff, hint=q.hint, tag=inp.client, max_conf=q.max_conf)
             except AiError as e:
-                return "", f"미결 | {q.basis} | {e}", ST_CHECK
+                return "", f"미결 | {q.basis} | {e}", ST_CHECK, M_PENDING, ""
         price = "/".join(str(p) for _, p in q.item_prices) if q.item_prices else q.unit_price
-        if q.confidence == "low":
-            return price, f"{LOW_TAG} {q.label()}", ST_CHECK
-        return price, q.label(), ST_QUOTED
+        if q.confidence == "high":
+            return price, q.label(), ST_QUOTED, q.method, q.confidence
+        return price, f"{gagyeon_tag(q.confidence)} {q.label()}", ST_CHECK, q.method, q.confidence or ""
 
     def process_job(self, key: str, scfg: dict, snap: dict) -> None:
-        """임가공: 사다리(사전단가·동일품) → 미결은 Claude. high/mid → 견적완료,
-        low → 단가 적고 '[가견적-확인필요]' + 견적확인필요(발행 차단). 임가공은 아직 발행기 미연결."""
+        """임가공 시트. 확정 행 → 사다리/Claude 견적. 견적확인필요 행 → 사람이 단가를 고쳤으면 그 값으로 견적완료.
+        확정으로 돌아온 가견적 행(사람이 상태 칸을 비움, 내용 지문 그대로) → 적힌 단가로 견적완료.
+        임가공은 아직 발행기 미연결."""
         from datetime import date, timedelta
 
         from pricer_job import JobInput
@@ -302,24 +336,55 @@ class Pricer:
             return row[i - 1].strip() if i and i - 1 < len(row) else ""
 
         for r in snap["rows"]:
-            hcheck = r["status"] == ST_HCHECK and r.get("needs_quote")
-            if (r["status"] != ST_CONFIRMED and not hcheck) or r["author"] or r.get("legacy"):
+            if r["author"] or r.get("legacy"):
                 continue
+            status = r["status"]
+            hcheck = status == ST_HCHECK and r.get("needs_quote")
             row, rownum = r["row"], r["rownum"]
+            price_cell, body = cell(row, "unit_price"), strip_block_tag(cell(row, "basis"))
+            tag = r.get("block_tag") or ""
+            if status not in (ST_CONFIRMED, ST_CHECK) and not hcheck:
+                continue
 
             def set_cell(rownum, name, value, row=row, r=r):
                 writer.add(rownum, name, value, row, row_id=r["row_id"], expect_fp=r.get("fp"))
 
-            tag = r.get("block_tag") or ""
-            if cell(row, "unit_price") and not strip_block_tag(cell(row, "basis")):
+            def set_basis(text, tag=tag):
+                set_cell(rownum, "basis", with_block_tag(tag, text) if tag else text)
+
+            prev = self.job_quote_get(r["row_id"]) if status in (ST_CONFIRMED, ST_CHECK) else None
+            human_price = norm_price_cell(price_cell)
+            if status == ST_CHECK:
+                # 견적확인필요 + 사람이 단가를 고침(빈칸이던 것을 채운 것 포함) → 그 값으로 견적완료
+                if prev is None or not human_price or human_price == (prev[0] or ""):
+                    continue
+                new_status = ST_QUOTED
+                basis = f"사람 수정 {price_cell} (에이전트 {prev[0] or '없음'}) | {GAGYEON_RE.sub('', body)}"
+                set_basis(basis)
+                self.job_quote_put(r["row_id"], human_price, r.get("fp"), "사람수정", "", basis)
+                msg = f"사람 단가 {price_cell} → 견적완료"
+            elif (status == ST_CONFIRMED and prev is not None and prev[1] == (r.get("fp") or "")
+                  and human_price and GAGYEON_RE.match(body)):
+                # 가견적 행인데 내용 그대로 확정으로 돌아옴 = 사람이 상태 칸을 비움 → 적힌 단가로 견적완료
+                new_status = ST_QUOTED
+                who = "사람 확인" if human_price == prev[0] else f"사람 수정 {price_cell} (에이전트 {prev[0]})"
+                basis = f"{who} | {GAGYEON_RE.sub('', body)}"
+                set_basis(basis)
+                self.job_quote_put(r["row_id"], human_price, r.get("fp"), "사람확인", "", basis)
+                msg = f"{who} (상태 칸 비움) → 견적완료"
+            elif price_cell and not body:
                 new_status, msg = ST_QUOTED, "사람 입력 가격 유지"
             else:
                 index = index or self.job_index()
                 inp = JobInput.from_sheet_row(row, cols, r.get("client_resolved") or "",
                                               r.get("client_reg_no") or "", date.today())
-                price, basis, new_status = self.quote_job_row(inp, index, cutoff)
+                price, basis, new_status, method, conf = self.quote_job_row(inp, index, cutoff)
                 set_cell(rownum, "unit_price", price)
-                set_cell(rownum, "basis", with_block_tag(tag, basis) if tag else basis)
+                set_basis(basis)
+                self.job_quote_put(r["row_id"], price, r.get("fp"), method, conf, basis)
+                raw = " ".join(f"{k}={v!r}" for k, v in inp.raw.items() if v)
+                logger.info("임가공 견적 sheet={} row={} 거래처={} | 입력 {} | 단가 {} | {} | {} | {}", label, rownum,
+                            inp.client or cell(row, "client"), raw, price or "-", method, conf or "-", new_status)
                 msg = f"{price} ({basis})"
             if hcheck:
                 new_status = ST_HCHECK

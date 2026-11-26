@@ -1,6 +1,6 @@
 """임가공 행 공용 파서 — watcher가 넘기는 시트 원문(D/E/F/H/S…)과 백테스트 정답지가 같은 함수를 쓴다.
 
-parse_row(raw) : RAW_FIELDS 원문 dict → 구경·공차·기장·수량·재질·특이사항 키워드.
+parse_row(raw) : RAW_FIELDS 원문 dict → 구경·공차·기장·수량·재질·특이사항 키워드·치대.
 """
 from __future__ import annotations
 
@@ -168,6 +168,37 @@ def parse_ra(text) -> float | None:
     return float(m.group(1)) if m else None
 
 
+_SIGNED_NUM = r"[-+]\s*(?:\d+(?:\.\d*)?|\.\d+)"
+_PLAIN_NUM = r"(?:\d+(?:\.\d*)?|\.\d+)"
+_STOCK_RE = re.compile(rf"(?:{_SIGNED_NUM})\s*(?:MM)?|{_PLAIN_NUM}\s*MM", re.I)
+_CHIDAE_TXT_RE = re.compile(rf"(?:치대|연마량|호닝\s*전)\s*Ø?\s*({_SIGNED_NUM}|{_PLAIN_NUM})", re.I)
+CHIDAE_MAX = 5.0   # 이보다 크면 치대가 아니라 치수(호닝 전 Ø270 등)
+
+
+def is_stock_removal(text) -> bool:
+    """'-0.5', '+0.3', '0.3mm'처럼 부호나 mm가 붙은 값 = 연마량(치대) 표기 (D열이면 단가가 아님)."""
+    s = norm(text)
+    return bool(s) and bool(_STOCK_RE.fullmatch(s))
+
+
+def _chidae_value(tok: str) -> float | None:
+    v = abs(float(re.sub(r"[\s+]", "", tok)))
+    return v if v < CHIDAE_MAX else None
+
+
+def parse_chidae(h: str = "", text: str = "") -> float | None:
+    """치대(연마량, 절댓값 mm). H 칸이 숫자(부호·mm 허용)면 그 값, 아니면 H·text에서 '치대/연마량/호닝전 -0.2'."""
+    s = norm(h)
+    m = re.fullmatch(rf"({_SIGNED_NUM}|{_PLAIN_NUM})\s*(?:MM)?", s, re.I)
+    if m:
+        return _chidae_value(m.group(1))
+    for t in (h, text):
+        m = _CHIDAE_TXT_RE.search(norm(t))
+        if m and (v := _chidae_value(m.group(1))) is not None:
+            return v
+    return None
+
+
 def parse_row(raw: dict) -> dict:
     """시트 원문(RAW_FIELDS) → 파싱 열. 치수·수량은 E 우선, 없으면 D."""
     e, d = raw.get("spec_qty", ""), raw.get("main_msg", "")
@@ -185,4 +216,15 @@ def parse_row(raw: dict) -> dict:
         "material": ",".join(parse_materials(alltext)),
         "specials": ",".join(parse_specials(alltext)),
         "ra": parse_ra(e) or parse_ra(alltext),
+        "chidae": row_chidae(raw),
     }
+
+
+def row_chidae(raw: dict) -> float | None:
+    """치대: H 칸 숫자 → D가 '-0.5'처럼 연마량 표기면 D → D·E·호닝 전 노트 글의 '치대/연마량/호닝전 -0.2'."""
+    h, d = raw.get("pre_size", ""), raw.get("main_msg", "")
+    v = parse_chidae(h)
+    if v is None and is_stock_removal(d):
+        v = parse_chidae(d)
+    return v if v is not None else parse_chidae(
+        h, " ".join(raw.get(k, "") for k in ("main_msg", "spec_qty", "pre_note")))

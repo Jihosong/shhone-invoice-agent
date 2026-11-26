@@ -540,7 +540,7 @@ def run_ai_scores(rows: list[dict], index: LineIndex, *, limit: int = 200, seed:
         r, inp, q0, lid, line = item
         try:
             q = ai.quote(inp, index, inp.on_date, exclude_ids={lid} if lid is not None else (), hint=q0.hint,
-                         tag=f"{r['tab']} {r['row']}행")
+                         tag=f"{r['tab']} {r['row']}행", max_conf=q0.max_conf)
         except AiError as e:
             q = Quote("AI실패", basis=str(e))
         q.hint = q0.hint

@@ -114,11 +114,16 @@ python agent.py backtest run --no-ai                     # 사다리(사전단�
 python agent.py backtest run --ai --limit 200 --seed 0   # 미결 행 표본을 Claude로 → results_ai.csv (API 비용 발생)
 ```
 
-- **A 사다리** (`pricer_job.py`): 사전단가(D열 숫자, 5천~500만 원만; `20/30`은 E 품목 수와 같을 때 품목별;
-  같은 거래처 과거 단가 중앙값과 3배 이상 차이 → low, 과거 없음 → mid) → 동일품(최근 건 단가 그대로, 24개월↑ mid,
-  수량 3배↑/⅓↓이면 미결 + 직전 건 hint) → 미결.
-- **B Claude** (`pricer_ai.py`): `claude-sonnet-5-5`, 시스템 = `config/pricing_rules.md` 전문(prompt caching),
-  참고 사례(같은 거래처 8 · 타 거래처 5 · 인상 성향), 부록 B.5 JSON(structured outputs), max_tokens 300.
-  호출마다 `logs/ai_calls.jsonl`에 토큰·비용. 운영 호출은 하루 300건까지.
-- **운영** (`pricer.py` kind=job): high/mid → 견적완료, low → 단가 + `[가견적-확인필요]` + 견적확인필요,
-  미결·AI 실패 → 단가 비우고 견적확인필요. `--dry-run`은 AI를 부르지 않는다. 임가공은 아직 발행기 미연결.
+- **A 사다리** (`pricer_job.py`): 사전단가(D열 숫자, 5천~500만 원만; 부호·mm가 붙은 값은 연마량이라 제외;
+  `20/30`은 E 품목 수와 같을 때 품목별; 같은 거래처 과거 단가 중앙값과 3배 이상 차이 → low, 과거 없음 → mid)
+  → 동일품(구경·공차·기장·치대·품목 성질 키워드 7개; 최근 건 단가 그대로 — 6개월 이내 high, 6~24개월 mid
+  '인상 검토', 24개월 초과는 AI로(직전 단가·인상 성향을 참고 맨 위에, 결과 최대 mid); 수량 3배↑/⅓↓이면 AI로) → 미결.
+- **B Claude** (`pricer_ai.py`): `claude-sonnet-5-5`, 시스템 = `config/pricing_rules.md` 전문(prompt caching).
+  입력 = D·E·F·H·S·T·U 원문(빈 칸 생략) + 파싱값(구경·공차·기장·수량·재질·특이사항·치대),
+  참고 사례(같은 거래처 8 · 타 거래처 5 · 인상 성향). 부록 B.5 JSON(structured outputs), max_tokens 300.
+  호출마다 `logs/ai_calls.jsonl`에 토큰·비용. 운영 호출은 하루 300건, 운영 첫날은 60건.
+- **운영** (`pricer.py` kind=job): confidence high만 견적완료. mid/low → 단가 + `[가견적-mid]`/`[가견적-low]`
+  + 견적확인필요(발행 차단). 사람이 상태 칸을 비우면 적힌 단가로, 단가를 고치면 고친 값으로 견적완료
+  (에이전트가 적은 단가·지문은 DB `job_quotes`). 미결·AI 실패 → 단가 비우고 견적확인필요.
+  건별 INFO 로그 `임가공 견적 … 거래처 | 입력 | 단가 | method | confidence | 상태`. `--dry-run`은 AI를 부르지 않는다.
+  임가공은 아직 발행기 미연결.
