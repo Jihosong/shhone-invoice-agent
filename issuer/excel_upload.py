@@ -150,7 +150,8 @@ JOB_FACE = "면작업"
 # 품목명 앞에 붙이는 말 (순서대로): (job_parse 라벨, 품목명 표기)
 JOB_NAME_PREFIX = [("수리/재작업", "수리품"), ("SUS", "SUS"), ("AL", "알미늄"), ("막힘", "막힘"), ("사각", "사각"),
                    ("용접", "용접"), ("열처리", "열처리"), ("도금", "도금"), ("딥홀", "딥홀"), ("다공", "다공")]
-_QTY_TAIL_RE = re.compile(r"\s*[/×xX*]?\s*\d+\s*(?:개|ea|pcs|본|set|조)(?![a-z]).*$", re.I | re.S)
+_QTY_TAIL_RE = re.compile(r"\s*[/×xX*]?\s*\d+\s*(?:개|ea|pcs|본|set|조(?!도))(?![a-z]).*$", re.I | re.S)
+_QTY_ANY_RE = re.compile(r"\s*[/×xX*]?\s*\d+\s*(?:개|ea|pcs|본|set|조(?!도))(?![a-z])", re.I)
 _RA_RE = re.compile(r"Ra\s*\d+(?:\.\d+)?(?:\s*~\s*\d+(?:\.\d+)?)?", re.I)
 
 
@@ -210,29 +211,61 @@ def _history_label(seg_text: str, d: str, ctx: LineCtx) -> tuple[str, str] | Non
     return ln.item, (ln.spec if exact and ln.spec else "")
 
 
+def _compact(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").upper()
+
+
+def strip_qty(text: str) -> str:
+    """원문에서 수량 표기('/ 10개', '× 2EA')만 뺀 글."""
+    return re.sub(r"\s{2,}", " ", _QTY_ANY_RE.sub(" ", text or "")).strip(" /+,×*")
+
+
+def _history_by_text(text: str, ctx: LineCtx) -> tuple[str, str] | None:
+    """구경 없는 행: 같은 거래처 최근 명세표 중 품목명(+규격)이 이 글과 같거나 서로 포함(공백 무시, 4자 이상)."""
+    from datetime import timedelta
+
+    key = _compact(text)
+    if ctx.index is None or len(key) < 4 or not (ctx.client or ctx.reg_no):
+        return None
+    cutoff = (ctx.day or date.today()) + timedelta(days=1)
+    for ln in sorted(ctx.index.client_lines(ctx.reg_no, ctx.client), key=lambda x: (x.date, x.id), reverse=True):
+        item = _compact(ln.item)
+        if ln.date < cutoff and len(item) >= 4 and (item == key or item in key or key in item):
+            return ln.item, ln.spec or ""
+    return None
+
+
 def job_lines(get, ctx: LineCtx) -> list[Line]:
-    """임가공 한 행 → 줄들. 단가 '40000/25000'은 품목별, 단가 하나면 모든 줄 같은 단가. 수량은 구간별 'N개'."""
+    """임가공 한 행 → 줄들. 단가 '40000/25000'은 품목별, 단가 하나면 모든 줄 같은 단가. 수량은 구간별 'N개'.
+    구경(Ø)이 없으면 한 줄: 이력 표기(품목명 글 일치) 또는 품목명 = 원문에서 수량만 뺀 글, 규격 비움.
+    수량이 없으면 1 (경고 로그) — 사람이 파일을 보고 거른다. 보류는 단가 개수 ≠ 품목 개수일 때만."""
+    from loguru import logger
+
     from job_parse import _dia_spans, norm, parse_dias, parse_qty
 
     d, e = norm(get("main_msg")), norm(get("spec_qty"))
     src = e if parse_dias(e) else d
     segs = job_segments(src)
-    if not segs:
-        raise LineError(f"구경(Ø) 없음 — 규격을 만들 수 없음({(e or d)[:40]!r})")
-    spans = _dia_spans(src)
-    prefix = src[:spans[0][1]] if spans else ""   # 첫 구경 앞 글 (Ra 표기 등)
+    n_items = len(segs) or 1
     tokens = [t for t in re.sub(r"\s+", "", str(get("unit_price") or "")).split("/") if t]
     prices = [parse_price(t) for t in tokens] or [parse_price("")]
     if len(prices) == 1:
-        prices = prices * len(segs)
-    elif len(prices) != len(segs):
-        raise LineError(f"단가 {len(prices)}개 ≠ 품목 {len(segs)}개 ({get('unit_price')!r})")
-    if len(segs) == 1:
+        prices = prices * n_items
+    elif len(prices) != n_items:
+        raise LineError(f"단가 {len(prices)}개 ≠ 품목 {n_items}개 ({get('unit_price')!r})")
+    if len(segs) <= 1:
         qtys = [parse_qty(e) or parse_qty(d)]
     else:
         qtys = [parse_qty(seg) for seg in segs]
     if any(not q for q in qtys):
-        raise LineError(f"수량 없음 ({(e or d)[:40]!r})")
+        logger.warning("임가공 줄 수량 없음 → 1로 ({!r})", (e or d)[:60])
+        qtys = [q or 1 for q in qtys]
+    if not segs:  # 구경 없음 — 모델명·품번만 적는 거래처
+        text = strip_qty(e or d)
+        name, spec = _history_by_text(text, ctx) or (text, "")
+        return [Line(name or (e or d), spec, qtys[0], prices[0])]
+    spans = _dia_spans(src)
+    prefix = src[:spans[0][1]] if spans else ""   # 첫 구경 앞 글 (Ra 표기 등)
     name0 = job_name(f"{d} {e}")
     out = []
     for i, (seg, qty, price) in enumerate(zip(segs, qtys, prices)):

@@ -66,9 +66,9 @@ def test_history_name_but_own_spec_when_length_differs():
 
 
 def test_no_history_other_client_or_future_ignored():
-    other = [ln(1, "2026-03-24", "남의 이름", "s", 50.0, 300, reg="999-99-99999"),
+    other = [DbLine(1, date(2026, 3, 24), "나사", "999-99-99999", "남의 이름", "s", 1, 1, 1, 50.0, 300, 0.0, 0.05),
              ln(2, "2026-11-27", "내일 이름", "s", 50.0, 300)]
-    assert job_lines(get("막힘 Ø50+0.0~+0.05 / 300 / 2개"), ctx(other))[0].name == "막힘 시린더호닝"
+    assert job_lines(get("Ø50+0.0~+0.05 / 300 / 2개"), ctx(other))[0].name == "시린더호닝"
 
 
 @pytest.mark.parametrize("text,name", [("막힘 Ø50", "막힘 시린더호닝"), ("사각 SUS Ø50", "SUS 사각 시린더호닝"),
@@ -94,10 +94,40 @@ def test_ra_prefix_kept_in_first_spec():
 
 
 @pytest.mark.parametrize("e,price,msg", [("Ø50 / 2개", "", "단가"), ("Ø50 / 1개 + Ø60 / 1개", "1/2/3", "단가 3개"),
-                                         ("Ø50 / 300", "45000", "수량"), ("긴급 호닝", "45000", "구경")])
+                                         ("STO-401 / 10개", "1/2", "단가 2개 ≠ 품목 1개")])
 def test_job_lines_errors(e, price, msg):
     with pytest.raises(LineError, match=msg):
         job_lines(get(e, price=price), ctx())
+
+
+def test_missing_qty_defaults_to_one():
+    assert job_lines(get("Ø50 / 300"), ctx()) == [Line("시린더호닝", "Ø50 / 300", 1, 45000)]
+
+
+# ---------------------------------------------------------------- 구경(Ø) 없는 행
+def test_no_dia_name_is_text_without_qty():
+    e = "STO-401 #2  NO2 각도30 조도 Ra0.8~1.0 / 10개"   # '30 조도'는 수량(조)이 아님
+    assert job_lines(get(e, price="6800"), ctx()) == [Line("STO-401 #2 NO2 각도30 조도 Ra0.8~1.0", "", 10, 6800)]
+
+
+def test_no_dia_uses_d_when_e_empty_and_keeps_text_after_qty():
+    assert job_lines(get("", d="펌프케이스 3개 긴급", price="50000"), ctx()) == [Line("펌프케이스 긴급", "", 3, 50000)]
+
+
+def test_no_dia_follows_history_by_text():
+    hist = [ln(1, "2026-01-05", "70K 각도30 조도 Ra 0.8~1.0", "Ø45.43 0~ 0.05", 45.43),
+            ln(2, "2025-01-05", "70K 각도30 조도 Ra 0.8~1.0", "옛 규격", 45.43)]
+    got = job_lines(get("70K 각도30 조도 Ra 0.8~1.0 / 448개", price="6800"), ctx(hist))
+    assert got == [Line("70K 각도30 조도 Ra 0.8~1.0", "Ø45.43 0~ 0.05", 448, 6800)]
+    # 다른 거래처·짧은 글은 이력으로 안 봄
+    other = [DbLine(3, date(2026, 1, 5), "나사", "999-99-99999", "70K 각도30 조도 Ra 0.8~1.0", "s", 1, 6800, 6800,
+                    45.43, None, 0.0, 0.05)]
+    assert job_lines(get("70K 각도30 조도 Ra 0.8~1.0 / 1개"), ctx(other))[0].spec == ""
+
+
+def test_parse_qty_set_unit_not_jodo():
+    from job_parse import parse_qty
+    assert parse_qty("각도30 조도 Ra0.8 / 10개") == 10 and parse_qty("Ø50 / 3조") == 3
 
 
 def test_dia_from_d_when_e_has_none():

@@ -14,7 +14,7 @@ _N = r"\d+(?:\.\d+)?"
 _NUM_RE = re.compile(_N)
 _DIA_RE = re.compile(r"(?:Ø|파이|내경)\s*(" + _N + r")")
 _PAREN_RE = re.compile(r"\([^()]*\)")
-_QTY_UNIT = r"(?:개|ea|pcs|본|set|조)"
+_QTY_UNIT = r"(?:개|ea|pcs|본|set|조(?!도))"
 _QTY_RE = re.compile(r"(\d+)\s*" + _QTY_UNIT + r"(?![a-z])", re.I)
 _HOLE_RE = re.compile(r"(\d+)\s*hole", re.I)
 
