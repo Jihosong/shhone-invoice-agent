@@ -149,7 +149,7 @@ def test_one_held_row_holds_whole_block():
 def test_hold_does_not_override_human_or_skip():
     w = make([r("11/25", "선기산업"), r("", "", "50x60", author="팀장"), r("", "", "60x70", status=ST_SCREEN)])
     poll(w)
-    assert statuses(w) == [ST_SCREEN, "", ST_SCREEN]
+    assert statuses(w) == ["", "", ""]  # 묶음 안 사람 작성자 → 보류보다 우선, 묶음 전체 사람처리
     w2 = make([r("11/25", "영성기공"), r("", "", "50x60", status=ST_SCREEN)])
     poll(w2)
     assert statuses(w2, (2, 3)) == [ST_SKIP, ST_SKIP]
@@ -256,7 +256,8 @@ def test_block_tag_not_written_to_human_or_skip_rows():
               r("11/26", "오성기계공구", author="사장"), r("", "", "50x60", basis="[예전 11/1 1/1] 그대로")])
     snap = poll(w)
     basis = [w.ws.values[n - 1][C["basis"]] for n in range(2, 9)]
-    assert basis == ["[선기산업 11/25 1/3] 사람 근거", "팀장 메모", "[선기산업 11/25 3/3]",
+    # 선기산업 묶음은 2행 작성자 '팀장' → 묶음 전체 사람처리라 태그 안 씀
+    assert basis == ["사람 근거", "팀장 메모", "",
                      "월말 메모", "", "", "[예전 11/1 1/1] 그대로"]
     assert snap[3]["block_tag"] == "[선기산업 11/25 2/3]"  # blocks 출력·순번은 그대로
 

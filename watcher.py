@@ -19,7 +19,12 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   manual_clients 표기: 해석 없이 묶음 전체 사람처리, 산출근거에 '[수동처리: 사유]'.
   날짜 없는 행 = 바로 위 묶음의 이어지는 줄 — 거래처 칸은 통째로 client_note.
   item_columns 중 하나라도 있으면 품목 행(견적·발행 대상), 없으면 메모 행(건너뜀, 상태 비움).
-  첫 행 작성자가 사람이면 묶음 전체 사람처리, 첫 행 거래처를 못 찾으면 묶음 전체 '보류-미등록'.
+  작성자 잠금은 묶음 단위: 묶음 안 어느 행이든(보통 날짜 있는 첫 행, 메모 행 포함) 사람 작성자가 있으면
+  묶음 전체 사람처리 — 다른 줄 작성자가 비어 있어도. 기존건-확인필요·발행대기·AI발행 판정보다 우선.
+  서로 다른 작성자가 섞이면(예: 1행 고문, 2행 AI) 사람처리 + WARNING.
+  첫 행 거래처를 못 찾으면 묶음 전체 '보류-미등록'.
+  로그: 거래처 판정(동명확인·수동처리·미등록 등)·작성자 섞임은 그 묶음의 판정이 바뀔 때만 찍음(매 폴링 반복 안 함).
+  '작업완료 체크 → 발행 후보'는 묶음이 발행 조건(작성자 없음·기존건/보류/제외 아님·전 행 작업완료)을 만족할 때만.
   첫 묶음보다 위의 날짜 없는 행은 건너뜀. block_id = 묶음 첫 행의 row_id.
   확정 판정도 묶음 단위: 묶음 last_change = 묶음 안 품목 행 last_change 중 최신.
   quote_settle_min이 안 지났으면 묶음 전체 '입력중', 지났으면 묶음 전체 함께 '확정'.
@@ -486,6 +491,18 @@ class Watcher:
         # 보류-화면이상은 유지 — 사람이 묶음 안 한 행의 상태 칸을 비우면 묶음 전체 재평가
         # 동명확인은 매 바퀴 다시 판정 (거래처 칸을 고치면 확정으로)
         self.post_quote = set(st[st.index(ST_QUOTED):]) - {ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM, ST_HCHECK}
+        self._log_state: dict[tuple, tuple | None] = {}
+
+    def _log_on_change(self, ident: tuple, level: str | None, msg: str = "", *args) -> None:
+        """같은 판정이면 매 바퀴 반복하지 않음 — ident(시트·묶음·종류)의 판정 문구가 바뀔 때만 로그.
+        level=None이면 '해당 없음'으로 기억만 (다시 생기면 다시 찍힘)."""
+        state = self.__dict__.setdefault("_log_state", {})
+        sig = (level, msg.format(*args)) if level else None
+        if state.get(ident) == sig:
+            return
+        state[ident] = sig
+        if level:
+            logger.log(level, msg, *args)
 
     # ------------------------------------------------------------------
     def run_once(self) -> None:
@@ -569,6 +586,27 @@ class Watcher:
             if not blk or not blk["entries"]:
                 return
             entries = blk["entries"]
+            where = f"sheet={label} row={blk['rownum']}"
+            if blk["client_log"]:
+                self._log_on_change((key, blk["id"], "client"), "INFO", where + " " + blk["client_log"][0],
+                                    *blk["client_log"][1:])
+            else:
+                self._log_on_change((key, blk["id"], "client"), None)
+            # 작성자 잠금 (묶음 단위): 묶음 안 어느 행이든(메모 행 포함) 사람 작성자가 있으면 묶음 전체 사람처리.
+            # 2번째 줄 이후 작성자가 비어 있어도 마찬가지 — 기존건·발행대기·AI발행 판정도 사람 것으로 봄.
+            filled = [(n, a) for n, a in blk["authors"] if a]
+            human = next((a for _, a in filled if a != ai), None)
+            if len({a for _, a in filled}) > 1:
+                self._log_on_change((key, blk["id"], "authors"), "WARNING",
+                                    "{} client={} 묶음 안 작성자가 섞임 ({}) → 묶음 전체 사람처리", where,
+                                    entries[0]["client_log"], ", ".join(f"{n}행 {a}" for n, a in filled))
+            else:
+                self._log_on_change((key, blk["id"], "authors"), None)
+            if human:
+                for e in entries:
+                    if e["author"] != human:
+                        e["author"] = human
+                        self.con.execute("UPDATE rows SET author=? WHERE row_id=?", (human, e["row_id"]))
             block_last = max(e["last_change"] for e in entries)
             # 묶음 안 한 행이라도 바뀌었거나, 알던 묶음에 새 행이 붙으면 묶음 전체가 '변경'
             news = [e["is_new"] for e in entries]
@@ -623,6 +661,12 @@ class Watcher:
                     self.con.execute("UPDATE issue_file_blocks SET removed_at=? WHERE block_id=?",
                                      (now_iso(), blk["id"]))
                     filed = filed_map[blk["id"]] = (filed[0], now_iso())
+            if any(e["just_flipped"] for e in entries):
+                why = self.issue_block_reason(blk, entries, human, ai)
+                if why:
+                    logger.debug("{} client={} 작업완료 체크 (발행 후보 아님: {})", where, entries[0]["client_log"], why)
+                else:
+                    logger.info("{} client={} 작업완료 체크 → 발행 후보", where, entries[0]["client_log"])
             file_mark = ""
             if filed:
                 file_mark = f" [→ {filed[0]}" + (" 뺌(수정됨)]" if filed[1] else "]")
@@ -678,30 +722,29 @@ class Watcher:
                 res = master.resolve_full(client_text) if client_text else Resolution(None, "", hold=ST_UNREG)
                 client_note = res.note
                 resolved = None if res.hold == ST_UNREG or res.manual else res.name
-                block = {"rownum": rownum, "row": row, "client": resolved, "author": cell(row, "author"),
-                         "id": None, "date": cell(row, "date"), "client_text": client_text,
+                block = {"rownum": rownum, "row": row, "client": resolved, "authors": [],
+                         "id": None, "client_log": None, "date": cell(row, "date"), "client_text": client_text,
                          "client_note": client_note, "entries": [], "reg_no": res.reg_no, "hold": res.hold,
                          "basis": res.basis, "notice": res.notice, "manual": res.manual}
                 counts["묶음"] += 1
                 cands = " | ".join(f"{c.name} {c.reg_no or '-'} 최근{c.last_date or '-'}" for c in res.candidates)
+                # 거래처 판정 로그는 finish_block에서 판정이 바뀔 때만 (매 폴링 반복 금지)
                 if res.manual:
-                    logger.info("sheet={} row={} 거래처 {!r} 수동처리 ({}) → 묶음 사람처리",
-                                label, rownum, client_text, res.manual)
+                    block["client_log"] = ("거래처 {!r} 수동처리 ({}) → 묶음 사람처리", client_text, res.manual)
                 elif res.hold == ST_HCHECK:
-                    logger.info("sheet={} row={} 거래처 {!r} {}", label, rownum, client_text, res.notice)
+                    block["client_log"] = ("거래처 {!r} {}", client_text, res.notice)
                 elif client_text and res.hold == ST_UNREG:
                     if res.candidates:
-                        logger.info("sheet={} row={} 거래처 후보 여럿 {!r} → 보류-미등록 (후보: {})",
-                                    label, rownum, client_text, cands)
+                        block["client_log"] = ("거래처 후보 여럿 {!r} → 보류-미등록 (후보: {})", client_text, cands)
                     else:
-                        logger.info("sheet={} row={} 거래처 미등록 {!r}", label, rownum, client_text)
+                        block["client_log"] = ("거래처 미등록 {!r}", client_text)
                 elif res.basis:
-                    logger.info("sheet={} row={} 거래처 {!r} → {} {} (후보: {})",
-                                label, rownum, client_text, res.name, res.basis, cands)
+                    block["client_log"] = ("거래처 {!r} → {} {} (후보: {})", client_text, res.name, res.basis, cands)
             elif block is None:
                 continue  # 첫 묶음보다 위의 날짜 없는 행
             else:  # 이어지는 줄: 거래처 칸은 해석하지 않고 통째로 메모
                 client_note = client_text
+            block["authors"].append((rownum, cell(row, "author")))  # 메모 행 포함 — 작성자 잠금은 묶음 단위
 
             if item_cols and not any(cell(row, c) for c in item_cols):
                 # 메모 행: 건너뜀, 상태 비움
@@ -721,12 +764,11 @@ class Watcher:
             counts["rows"] += 1
             fp = fingerprint([cell(row, c) for c in scfg["hash_columns"]])
             item_fp = fingerprint([cell(row, c) for c in item_hash_cols])  # 거래처 칸 뺀 지문
-            # 묶음 첫 행(또는 이 행)의 작성자가 사람 값이면 사람처리
-            author = next((a for a in (block["author"], cell(row, "author")) if a and a != ai),
-                          cell(row, "author"))
+            author = cell(row, "author")  # 묶음 작성자 잠금은 finish_block에서 (묶음 안 어느 행이든 사람 → 전체)
             status = cell(row, "status")
 
             work_end = bool_state(cell(row, "work_end")) if "work_end" in cols else "FALSE"
+            just_flipped = False
             shipped = bool_state(cell(row, "shipped")) if "shipped" in cols else "FALSE"
 
             # --- DB 갱신 ---
@@ -766,7 +808,7 @@ class Watcher:
                     legacy = False
                     if prev_work_end == "FALSE" and work_end == "TRUE":
                         flipped_at = now_iso()
-                        logger.info("sheet={} row={} client={} 작업완료 체크 → 발행 후보", label, rownum, client_log)
+                        just_flipped = True  # 로그는 finish_block에서 — 묶음이 발행 조건을 만족할 때만 '발행 후보'
                     elif work_end == "FALSE" and flipped_at and db_status != ST_ISSUED:
                         flipped_at = None  # 체크 해제 → 발행 후보에서 빠짐
                 self.con.execute(
@@ -783,6 +825,7 @@ class Watcher:
             # 상태는 묶음이 끝날 때 함께 결정 (finish_block)
             block["entries"].append({
                 "rownum": rownum, "row_id": row_id, "row": row, "author": author, "status": status,
+                "work_end": work_end, "just_flipped": just_flipped,
                 "fp": fp, "changed": changed, "items_changed": items_changed, "is_new": rec is None, "db_status": db_status if rec else None, "last_change": last_change, "legacy": legacy,
                 "flipped_at": flipped_at, "client_log": client_log, "client_note": client_note})
         finish_block(block)
@@ -800,6 +843,25 @@ class Watcher:
             f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run
             else f" 쓰기={written}" + (f" (보류 {len(writer) - written})" if written != len(writer) else ""),
         )
+
+    @staticmethod
+    def issue_block_reason(blk: dict, entries: list[dict], human: str | None, ai: str) -> str | None:
+        """작업완료 체크된 묶음이 발행 후보가 아닌 이유 (None = 후보: 견적만 끝나면 발행대기로 감)."""
+        if blk["manual"]:
+            return "수동처리"
+        if human:
+            return f"사람처리 (작성자 {human})"
+        if any(e["legacy"] for e in entries):
+            return "기존건"
+        for e in entries:
+            st = e["new_status"]
+            if st in (ST_SKIP, ST_HCHECK, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED) or (st or "").startswith(HOLD_PREFIX):
+                return st
+            if e["author"]:
+                return f"작성자 {e['author']}"
+        if not all(e["work_end"] == "TRUE" for e in entries):
+            return "다른 줄 작업완료 대기"
+        return None
 
     def mark_deleted(self, key, label, tab, values, cols, data_start_row, seen_ids) -> None:
         """이 탭에서 row_id가 더 이상 보이지 않는 행 → DB status '삭제됨' (이후 처리 안 함).

@@ -1,6 +1,8 @@
 """발행기 1단계 '반자동' — 발행 조건이 맞은 묶음을 경리나라 엑셀일괄등록 파일로 data/outbox/에 둔다.
 
 업로드는 사람이 한다. 흐름 (매 바퀴 watcher → pricer 다음):
+0) 작성자 잠금(묶음 단위): 묶음 안 어느 행이든 사람 작성자가 있으면(다른 줄은 비어 있거나 AI여도) 사람 것 —
+   마감·발행대기·파일 담기 모두 안 함 (watcher가 이미 묶음 전체 사람처리로 둠).
 1) 마감: 상태 발행대기/발행대기-수정됨인 묶음에서 사람이 아무 행의 작성자를 'AI'로 바꿨고 그 묶음이 파일에
    담겨 있으면 → 묶음 전체 AI발행, 모든 행 작성자 'AI'로 통일, rows.issued_at·issue_file_blocks.issued_at 기록.
 2) 발행대기 표시: 묶음 단위 조건 —
@@ -102,6 +104,8 @@ class Issuer:
         for block_id, rows in group_blocks(snap["rows"]):
             statuses = {r["status"] for r in rows}
             authors = [self._cell(scfg, r, "author") for r in rows]
+            if self.human_author(scfg, rows):
+                continue  # 묶음 안 사람 작성자가 하나라도 있으면 사람 것 — 마감·발행대기 안 함
             if statuses & {ST_PENDING, ST_PENDING_EDITED} and self.ai in authors:
                 if block_id in filed:
                     self._close(key, label, scfg, block_id, rows, writer, filed[block_id][0])
@@ -132,6 +136,14 @@ class Issuer:
             logger.info("issuer sheet={} 발행대기={} AI발행={}{}", label, counts[ST_PENDING], counts[ST_ISSUED],
                         " (dry-run)" if self.dry_run else f" 쓰기={written}")
 
+    def human_author(self, scfg: dict, rows: list[dict]) -> str | None:
+        """묶음 작성자 잠금: 시트 칸 또는 watcher가 정한 묶음 작성자(메모 행·다른 줄 포함) 중 사람 값."""
+        for r in rows:
+            for a in (self._cell(scfg, r, "author"), r.get("author") or ""):
+                if a and a != self.ai:
+                    return a
+        return None
+
     def waiting_reason(self, scfg: dict, rows: list[dict]) -> str | None:
         """발행대기로 갈 수 없는 이유 (None = 조건 충족). 대부분 '아직 기다림'이라 로그는 안 남김."""
         for r in rows:
@@ -145,7 +157,7 @@ class Issuer:
                     return "견적확인필요 (사람 단가 없음)"
             elif st != ST_QUOTED:
                 return f"상태 {st or '사람처리'}"
-            if self._cell(scfg, r, "author"):
+            if self._cell(scfg, r, "author") or r.get("author"):
                 return "작성자 있음"
             if r.get("legacy"):
                 return "기존건"
@@ -203,7 +215,7 @@ class Issuer:
             filed = self.filed(key)
             blocks = [(bid, rows) for bid, rows in group_blocks(snap["rows"])
                       if bid not in filed and all(r["status"] == ST_PENDING for r in rows)
-                      and not any(self._cell(scfg, r, "author") for r in rows)]
+                      and not any(self._cell(scfg, r, "author") or r.get("author") for r in rows)]
             if not blocks:
                 continue
             fresh = None if self.dry_run else self._fresh_rows(scfg, snap)

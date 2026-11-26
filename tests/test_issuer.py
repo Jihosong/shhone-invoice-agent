@@ -360,3 +360,106 @@ def test_write_xls_continuation_rows_have_no_header(tmp_path):
     st = Statement("abcd1234", CLIENT, REG, TODAY, [Line("호닝파이프", "a", 1, 10), Line("호닝파이프", "b", 1, 20)])
     s = xlrd.open_workbook(str(write_xls([st], tmp_path / "x.xls"))).sheet_by_index(0)
     assert s.row_values(2)[:7] == [""] * 7 and s.row_values(2)[7] == "1126" and s.row_values(2)[19] == ""
+
+
+# ---------------------------------------------------------------- 작성자 잠금 (묶음 단위)
+TWO_ROWS = [r("11/26", CLIENT, "40x50", "500", "5개"), r("", "", "50x60", "500", "2개")]
+
+
+class Logs:
+    def __enter__(self):
+        self.msgs = []
+        self.sink = logger.add(lambda m: self.msgs.append(m.record), level="DEBUG")
+        return self
+
+    def __exit__(self, *exc):
+        logger.remove(self.sink)
+
+    def count(self, text, level=None):
+        return sum(1 for m in self.msgs if text in m["message"] and (level is None or m["level"].name == level))
+
+
+def test_first_row_author_locks_whole_block_from_start(tmp_path):
+    """2행 묶음에서 1행만 작성자 '고문' → 2행(작성자 빈칸)까지 둘 다 사람처리, 발행대기 안 됨."""
+    rig = Rig(TWO_ROWS)
+    rig.set(2, "author", "고문")
+    rig.cycle()
+    age_all(rig.w)
+    rig.cycle()
+    rig.finish()
+    with Logs() as logs:
+        assert rig.cycle(bundle=True, out=tmp_path) is None
+    assert rig.col("status") == ["", ""]
+    assert rig.col("author") == ["고문", ""]  # 시트 작성자 칸은 안 건드림
+    snap = {x["rownum"]: x for x in rig.w.snapshots["t"]["rows"]}
+    assert snap[2]["author"] == snap[3]["author"] == "고문"
+    assert logs.count("발행 후보", "INFO") == 0
+    assert rig.db("SELECT COUNT(*) FROM issue_file_blocks") == [(0,)]
+
+
+def test_first_row_author_after_quote_locks_whole_block(tmp_path):
+    rig = Rig(TWO_ROWS).quoted()
+    rig.set(2, "author", "고문")
+    rig.finish()
+    assert rig.cycle(bundle=True, out=tmp_path) is None
+    assert rig.col("status") == ["", ""]
+    assert ST_PENDING not in rig.col("status")
+    rig.cycle(bundle=True, out=tmp_path)
+    assert rig.col("status") == ["", ""]
+
+
+@pytest.mark.parametrize("author_row", [3, 4])
+def test_later_row_or_memo_row_author_locks_whole_block(tmp_path, author_row):
+    """2번째 줄(품목) 또는 묶음 안 메모 행에만 작성자 → 1행 포함 묶음 전체 사람처리."""
+    rows = [list(x) for x in TWO_ROWS] + [r("", "", "", "", "")]  # 4행 = 메모 행
+    rig = Rig(rows)
+    rig.cycle()
+    age_all(rig.w)
+    rig.cycle()  # 견적완료
+    assert rig.col("status", [2, 3]) == [ST_QUOTED] * 2
+    rig.set(author_row, "author", "고문")
+    rig.finish([2, 3])
+    assert rig.cycle(bundle=True, out=tmp_path) is None
+    assert rig.col("status", [2, 3]) == ["", ""]
+
+
+def test_mixed_authors_human_wins_and_warns_once(tmp_path):
+    """1행 고문, 2행 AI → 사람처리 + WARNING (판정이 그대로면 다음 바퀴엔 다시 안 찍음)."""
+    rig, _ = ready(TWO_ROWS, tmp_path)  # 발행대기 + 파일에 담김
+    rig.set(2, "author", "고문")
+    rig.set(3, "author", "AI")
+    with Logs() as logs:
+        rig.cycle()
+        rig.cycle()
+    assert rig.col("status") == ["", ""]  # AI발행으로 마감하지 않음
+    assert rig.col("author") == ["고문", "AI"]
+    assert rig.db("SELECT issued_at FROM issue_file_blocks") == [(None,)]
+    assert logs.count("작성자가 섞임", "WARNING") == 1
+
+
+def test_issue_candidate_log_only_when_block_qualifies(tmp_path):
+    rig = Rig(TWO_ROWS).quoted()
+    with Logs() as logs:
+        rig.finish([2])
+        rig.cycle()  # 2행만 작업완료 → 아직 후보 아님
+        assert logs.count("발행 후보", "INFO") == 0
+        assert logs.count("다른 줄 작업완료 대기", "DEBUG") == 1
+        rig.finish([3])
+        rig.cycle()
+    assert logs.count("작업완료 체크 → 발행 후보", "INFO") == 1
+    assert rig.col("status") == [ST_PENDING] * 2
+
+
+def test_client_judgement_logged_only_on_change():
+    from tests.test_watcher_settle import make, poll, r as sr
+    w = make([sr("11/25", "모르는상사"), sr("", "", "50x60")])
+    with Logs() as logs:
+        poll(w)
+        poll(w)
+        poll(w)
+    assert logs.count("거래처 미등록", "INFO") == 1
+    w.ws.values[1][1] = "다른모르는상사"  # 판정 문구가 바뀌면 다시 찍음
+    with Logs() as logs:
+        poll(w)
+        poll(w)
+    assert logs.count("거래처 미등록", "INFO") == 1
