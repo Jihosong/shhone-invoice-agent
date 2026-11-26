@@ -59,6 +59,7 @@ FIELD_LABELS = {"main_msg": "D 주요 메시지", "spec_qty": "E 공차x갯수·
                 "pre_size": "H 연마량/치대", "pre_note": "S 호닝 전 매니저 노트",
                 "post_size": "T 호닝 후 치수", "post_note": "U 호닝 후 매니저 노트"}
 CONF_RANK = {"low": 0, "mid": 1, "high": 2}
+AI_PRESET_MAX = "mid"   # AI가 D열 숫자를 근거로 낸 사전단가의 confidence 상한
 
 _log_lock = threading.Lock()
 
@@ -317,6 +318,8 @@ class AiPricer:
         conf, basis = ans["confidence"], ans["basis"]
         if max_conf and CONF_RANK[conf] > CONF_RANK[max_conf]:
             conf, basis = max_conf, f"{basis} (24개월 초과 동일품 → 최대 {max_conf})"
+        if ans["method"] == "사전단가" and conf == "high":  # 규칙 단계가 거른 D열 숫자를 AI가 단가로 읽은 것
+            conf, basis = AI_PRESET_MAX, f"{basis} (AI 사전단가 → 최대 {AI_PRESET_MAX})"
         return Quote("AI-" + ans["method"], ans["unit_price"], conf, basis, cost_usd=cost)
 
 

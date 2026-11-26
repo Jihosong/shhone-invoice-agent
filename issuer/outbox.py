@@ -6,10 +6,11 @@
 1) 마감: 상태 발행대기/발행대기-수정됨인 묶음에서 사람이 아무 행의 작성자를 'AI'로 바꿨고 그 묶음이 파일에
    담겨 있으면 → 묶음 전체 AI발행, 모든 행 작성자 'AI'로 통일, rows.issued_at·issue_file_blocks.issued_at 기록.
 2) 발행대기 표시: 묶음 단위 조건 —
-   - 모든 품목 행 상태 견적완료(또는 견적확인필요인데 사람이 단가를 적음), 이번 바퀴에 바뀐 상태가 아님
+   - 모든 품목 행 상태 견적완료(호닝파이프는 견적확인필요인데 사람이 단가를 적은 것도), 이번 바퀴에 바뀐 상태가 아님.
+     임가공은 견적완료만 — 견적확인필요 행에는 에이전트 가견적 단가가 적혀 있다 (사람 확인은 pricer가 견적완료로 바꿈)
    - 모든 행 작성자 빈칸, 기존건 아님 (보류·동명확인·사람처리·제외는 위 상태 조건에서 이미 빠짐)
    - 모든 행 작업완료 TRUE, 그중 하나 이상은 에이전트가 FALSE→TRUE를 직접 봄(work_end_flipped_at)
-   - 줄을 만들 수 있음(거래처 사업자번호·날짜·규격·수량·단가) — 시트 kind에 builder가 있어야 함(지금은 pipe)
+   - 줄을 만들 수 있음(거래처 사업자번호·날짜·규격·수량·단가) — 시트 kind에 builder가 있어야 함(pipe, job)
    - 아직 어느 파일에도 담긴 적 없는 묶음
    일부만 작업완료면 기다림. 작업완료가 먼저고 견적이 늦으면 견적완료된 다음 바퀴에 발행대기.
 3) 묶음 파일(bundle — `agent.py issue`, run 루프에서는 issue.bundle_interval_min마다):
@@ -29,7 +30,8 @@ from pathlib import Path
 
 from loguru import logger
 
-from issuer.excel_upload import DEFAULT_MEMO_TEXT, LINE_BUILDERS, LineError, Statement, block_date, parse_price, write_xls
+from issuer.excel_upload import (DEFAULT_MEMO_TEXT, LINE_BUILDERS, LineCtx, LineError, Statement, block_date, parse_price,
+                                 write_xls)
 from watcher import (REG_NO_RE, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_SKIP, SheetWriter, bool_state, now_iso,
                      warn_once, with_block_tag)
 
@@ -151,6 +153,8 @@ class Issuer:
             st = r["status"]
             if st != self._cell(scfg, r, "status"):
                 return "이번 바퀴에 상태가 바뀜 (단가 칸이 아직 시트 값 기준이 아님)"
+            if st == ST_CHECK and scfg.get("kind") == "job":
+                return "견적확인필요 (임가공은 견적완료만 발행)"
             if st == ST_CHECK:
                 try:
                     parse_price(self._cell(scfg, r, "unit_price"))
@@ -177,13 +181,23 @@ class Issuer:
             raise LineError(f"사업자번호 없음/형식 아님({reg_no!r})")
         day = block_date(first.get("block_date") or "", snap["ws"].title, self.today)
         builder = LINE_BUILDERS[scfg["kind"]]
+        ctx = LineCtx(client, reg_no, day, self.job_index() if scfg["kind"] == "job" else None)
         lines = []
         for r in rows:
             try:
-                lines.append(builder(lambda name, r=r: self._cell(scfg, r, name)))
+                lines.extend(builder(lambda name, r=r: self._cell(scfg, r, name), ctx))
             except LineError as e:
                 raise LineError(f"row={r['rownum']} {e}") from None
         return Statement(block_id, client, reg_no, day, lines, sheet=key)
+
+    def job_index(self):
+        """임가공 이력 표기용 DB lines(kind=job) 색인. 줄 수·마지막 id가 바뀌면 다시 만든다."""
+        from cases import LineIndex, load_job_lines
+
+        key = self.con.execute("SELECT COUNT(*), MAX(id) FROM lines WHERE kind='job'").fetchone()
+        if getattr(self, "_job_index", None) is None or self._job_index[0] != key:
+            self._job_index = (key, LineIndex.build(load_job_lines(self.con)))
+        return self._job_index[1]
 
     def _close(self, key, label, scfg, block_id, rows, writer: SheetWriter, file_name: str) -> None:
         """사람이 업로드 후 작성자를 AI로 → 묶음 전체 AI발행 + 작성자 AI 통일."""

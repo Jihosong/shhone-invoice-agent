@@ -361,3 +361,11 @@ def test_prompt_hint_then_tendency_on_top():
                              hint="직전 동일품 1개 500,000 / 이번 1개 (2023-11-02; 24개월 초과)")
     same = msg.split("# 참고: 같은 거래처")[1]
     assert same.index("※ 직전 동일품") < same.index("※ 이 거래처 인상 성향") < same.index("40,000")
+
+
+def test_ai_preset_capped_at_mid(tmp_path):
+    ai = fake_ai(tmp_path, [{"unit_price": 80000, "method": "사전단가", "basis": "D열 8", "confidence": "high"},
+                            {"unit_price": 80000, "method": "사전단가", "basis": "D열 8", "confidence": "low"}])
+    q = ai.quote(job("Ø50 / 1개", d="8개"), LineIndex.build([]), CUT)
+    assert (q.method, q.confidence) == ("AI-사전단가", "mid") and "AI 사전단가 → 최대 mid" in q.basis
+    assert ai.quote(job("Ø50 / 1개"), LineIndex.build([]), CUT).confidence == "low"  # 낮은 건 그대로

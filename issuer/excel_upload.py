@@ -8,8 +8,10 @@
 - 품목비고는 비움(명세표에 인쇄되어 고객에게 보임). 공통메모는 config issue.memo_text 그대로
   (명세표마다 첫 줄에만, 이어지는 품목 줄은 비움). '(AI)'로 끝나서 월간 import가 AI 발행을 알아본다.
 
-줄 만들기는 시트 종류별 builder (블록의 한 행 → Line) — 지금은 호닝파이프(pipe)만. 임가공(job)은 나중에
-LINE_BUILDERS에 같은 인터페이스로 붙인다.
+줄 만들기는 시트 종류별 builder: builder(get, ctx) → [Line, …] (블록의 한 행 → 줄 하나 이상).
+- 호닝파이프(pipe): 한 행 = 한 줄 (pipe_line).
+- 임가공(job): 한 행에 품목(구경)이 여럿이면 여러 줄 (job_lines). 같은 거래처 동일품 이력이 있으면 그 명세표의
+  품목명·규격 표기를 따르고, 없으면 '막힘 시린더호닝' / 'Ø50+0.0~+0.05 / 300' 식으로 만든다.
 
 업로드 자동화(화면 조작)는 2단계 — 지금은 사람이 data/outbox/의 파일을 올린다.
 """
@@ -133,8 +135,118 @@ def pipe_line(get) -> Line:
     return Line(name, f"{key} L{length}", qty, parse_price(get("unit_price")))
 
 
-# 시트 kind → (행 → Line). 임가공(job)은 아직 없음 → 그 시트는 발행 대상에서 빠짐
-LINE_BUILDERS = {"pipe": pipe_line}
+# ---------------------------------------------------------------- 임가공
+@dataclass
+class LineCtx:
+    """builder에 넘기는 묶음 정보 (임가공 이력 표기용)."""
+    client: str = ""
+    reg_no: str = ""
+    day: date | None = None
+    index: object = None   # cases.LineIndex — 임가공일 때만
+
+
+JOB_BASE = "시린더호닝"
+JOB_FACE = "면작업"
+# 품목명 앞에 붙이는 말 (순서대로): (job_parse 라벨, 품목명 표기)
+JOB_NAME_PREFIX = [("수리/재작업", "수리품"), ("SUS", "SUS"), ("AL", "알미늄"), ("막힘", "막힘"), ("사각", "사각"),
+                   ("용접", "용접"), ("열처리", "열처리"), ("도금", "도금"), ("딥홀", "딥홀"), ("다공", "다공")]
+_QTY_TAIL_RE = re.compile(r"\s*[/×xX*]?\s*\d+\s*(?:개|ea|pcs|본|set|조)(?![a-z]).*$", re.I | re.S)
+_RA_RE = re.compile(r"Ra\s*\d+(?:\.\d+)?(?:\s*~\s*\d+(?:\.\d+)?)?", re.I)
+
+
+def job_name(text: str) -> str:
+    """D·E 글의 품목 성질·재질 키워드 → '수리품 SUS 막힘 시린더호닝'. 면작업이면 '시린더호닝' 대신 '면작업'."""
+    from job_parse import parse_materials, parse_specials
+
+    labels = set(parse_specials(text)) | set(parse_materials(text))
+    words = [w for lbl, w in JOB_NAME_PREFIX if lbl in labels]
+    return " ".join(words + [JOB_FACE if "면작업" in labels else JOB_BASE])
+
+
+def job_segments(text: str) -> list[str]:
+    """E(구경 없으면 D) 글 → 품목 구간들. 구경(Ø)마다 한 구간, '~Ø'로 이어진 범위·수량 없는 앞 구간은 다음에 붙임."""
+    from job_parse import _dia_spans, norm
+
+    s = norm(text)
+    spans = [st for _, st, _ in _dia_spans(s)]
+    starts = [st for i, st in enumerate(spans) if i == 0 or not s[max(0, st - 2):st].strip().endswith("~")]
+    if not starts:
+        return []
+    segs = [s[a:b].strip(" +,") for a, b in zip(starts, starts[1:] + [len(s)])]
+    out: list[str] = []
+    carry = ""
+    for i, seg in enumerate(segs):
+        seg = f"{carry} {seg}".strip() if carry else seg
+        if i < len(segs) - 1 and not _QTY_TAIL_RE.search(seg):
+            carry = seg
+            continue
+        carry = ""
+        out.append(seg)
+    return out
+
+
+def job_spec(seg: str, prefix: str = "") -> str:
+    """품목 구간 → 규격 (수량 부분과 그 뒤를 뺀 Ø·공차·기장). prefix의 Ra 표기는 앞에 붙임."""
+    spec = _QTY_TAIL_RE.sub("", seg).strip(" /+,")
+    ra = _RA_RE.search(prefix or "")
+    return f"{ra.group(0)} {spec}" if ra and ra.group(0) not in spec else spec
+
+
+def _history_label(seg_text: str, d: str, ctx: LineCtx) -> tuple[str, str] | None:
+    """같은 거래처 동일품 최근 명세표의 (품목명, 규격). 규격은 구경·기장이 똑같을 때만 그대로."""
+    from datetime import timedelta
+
+    from pricer_job import JobInput, same_item_lines
+
+    if ctx.index is None or not (ctx.client or ctx.reg_no):
+        return None
+    inp = JobInput.from_raw({"main_msg": d, "spec_qty": seg_text}, ctx.client, ctx.reg_no, ctx.day)
+    cands = same_item_lines(inp, ctx.index, (ctx.day or date.today()) + timedelta(days=1))
+    if not cands or not cands[0].item:
+        return None
+    ln = cands[0]
+    exact = (ln.dia is not None and inp.dia is not None and abs(ln.dia - inp.dia) < 1e-6
+             and (ln.length or None) == (inp.length or None))
+    return ln.item, (ln.spec if exact and ln.spec else "")
+
+
+def job_lines(get, ctx: LineCtx) -> list[Line]:
+    """임가공 한 행 → 줄들. 단가 '40000/25000'은 품목별, 단가 하나면 모든 줄 같은 단가. 수량은 구간별 'N개'."""
+    from job_parse import _dia_spans, norm, parse_dias, parse_qty
+
+    d, e = norm(get("main_msg")), norm(get("spec_qty"))
+    src = e if parse_dias(e) else d
+    segs = job_segments(src)
+    if not segs:
+        raise LineError(f"구경(Ø) 없음 — 규격을 만들 수 없음({(e or d)[:40]!r})")
+    spans = _dia_spans(src)
+    prefix = src[:spans[0][1]] if spans else ""   # 첫 구경 앞 글 (Ra 표기 등)
+    tokens = [t for t in re.sub(r"\s+", "", str(get("unit_price") or "")).split("/") if t]
+    prices = [parse_price(t) for t in tokens] or [parse_price("")]
+    if len(prices) == 1:
+        prices = prices * len(segs)
+    elif len(prices) != len(segs):
+        raise LineError(f"단가 {len(prices)}개 ≠ 품목 {len(segs)}개 ({get('unit_price')!r})")
+    if len(segs) == 1:
+        qtys = [parse_qty(e) or parse_qty(d)]
+    else:
+        qtys = [parse_qty(seg) for seg in segs]
+    if any(not q for q in qtys):
+        raise LineError(f"수량 없음 ({(e or d)[:40]!r})")
+    name0 = job_name(f"{d} {e}")
+    out = []
+    for i, (seg, qty, price) in enumerate(zip(segs, qtys, prices)):
+        hist = _history_label(seg if len(segs) > 1 else src, d, ctx)
+        spec = job_spec(seg, prefix if i == 0 else "")
+        name = name0
+        if hist:
+            name, spec = hist[0], hist[1] or spec
+        out.append(Line(name, spec, qty, price))
+    return out
+
+
+# 시트 kind → builder(get, ctx) → [Line, …]
+LINE_BUILDERS = {"pipe": lambda get, ctx=None: [pipe_line(get)], "job": job_lines}
 
 
 # ---------------------------------------------------------------- .xls 쓰기
