@@ -54,6 +54,10 @@ issue:
 # 임가공 견적 정책 (pricer_job) — 운영·백테스트 공통. 고치면 다음 견적부터 반영 (재시작 불필요)
 pricing:
   same_item_6_12m_confidence: mid   # 6~12개월 동일품(직전 단가 그대로): high → 견적완료 / mid → 가견적·견적확인필요
+  # 견적완료 이후 H(연마량/치대) 변경 — 사람 단가 행: 아래 중 하나면 견적확인필요(단가 유지), 아니면 산출근거에 덧붙임만
+  post_quote_chidae_ratio: 0.004    # |치대| ÷ 구경 ≥ 0.4%
+  post_quote_chidae_mm: 1.0         # 또는 |치대| ≥ 1mm
+  post_quote_chidae_nodia_mm: 0.2   # 구경을 모르면 |치대| ≥ 0.2mm
 
 # 묶음(block) 규칙 — 두 시트 공통 (watcher.py)
 #   날짜 칸이 있는 행 = 묶음 첫 행. 거래처는 이 행의 거래처 칸에서만 해석(별칭표 config/client_aliases.yaml

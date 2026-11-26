@@ -22,7 +22,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from watcher import QUOTED_STATES, ST_HCHECK, ST_QUOTED_EDIT, ST_QUOTED_OK, SheetWriter, strip_block_tag, with_block_tag
+from watcher import QUOTED_STATES, RECHECK_RE, ST_HCHECK, ST_QUOTED_EDIT, ST_QUOTED_OK, SheetWriter, strip_block_tag, with_block_tag
 
 ROOT = Path(__file__).parent
 PRICE_SHEET = "삼화호닝"
@@ -43,8 +43,16 @@ _MISMATCH_RE = re.compile(r"^단가 개수 불일치 \([^)]*\) \| ")
 
 
 def _job_body(body: str) -> str:
-    """산출근거에서 에이전트 표시('[가견적-…]', '단가 개수 불일치 …')를 뗀 본문."""
-    return _MISMATCH_RE.sub("", GAGYEON_RE.sub("", body))
+    """산출근거에서 에이전트 표시('[가견적-…]', '단가 개수 불일치 …')를 뗀 본문.
+    재확인 표시 '[연마량 -0.3 추가(…) — 단가 재확인] 사람 단가 N 유지'는 사유만 남김 ('연마량 -0.3 추가(…) | …')."""
+    body = _MISMATCH_RE.sub("", GAGYEON_RE.sub("", body))
+    m = RECHECK_RE.match(body)
+    return f"{m.group(1)} | {body[m.end():]}".rstrip(" |") if m else body
+
+
+def awaiting_human(body: str) -> bool:
+    """단가는 적혀 있고 사람 확인을 기다리는 행: 가견적, 또는 사람 단가 유지 + 재확인 (watcher 견적 이후 변경)."""
+    return bool(GAGYEON_RE.match(body) or RECHECK_RE.match(body))
 
 
 def gagyeon_tag(conf: str) -> str:
@@ -493,13 +501,16 @@ class Pricer:
             human_price = norm_price_cell(price_cell)
             human_edit = human_price and prev is not None and (
                 (status == ST_CHECK and human_price != (prev[0] or ""))
-                or (status == ST_CONFIRMED and prev[1] == (r.get("fp") or "") and GAGYEON_RE.match(body)))
+                or (status == ST_CONFIRMED and prev[1] == (r.get("fp") or "") and awaiting_human(body)))
             n_items = item_count(JobInput.from_sheet_row(row, cols, "", "").raw) if human_edit else 1
             if human_edit and len(human_price.split("/")) != n_items:
                 # 단가 개수 ≠ 품목 수 → 견적확인필요 유지 + 산출근거에 표시 (같은 표시가 이미 있으면 그대로)
-                g = GAGYEON_RE.match(body)
+                g, rc = GAGYEON_RE.match(body), RECHECK_RE.match(body)
                 note = f"단가 개수 불일치 (단가 {len(human_price.split('/'))}개 ≠ 품목 {n_items}개)"
-                new_body = f"{g.group(0) if g else ''}{note} | {_job_body(body)}"
+                if rc:  # 재확인 표시는 남김 (사람이 '확인'하면 적힌 단가로 사람확인)
+                    new_body = f"[{rc.group(1)} — 단가 재확인] | {note} | {_MISMATCH_RE.sub('', body[rc.end():])}"
+                else:
+                    new_body = f"{g.group(0) if g else ''}{note} | {_job_body(body)}"
                 if new_body == body and status == ST_CHECK:
                     continue
                 set_basis(new_body)
@@ -515,8 +526,8 @@ class Pricer:
                 learn = True
                 msg = f"사람 단가 {price_cell} → {new_status}"
             elif (status == ST_CONFIRMED and prev is not None and prev[1] == (r.get("fp") or "")
-                  and human_price and GAGYEON_RE.match(body)):
-                # 가견적 행인데 내용 그대로 확정으로 돌아옴 = 사람이 상태 칸을 비움 → 적힌 단가로 견적완료
+                  and human_price and awaiting_human(body)):
+                # 가견적(또는 재확인) 행인데 내용 그대로 확정으로 돌아옴 = 사람이 상태 칸을 비움 → 적힌 단가로 견적완료
                 # 단가도 고쳤으면 사람수정, 상태 칸만 비웠으면 사람확인
                 same = human_price == prev[0]
                 new_status = ST_QUOTED_OK if same else ST_QUOTED_EDIT
