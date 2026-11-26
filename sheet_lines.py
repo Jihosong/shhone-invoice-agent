@@ -1,9 +1,9 @@
 """시트 확정 단가 즉시 학습 — lines(source='sheet').
 
 사람이 임가공 시트에서 단가를 확정(가견적 행 상태 칸 비움 / 견적확인필요 행 단가 수정 → 견적완료)하거나
-묶음이 AI발행으로 마감되면, 그 행을 발행 줄과 같은 방식(issuer.excel_upload.job_lines)으로 줄로 만들어
+묶음이 명세표발행완료(AI)으로 마감되면, 그 행을 발행 줄과 같은 방식(issuer.excel_upload.job_lines)으로 줄로 만들어
 lines에 source='sheet', row_id=시트 행 id로 넣는다. 다음 견적부터 동일품·유사품 검색(cases.load_job_lines)에 쓰인다.
-  - 같은 row_id의 sheet 줄은 지우고 다시 넣는다 (사람 확정 뒤 AI발행 마감 = 같은 줄 갱신, 중복 없음).
+  - 같은 row_id의 sheet 줄은 지우고 다시 넣는다 (사람 확정 뒤 명세표발행완료(AI) 마감 = 같은 줄 갱신, 중복 없음).
   - 월간 import(feedback.main) 뒤 replace_by_official: 같은 거래처(사업자번호, 없으면 이름)·같은 날짜·
     같은 구경(±0.3mm, 구경 없는 줄은 둘 다 없을 때)의 공식 줄(source='export')이 있으면 sheet 줄은 지운다.
   - 백테스트는 공식 줄만 본다 (load_job_lines(official_only=True)) — 시트에서 온 답이 섞이지 않게.

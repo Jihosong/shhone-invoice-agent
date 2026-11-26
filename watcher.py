@@ -20,7 +20,7 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   날짜 없는 행 = 바로 위 묶음의 이어지는 줄 — 거래처 칸은 통째로 client_note.
   item_columns 중 하나라도 있으면 품목 행(견적·발행 대상), 없으면 메모 행(건너뜀, 상태 비움).
   작성자 잠금은 묶음 단위: 묶음 안 어느 행이든(보통 날짜 있는 첫 행, 메모 행 포함) 사람 작성자가 있으면
-  묶음 전체 사람처리 — 다른 줄 작성자가 비어 있어도. 기존건-확인필요·발행대기·AI발행 판정보다 우선.
+  묶음 전체 사람처리 — 다른 줄 작성자가 비어 있어도. 기존건-확인필요·명세표발행대기·명세표발행완료(AI) 판정보다 우선.
   서로 다른 작성자가 섞이면(예: 1행 고문, 2행 AI) 사람처리 + WARNING.
   첫 행 거래처를 못 찾으면 묶음 전체 '보류-미등록'.
   로그: 거래처 판정(동명확인·수동처리·미등록 등)·작성자 섞임은 그 묶음의 판정이 바뀔 때만 찍음(매 폴링 반복 안 함).
@@ -29,7 +29,7 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   확정 판정도 묶음 단위: 묶음 last_change = 묶음 안 품목 행 last_change 중 최신.
   quote_settle_min이 안 지났으면 묶음 전체 '입력중', 지났으면 묶음 전체 함께 '확정'.
   한 행이라도 바뀌면(알던 묶음에 행이 추가돼도) 견적 이후 단계 행까지 묶음 전체가 다시 입력중.
-  보류-* 행이 하나라도 있으면 제외·사람처리·AI발행 행을 뺀 묶음 전체를 같은 보류로.
+  보류-* 행이 하나라도 있으면 제외·사람처리·명세표발행완료(AI) 행을 뺀 묶음 전체를 같은 보류로.
   보류-미등록·보류-동명(같은 이름에 사업자번호 둘 이상)은 매 바퀴 재검사 → 풀리면 자동 해제.
   보류-화면이상은 유지, 사람이 묶음 안 아무 행의 상태 칸을 비우면 묶음 전체 재평가.
   산출근거 칸 맨 앞에 "[거래처(비고) 날짜 n/총줄수]" 묶음 표시 (품목 행 기준 순번) —
@@ -70,7 +70,9 @@ ST_QUOTED = "견적완료"
 ST_QUOTED_EDIT = "견적완료(사람수정)"   # 견적확인필요 행에서 사람이 단가 칸을 고쳐 확정
 ST_QUOTED_OK = "견적완료(사람확인)"     # 가견적 행 상태 칸만 비워 적힌 단가로 확정
 QUOTED_STATES = frozenset({ST_QUOTED, ST_QUOTED_EDIT, ST_QUOTED_OK})  # 발행기·watcher는 셋 다 견적완료로 봄
-ST_ISSUED = "AI발행"
+ST_ISSUED = "명세표발행완료(AI)"  # 사람이 업로드 후 작성자 AI → 묶음 마감
+ST_PRINTED = "명세표인쇄완료(AI)"  # (2단계용 예약) 발행 후 인쇄까지 끝남 — watcher는 발행완료와 똑같이 유지
+ISSUED_STATES = frozenset({ST_ISSUED, ST_PRINTED})
 ST_SKIP = "제외-월말일괄"
 ST_LEGACY = "기존건-확인필요"
 ST_UNREG = "보류-미등록"
@@ -78,10 +80,13 @@ ST_HOMONYM = "보류-동명"
 ST_SCREEN = "보류-화면이상"
 ST_HCHECK = "동명확인"  # homonyms 이름인데 법인/개인 표시 없음 → 기본 쪽으로 가견적만, 발행 안 함
 ST_DELETED = "삭제됨"  # DB 전용 (시트에 쓰지 않음): 시트에서 row_id가 사라진 행
-ST_PENDING = "발행대기"  # 발행 조건 충족 → data/outbox 파일에 담김(또는 담길 예정), 사람이 업로드
-ST_PENDING_EDITED = "발행대기-수정됨"  # 파일에 담긴 뒤 행이 수정됨 → 올린 파일과 어긋남, 사람이 봐야 함
+ST_PENDING = "명세표발행대기"  # 발행 조건 충족 → data/outbox 파일에 담김(또는 담길 예정), 사람이 업로드
+ST_PENDING_EDITED = "명세표발행대기-수정됨"  # 파일에 담긴 뒤 행이 수정됨 → 올린 파일과 어긋남, 사람이 봐야 함
 # 파일에 담긴 뒤 사람 작성자가 붙음 → 사람처리지만 경리나라 중복 발행 확인 필요. 사람이 상태 칸을 비우면 보통 사람처리
-ST_HUMAN_CHECK = "사람처리-발행확인"
+ST_HUMAN_CHECK = "사람처리-명세표중복확인"
+# 옛 상태 이름 → 새 이름. 시트에 옛 이름이 남아 있으면 새 이름으로 보고 다음 쓰기에 바꿔 씀 (DB는 ensure_columns가 이전)
+LEGACY_STATUS_NAMES = {"발행대기": ST_PENDING, "발행대기-수정됨": ST_PENDING_EDITED, "AI발행": ST_ISSUED,
+                       "AI발행-인쇄됨": ST_PRINTED, "사람처리-발행확인": ST_HUMAN_CHECK}
 # 상태 칸에 사람이 적는 '확인' 표시 — 상태 칸을 비운 것과 똑같이 취급 (견적확인필요 → 견적완료(사람확인) 등)
 HUMAN_OK_WORDS = frozenset({"확인", "ok"})  # casefold 비교: ok / OK / Ok
 HOLD_PREFIX = "보류-"
@@ -105,7 +110,7 @@ CREATE TABLE IF NOT EXISTS issue_file_blocks(
   block_date TEXT, n_lines INTEGER, supply INTEGER, tax INTEGER, row_ids TEXT,
   removed_at TEXT, issued_at TEXT);
 """
-# issue_file_blocks: 파일에 담긴 뒤 사람 작성자 → 사람처리-발행확인 표시한 때 / 사람이 상태 칸을 비워 확인한 때
+# issue_file_blocks: 파일에 담긴 뒤 사람 작성자 → 사람처리-명세표중복확인 표시한 때 / 사람이 상태 칸을 비워 확인한 때
 FILE_BLOCK_EXTRA = {"human_flag_at": "TEXT", "human_ack_at": "TEXT"}
 # 기존 DB에는 없을 수 있는 열 → 없으면 ALTER
 EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT",
@@ -128,7 +133,7 @@ def post_quote_states(status_values: list[str]) -> set[str]:
 def known_states(status_values: list[str]) -> set[str]:
     """시트 상태 칸에 에이전트가 쓰는 값 전부. 이 밖의 글자(+ 사람 확인 표시 제외)는 모르는 값 → 손대지 않음."""
     return set(status_values) | QUOTED_STATES | {
-        ST_TYPING, ST_CONFIRMED, ST_ISSUED, ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM, ST_SCREEN, ST_HCHECK,
+        ST_TYPING, ST_CONFIRMED, ST_ISSUED, ST_PRINTED, ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM, ST_SCREEN, ST_HCHECK,
         ST_PENDING, ST_PENDING_EDITED, ST_HUMAN_CHECK, "견적확인필요"}
 
 
@@ -142,7 +147,22 @@ def ensure_columns(con: sqlite3.Connection) -> None:
     for name, typ in FILE_BLOCK_EXTRA.items():
         if name not in have:
             con.execute(f"ALTER TABLE issue_file_blocks ADD COLUMN {name} {typ}")
+    migrate_status_names(con)
     con.commit()
+
+
+def migrate_status_names(con: sqlite3.Connection) -> int:
+    """DB에 남은 옛 상태 이름(rows.status) → 새 이름. sheet 학습 줄 비고('AI발행')도 함께. 바꾼 행 수."""
+    n = 0
+    for old, new in LEGACY_STATUS_NAMES.items():
+        n += con.execute("UPDATE rows SET status=? WHERE status=?", (new, old)).rowcount
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lines'").fetchone():
+        have = {r[1] for r in con.execute("PRAGMA table_info(lines)")}
+        if {"note", "source"} <= have:
+            con.execute("UPDATE lines SET note=? WHERE source='sheet' AND note='AI발행'", (ST_ISSUED,))
+    if n:
+        logger.info("DB 상태 이름 이전 {}행 ({})", n, ", ".join(f"{o}→{v}" for o, v in LEGACY_STATUS_NAMES.items()))
+    return n
 
 
 def bool_state(value: str) -> str:
@@ -535,6 +555,8 @@ class SheetWriter:
     - row_id가 아직 없는/새로 부여하는 행: 같은 행 번호의 내용이 읽을 때와 똑같을 때만 씀.
     - expect_fp(hash_columns 지문)를 주면 다시 읽은 행의 지문이 같을 때만 씀
       (읽은 뒤 내용이 바뀌었으면 낡은 판단을 쓰지 않음 — 다음 바퀴가 다시 판단).
+    - 같은 칸을 여러 번 add하면 마지막 값만 씀 — watcher·pricer가 한 writer를 같이 쓰면(agent.py run)
+      watcher의 중간 상태('확정')는 pricer의 최종 상태(견적완료(사람확인) 등)에 덮여 시트에 안 써짐.
     """
 
     def __init__(self, cols: dict, data_start_row: int, hash_columns: list[str], label: str = ""):
@@ -572,7 +594,8 @@ class SheetWriter:
             rid = (fresh[idx][id_col] if id_col < len(fresh[idx]) else "").strip()
             if ROW_ID_RE.match(rid) and rid not in where:  # 중복이면 위쪽이 주인 (ensure_row_id와 같은 규칙)
                 where[rid] = idx + 1
-        updates, dropped = [], 0
+        updates: dict[tuple[int, str], dict] = {}  # (행, 열) → 쓰기. 같은 칸을 여러 번 add하면 마지막 값만
+        dropped = 0
         for row_id, rownum, snap_row, name, value, expect_fp in self.items:
             if row_id and row_id not in self.new_ids:
                 target = where.get(row_id)
@@ -589,8 +612,9 @@ class SheetWriter:
             if target != rownum:
                 logger.info("sheet={} row_id={} 행 이동 {}→{} ({} 쓰기를 새 위치로)",
                             self.label, row_id, rownum, target, name)
-            updates.append({"range": rowcol_to_a1(target, self.cols[name]), "values": [[value]]})
-        return updates, dropped
+            updates.pop((target, name), None)
+            updates[(target, name)] = {"range": rowcol_to_a1(target, self.cols[name]), "values": [[value]]}
+        return list(updates.values()), dropped
 
     def flush(self, ws, dry_run: bool = False) -> int:
         """쓰기 직전 다시 읽고 row_id 기준으로 옮겨 batch_update. 실제 쓴 건수 반환."""
@@ -617,12 +641,69 @@ def load_client_master(con: sqlite3.Connection, extra_names=(), aliases: dict[st
                         today, rules.get("homonyms"), rules.get("manual"), rules.get("normalize"))
 
 
+# Google Sheets API 할당량: 읽기·쓰기 각각 프로젝트당 300회/분, 사용자당 60회/분.
+# 서비스 계정 하나로 도는 에이전트는 '사용자' 하나 → 실제 한도는 60회/분 (넘으면 HTTP 429).
+SHEETS_LIMIT_PER_MIN = 60
+
+
+class ApiMeter:
+    """gspread HTTP 요청 수 세기 (GET=읽기, 그 밖=쓰기). report()는 60초마다 지난 1분 호출 수를 로그로."""
+
+    def __init__(self, window: float = 60.0, clock=time.monotonic):
+        self.window = window
+        self.clock = clock
+        self.calls: list[tuple[float, str]] = []
+        self.last_report: float | None = None
+
+    def install(self, gc) -> None:
+        http = getattr(gc, "http_client", None)
+        if http is None or getattr(http, "_metered", False):
+            return
+        orig = http.request
+
+        def request(method, *a, **kw):
+            self.record("read" if str(method).upper() == "GET" else "write")
+            return orig(method, *a, **kw)
+
+        http.request = request
+        http._metered = True
+
+    def record(self, kind: str) -> None:
+        self.calls.append((self.clock(), kind))
+
+    def per_min(self) -> Counter:
+        cut = self.clock() - self.window
+        self.calls = [c for c in self.calls if c[0] > cut]
+        return Counter(k for _, k in self.calls)
+
+    def report(self, force: bool = False) -> Counter | None:
+        now = self.clock()
+        if self.last_report is None:
+            self.last_report = now  # 첫 1분이 다 찬 뒤부터
+            if not force:
+                return None
+        if not force and now - self.last_report < self.window:
+            return None
+        self.last_report = now
+        c = self.per_min()
+        worst = max(c["read"], c["write"])
+        level = "WARNING" if worst >= SHEETS_LIMIT_PER_MIN * 0.8 else "INFO"
+        logger.log(level, "sheets API 지난 1분 호출 읽기={} 쓰기={} (한도 사용자당 각 {}/분)", c["read"], c["write"],
+                   SHEETS_LIMIT_PER_MIN)
+        return c
+
+
 class Watcher:
     def __init__(self, cfg: dict, dry_run: bool = False):
         self.cfg = cfg
         self.common = cfg["common"]
         self.dry_run = dry_run
         self.gc = gspread.service_account(filename=self.common["credentials_file"])
+        self.api = ApiMeter()
+        self.api.install(self.gc)
+        # True면 process_sheet가 시트 쓰기를 미뤄 두고(snapshots[key]['writer']) pricer가 같은 writer에 더한 뒤
+        # flush_writes()로 한 번에 씀 → 중간 상태가 시트에 안 남고, 시트당 다시 읽기도 한 번 줄어듦
+        self.defer_flush = False
         Path(settings.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
         self.con = sqlite3.connect(settings.DB_PATH)
         ensure_columns(self.con)
@@ -668,8 +749,16 @@ class Watcher:
     def process_sheet(self, key: str, scfg: dict) -> None:
         label = scfg.get("label") or SHEET_LABELS.get(key, key)
         cols = scfg["columns"]
-        sh = self.gc.open_by_key(scfg["spreadsheet_id"])
-        ws = pick_active_tab(sh.worksheets(), self.common["month_tab_pattern"], scfg.get("ignore_tabs") or [])
+        books = self.__dict__.setdefault("_books", {})
+        sh = books.get(key)
+        if sh is None:  # open_by_key = 메타데이터 읽기 1회 → 한 번만 열고, 탭 목록은 매 바퀴 worksheets()로 새로
+            sh = books[key] = self.gc.open_by_key(scfg["spreadsheet_id"])
+        try:
+            tabs = sh.worksheets()
+        except Exception:
+            books.pop(key, None)
+            raise
+        ws = pick_active_tab(tabs, self.common["month_tab_pattern"], scfg.get("ignore_tabs") or [])
         if ws is None:
             logger.warning("sheet={} 활성 월 탭 없음", label)
             return
@@ -684,13 +773,13 @@ class Watcher:
         ai = self.common["author_ai_value"]
         skip_clients = [norm_text(c) for c in self.common.get("skip_clients") or []]
         now = datetime.now()
-        # 발행 파일에 담긴 묶음: block_id → (파일명, removed_at) — 산출근거 '[→ 파일]' 표시·발행대기-수정됨 판정
+        # 발행 파일에 담긴 묶음: block_id → (파일명, removed_at) — 산출근거 '[→ 파일]' 표시·명세표발행대기-수정됨 판정
         filed_map, human_map = {}, {}
         for bid, fn, rm, hf, ha in self.con.execute(
                 "SELECT block_id, file_name, removed_at, human_flag_at, human_ack_at FROM issue_file_blocks"
                 " WHERE sheet=?", (key,)):
             filed_map[bid] = (fn, rm)
-            human_map[bid] = (hf, ha)  # 사람처리-발행확인 표시한 때 / 사람이 확인(상태 칸 비움)한 때
+            human_map[bid] = (hf, ha)  # 사람처리-명세표중복확인 표시한 때 / 사람이 확인(상태 칸 비움)한 때
 
         writer = SheetWriter(cols, scfg["data_start_row"], scfg["hash_columns"], label)
         known = known_states(self.common["status_values"])
@@ -698,6 +787,8 @@ class Watcher:
         seen_ids: set[str] = set()
         snap_rows: list[dict] = []
         self.snapshots[key] = {"ws": ws, "values": values, "rows": snap_rows, "label": label}
+        if getattr(self, "defer_flush", False):
+            self.snapshots[key]["writer"] = writer  # pricer가 같은 writer에 더함 → flush_writes()
 
         def cell(row: list[str], name: str) -> str:
             return row[cols[name] - 1].strip()
@@ -721,10 +812,10 @@ class Watcher:
         def finish_block(blk: dict | None) -> None:
             """묶음 단위 상태 결정: 묶음 last_change(행들 중 최신) 기준으로 함께 입력중/확정.
             우선순위(제외 > 사람처리 > 보류 > 기존건 > 일반)는 행별 decide_status 그대로,
-            그 뒤 보류 행이 하나라도 있으면 (제외·사람처리·AI발행 행을 뺀) 묶음 전체를 보류로.
+            그 뒤 보류 행이 하나라도 있으면 (제외·사람처리·명세표발행완료(AI) 행을 뺀) 묶음 전체를 보류로.
             보류 우선순위: 미등록 > 동명 > 화면이상.
             manual_clients 묶음: 해석·판정 없이 전체 사람처리, 산출근거에 '[수동처리: 사유]'.
-            동명확인 묶음(homonyms 이름, 법인/개인 표시 없음): 확정 이후 단계(AI발행 제외) → '동명확인'.
+            동명확인 묶음(homonyms 이름, 법인/개인 표시 없음): 확정 이후 단계(명세표발행완료(AI) 제외) → '동명확인'.
             pricer가 기본 쪽 번호로 단가만 적고 상태는 동명확인 그대로 (발행 대상 아님).
             동명확인이던 묶음에서 거래처 칸만 고쳐 확정되면(품목 칸 지문 그대로) 안정화 대기 없이 바로 확정."""
             if not blk or not blk["entries"]:
@@ -737,7 +828,7 @@ class Watcher:
             else:
                 self._log_on_change((key, blk["id"], "client"), None)
             # 작성자 잠금 (묶음 단위): 묶음 안 어느 행이든(메모 행 포함) 사람 작성자가 있으면 묶음 전체 사람처리.
-            # 2번째 줄 이후 작성자가 비어 있어도 마찬가지 — 기존건·발행대기·AI발행 판정도 사람 것으로 봄.
+            # 2번째 줄 이후 작성자가 비어 있어도 마찬가지 — 기존건·명세표발행대기·명세표발행완료(AI) 판정도 사람 것으로 봄.
             filled = [(n, a) for n, a in blk["authors"] if a]
             human = next((a for _, a in filled if a != ai), None)
             if len({a for _, a in filled}) > 1:
@@ -780,26 +871,26 @@ class Watcher:
                     settle if client_fix else now - block_last, settle, ai, skip_clients, legacy=e["legacy"],
                     unregistered=blk["client"] is None or blk["hold"] == ST_UNREG, homonym=homonym,
                     filed=filed is not None)
-                if hcheck and new_status and new_status not in (ST_TYPING, ST_SKIP, ST_ISSUED, ST_LEGACY,
-                                                                ST_PENDING, ST_PENDING_EDITED) \
+                if hcheck and new_status and new_status not in (ST_TYPING, ST_SKIP, ST_LEGACY, ST_PENDING,
+                                                                ST_PENDING_EDITED, *ISSUED_STATES) \
                         and not new_status.startswith(HOLD_PREFIX):
                     new_status = ST_HCHECK
                 e["new_status"] = new_status
-            # 파일에 담긴 발행대기 묶음은 보류로 덮지 않음 (올린 파일과의 관계가 우선)
-            keep = {None, ST_SKIP, ST_ISSUED, ST_PENDING_EDITED} | ({ST_PENDING} if filed else set())
+            # 파일에 담긴 명세표발행대기 묶음은 보류로 덮지 않음 (올린 파일과의 관계가 우선)
+            keep = {None, ST_SKIP, ST_PENDING_EDITED, *ISSUED_STATES} | ({ST_PENDING} if filed else set())
             holds = [e["new_status"] for e in entries if (e["new_status"] or "").startswith(HOLD_PREFIX)]
             if holds:
                 hold = next((h for h in (ST_UNREG, ST_HOMONYM, ST_SCREEN) if h in holds), holds[0])
                 for e in entries:
                     if e["new_status"] not in keep:
                         e["new_status"] = hold
-            # 파일에 담긴 뒤 묶음이 수정됨 → 묶음 전체 발행대기-수정됨 (새로 붙은 행 포함), 파일에서 뺀 것으로 기록
+            # 파일에 담긴 뒤 묶음이 수정됨 → 묶음 전체 명세표발행대기-수정됨 (새로 붙은 행 포함), 파일에서 뺀 것으로 기록
             if filed and any(e["new_status"] == ST_PENDING_EDITED for e in entries):
                 for e in entries:
-                    if e["new_status"] not in (None, ST_SKIP, ST_ISSUED):
+                    if e["new_status"] not in (None, ST_SKIP, *ISSUED_STATES):
                         e["new_status"] = ST_PENDING_EDITED
                 if not filed[1]:
-                    logger.warning("sheet={} row={} client={} 발행대기 중 수정 → 발행대기-수정됨 ({}에서 뺌 — "
+                    logger.warning("sheet={} row={} client={} 명세표발행대기 중 수정 → 명세표발행대기-수정됨 ({}에서 뺌 — "
                                    "이미 올렸다면 경리나라 명세표와 어긋남, 확인 필요)",
                                    label, blk["rownum"], entries[0]["client_log"], filed[0])
                     self.con.execute("UPDATE issue_file_blocks SET removed_at=? WHERE block_id=?",
@@ -811,7 +902,7 @@ class Watcher:
                     logger.debug("{} client={} 작업완료 체크 (발행 후보 아님: {})", where, entries[0]["client_log"], why)
                 else:
                     logger.info("{} client={} 작업완료 체크 → 발행 후보", where, entries[0]["client_log"])
-            # 파일에 담긴 뒤 사람 작성자가 붙음 → 사람처리이되 상태 '사람처리-발행확인' + 산출근거 주의 + WARNING.
+            # 파일에 담긴 뒤 사람 작성자가 붙음 → 사람처리이되 상태 '사람처리-명세표중복확인' + 산출근거 주의 + WARNING.
             # 사람이 묶음 안 아무 행의 상태 칸을 비우면 확인한 것으로 보고 보통 사람처리 (다시 표시 안 함).
             caution = ""
             human_acked = False
@@ -822,7 +913,7 @@ class Watcher:
                     ack_at = now_iso()
                     self.con.execute("UPDATE issue_file_blocks SET human_ack_at=? WHERE block_id=?",
                                      (ack_at, blk["id"]))
-                    logger.info("{} client={} 사람처리-발행확인 해제 (상태 칸 비움) → 사람처리", where,
+                    logger.info("{} client={} 사람처리-명세표중복확인 해제 (상태 칸 비움) → 사람처리", where,
                                 entries[0]["client_log"])
                 if ack_at:
                     human_acked = True
@@ -830,7 +921,7 @@ class Watcher:
                     if not flag_at:
                         self.con.execute("UPDATE issue_file_blocks SET human_flag_at=? WHERE block_id=?",
                                          (now_iso(), blk["id"]))
-                        logger.warning("{} client={} 파일 {}에 담긴 뒤 작성자 변경({}) → 사람처리-발행확인 "
+                        logger.warning("{} client={} 파일 {}에 담긴 뒤 작성자 변경({}) → 사람처리-명세표중복확인 "
                                        "(경리나라 중복 발행 확인 필요)", where, entries[0]["client_log"], filed[0], human)
                     human_map[blk["id"]] = (flag_at or now_iso(), None)
                     caution = f" [주의: 파일 {filed[0]}에 담긴 뒤 작성자 변경 → 경리나라 중복 발행 확인]"
@@ -862,7 +953,7 @@ class Watcher:
                     if new_basis != basis:  # 태그 n/m 갱신은 '변경'이 아님 — 지문(hash_columns)에 없는 칸
                         writer.add(rownum, "basis", new_basis, row, row_id=row_id, expect_fp=e["fp"])
                 elif "basis" in cols and human_acked:
-                    # 사람이 확인한 사람처리-발행확인: 에이전트 표시([주의: …] 포함)만 떼고 사람 글은 그대로
+                    # 사람이 확인한 사람처리-명세표중복확인: 에이전트 표시([주의: …] 포함)만 떼고 사람 글은 그대로
                     basis = cell(row, "basis")
                     rest = strip_block_tag(basis)
                     if rest != basis and "[주의:" in basis[:len(basis) - len(rest)]:
@@ -946,6 +1037,10 @@ class Watcher:
             author = cell(row, "author")  # 묶음 작성자 잠금은 finish_block에서 (묶음 안 어느 행이든 사람 → 전체)
             status_raw = status = cell(row, "status")
             unknown_status = False
+            if status in LEGACY_STATUS_NAMES:  # 옛 이름 → 새 이름으로 판정, 칸은 이번 쓰기에 새 이름으로 바뀜
+                status = LEGACY_STATUS_NAMES[status]
+                self._log_on_change(("legacy_name", key, row_id), "INFO", "sheet={} row={} 상태 옛 이름 {!r} → {!r}",
+                                    label, rownum, status_raw, status)
             if status.casefold() in HUMAN_OK_WORDS:
                 status = ""  # 사람이 '확인'/'ok'라고 씀 = 상태 칸 비움
                 self._log_on_change(("human_ok", key, row_id), "INFO", "sheet={} row={} client={} 상태 칸 {!r} → "
@@ -996,13 +1091,13 @@ class Watcher:
                     legacy = True
                 elif prev_work_end is None:
                     # 이 규칙 이전에 발견된 행: 이전 상태를 모르므로 최초 발견처럼 판정 (이미 발행된 건 제외)
-                    legacy = db_status != ST_ISSUED and "TRUE" in (work_end, shipped)
+                    legacy = db_status not in ISSUED_STATES and "TRUE" in (work_end, shipped)
                 else:
                     legacy = False
                     if prev_work_end == "FALSE" and work_end == "TRUE":
                         flipped_at = now_iso()
                         just_flipped = True  # 로그는 finish_block에서 — 묶음이 발행 조건을 만족할 때만 '발행 후보'
-                    elif work_end == "FALSE" and flipped_at and db_status != ST_ISSUED:
+                    elif work_end == "FALSE" and flipped_at and db_status not in ISSUED_STATES:
                         flipped_at = None  # 체크 해제 → 발행 후보에서 빠짐
                 self.con.execute(
                     "UPDATE rows SET sheet=?, tab=?, row_number=?, fingerprint=?, last_change=?, author=? WHERE row_id=?",
@@ -1025,7 +1120,8 @@ class Watcher:
         finish_block(block)
         self.mark_deleted(key, label, ws.title, values, cols, scfg["data_start_row"], seen_ids)
 
-        written = writer.flush(ws, self.dry_run)
+        deferred = getattr(self, "defer_flush", False)
+        written = 0 if deferred else writer.flush(ws, self.dry_run)
 
         extra = [f"{k}={v}" for k, v in counts.items()
                  if k not in ("rows", "묶음", "메모", ST_TYPING, ST_CONFIRMED, "제외", "사람처리")]
@@ -1035,12 +1131,32 @@ class Watcher:
             counts["제외"], counts["사람처리"],
             (" " + " ".join(extra)) if extra else "",
             f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run
+            else f" 쓰기 대기={len(writer)} (pricer와 함께 씀)" if deferred
             else f" 쓰기={written}" + (f" (보류 {len(writer) - written})" if written != len(writer) else ""),
         )
 
+    def flush_writes(self) -> int:
+        """defer_flush 모드: 이번 바퀴 watcher+pricer 쓰기를 시트당 batch_update 한 번으로. 쓴 칸 수 반환."""
+        total = 0
+        for key, snap in self.snapshots.items():
+            writer = snap.pop("writer", None)
+            if writer is None:
+                continue
+            try:
+                written = writer.flush(snap["ws"], self.dry_run)
+            except Exception:
+                logger.exception("sheet={} 쓰기 실패", snap.get("label", key))
+                continue
+            total += written
+            if len(writer) and not self.dry_run:
+                logger.info("sheet={} 쓰기={}{}", snap.get("label", key), written,
+                            f" (요청 {len(writer)}, 같은 칸 덮어씀·보류 {len(writer) - written})"
+                            if written != len(writer) else "")
+        return total
+
     @staticmethod
     def issue_block_reason(blk: dict, entries: list[dict], human: str | None, ai: str) -> str | None:
-        """작업완료 체크된 묶음이 발행 후보가 아닌 이유 (None = 후보: 견적만 끝나면 발행대기로 감)."""
+        """작업완료 체크된 묶음이 발행 후보가 아닌 이유 (None = 후보: 견적만 끝나면 명세표발행대기로 감)."""
         if blk["manual"]:
             return "수동처리"
         if human:
@@ -1051,7 +1167,7 @@ class Watcher:
             st = e["new_status"]
             if e.get("unknown_status"):
                 return f"상태 칸 모르는 값 {e['status_raw']!r}"
-            if st in (ST_SKIP, ST_HCHECK, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED) or (st or "").startswith(HOLD_PREFIX):
+            if st in (ST_SKIP, ST_HCHECK, ST_PENDING, ST_PENDING_EDITED, *ISSUED_STATES) or (st or "").startswith(HOLD_PREFIX):
                 return st
             if e["author"]:
                 return f"작성자 {e['author']}"
@@ -1083,11 +1199,11 @@ class Watcher:
         """None = 사람이 처리(상태 비움).
 
         client는 묶음 첫 행에서 해석한 거래처명(미등록이면 원문). 우선순위:
-        제외-월말일괄 > 사람처리 > 발행대기(파일에 담김) > 보류-미등록 > 보류-동명 > 기존건-확인필요 > 일반 규칙.
+        제외-월말일괄 > 사람처리 > 명세표발행대기(파일에 담김) > 보류-미등록 > 보류-동명 > 기존건-확인필요 > 일반 규칙.
 
-        발행대기-수정됨은 사람이 볼 때까지 유지 (작성자 AI → AI발행, 사람 이름 → 사람처리).
-        발행대기 + 파일에 담김(filed) + 묶음 수정 → 발행대기-수정됨 (올린 파일과 어긋남).
-        아직 파일에 안 담긴 발행대기가 수정되면 일반 규칙(입력중 → 재견적)으로 — 아무도 올릴 수 없었으므로.
+        명세표발행대기-수정됨은 사람이 볼 때까지 유지 (작성자 AI → 명세표발행완료(AI), 사람 이름 → 사람처리).
+        명세표발행대기 + 파일에 담김(filed) + 묶음 수정 → 명세표발행대기-수정됨 (올린 파일과 어긋남).
+        아직 파일에 안 담긴 명세표발행대기가 수정되면 일반 규칙(입력중 → 재견적)으로 — 아무도 올릴 수 없었으므로.
 
         월말 일괄 거래처(skip_clients)는 작성자·기존건·완료/출고 여부와 무관하게 항상 '제외-월말일괄'.
         그 외: 작성자가 사람 값이면 기존건이어도 사람처리가 우선. '기존건-확인필요'는 작성자 빈칸인 기존건에만.
@@ -1109,7 +1225,7 @@ class Watcher:
             return ST_HOMONYM
         if legacy and not author:
             return ST_LEGACY
-        if status == ST_ISSUED:
+        if status in ISSUED_STATES:
             if changed:
                 logger.warning("sheet={} row={} client={} 발행후수정", label, rownum, client)
             return status

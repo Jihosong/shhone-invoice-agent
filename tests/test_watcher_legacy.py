@@ -9,7 +9,7 @@ from watcher import ST_CONFIRMED, ST_LEGACY, ST_SKIP, ST_TYPING, Watcher, ensure
 COLS = {"date": 1, "client": 2, "work_end": 3, "shipped": 4, "author": 5, "status": 6, "row_id": 7}
 SCFG = {"spreadsheet_id": "x", "label": "테스트", "data_start_row": 2, "columns": COLS,
         "hash_columns": ["client"]}
-STATUS_VALUES = [ST_TYPING, ST_CONFIRMED, "견적완료", "견적확인필요", "발행대기", "진행중", "AI발행",
+STATUS_VALUES = [ST_TYPING, ST_CONFIRMED, "견적완료", "견적확인필요", "명세표발행대기", "진행중", "명세표발행완료(AI)",
                  ST_SKIP, ST_LEGACY]
 
 

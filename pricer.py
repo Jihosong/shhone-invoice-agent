@@ -9,7 +9,8 @@ v1: 호닝파이프(kind: pipe) — data/price_table.xlsx '삼화호닝' 시트 
     → 그 행은 lines(source='sheet')로 즉시 학습 (sheet_lines.py).
 
 watcher가 한 바퀴 돈 뒤 그 결과(snapshot)를 받아 처리한다.
-대상: 상태 '확정' + 작성자 빈칸 + 기존건 아님. 시트 쓰기는 시트당 batch_update 한 번.
+대상: 상태 '확정' + 작성자 빈칸 + 기존건 아님. 시트 쓰기는 시트당 batch_update 한 번
+(agent.py run·issue: watcher와 같은 writer — 사람 '확인'/단가 수정 행은 중간 '확정' 없이 바로 견적완료(사람확인/사람수정)).
 """
 from __future__ import annotations
 
@@ -195,6 +196,22 @@ class Pricer:
             self._tables[str(path)] = cached
         return cached[1]
 
+    @staticmethod
+    def writer_for(snap: dict, cols: dict, scfg: dict, label: str):
+        """(writer, watcher와 같이 쓰는지, 시작 시 쌓인 쓰기 수). agent.py run은 watcher writer를 같이 써서
+        watcher의 중간 상태('확정')가 이 단계의 최종 상태로 덮인 채 한 번에 써짐."""
+        w = snap.get("writer")
+        if w is not None:
+            return w, True, len(w)
+        return SheetWriter(cols, scfg["data_start_row"], scfg["hash_columns"], label), False, 0
+
+    def flush_own(self, writer, shared: bool, base: int, snap: dict) -> str:
+        if shared:
+            return f" 쓰기 대기={len(writer) - base} (watcher와 함께 씀)"
+        if self.dry_run:
+            return f" (dry-run, 미기록 쓰기 {len(writer)}건)"
+        return f" 쓰기={writer.flush(snap['ws'], self.dry_run)}"
+
     def run_once(self, snapshots: dict[str, dict]) -> None:
         for key, scfg in self.cfg["sheets"].items():
             kind = scfg.get("kind")
@@ -215,7 +232,7 @@ class Pricer:
         label = snap.get("label", key)
         table = self.table_for(scfg)
         # 쓰기는 row_id 기준 — watcher가 읽은 뒤 행이 삭제·이동되면 새 위치로, 내용이 바뀌었으면 보류
-        writer = SheetWriter(cols, scfg["data_start_row"], scfg["hash_columns"], label)
+        writer, shared, base = self.writer_for(snap, cols, scfg, label)
         counts = Counter()
 
         def cell(row, name):
@@ -259,11 +276,10 @@ class Pricer:
             if not self.dry_run:
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
 
-        written = writer.flush(snap["ws"], self.dry_run)
+        tail = self.flush_own(writer, shared, base, snap)
         logger.info("pricer sheet={} 견적완료={} (사람수정 {} 사람확인 {}) 견적확인필요={} 동명확인가견적={}{}", label,
                     sum(counts[s] for s in QUOTED_STATES), counts[ST_QUOTED_EDIT], counts[ST_QUOTED_OK],
-                    counts[ST_CHECK], counts[ST_HCHECK],
-                    f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run else f" 쓰기={written}")
+                    counts[ST_CHECK], counts[ST_HCHECK], tail)
 
     # ------------------------------------------------------------ 임가공 (kind: job)
     def job_index(self):
@@ -434,7 +450,7 @@ class Pricer:
         cols = dict(scfg["columns"])
         cols.setdefault("pre_size", cols.get("stock_removal"))  # 시트 H 연마량/치대 = 정답지 pre_size
         label = snap.get("label", key)
-        writer = SheetWriter(scfg["columns"], scfg["data_start_row"], scfg["hash_columns"], label)
+        writer, shared, base = self.writer_for(snap, scfg["columns"], scfg, label)
         counts = Counter()
         index = None
         cutoff = date.today() + timedelta(days=1)  # 운영: 오늘까지의 DB 자료 전부
@@ -538,8 +554,7 @@ class Pricer:
             if not self.dry_run:
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
 
-        written = writer.flush(snap["ws"], self.dry_run)
+        tail = self.flush_own(writer, shared, base, snap)
         logger.info("pricer sheet={} 견적완료={} (사람수정 {} 사람확인 {}) 견적확인필요={} 동명확인가견적={}{}", label,
                     sum(counts[s] for s in QUOTED_STATES), counts[ST_QUOTED_EDIT], counts[ST_QUOTED_OK],
-                    counts[ST_CHECK], counts[ST_HCHECK],
-                    f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run else f" 쓰기={written}")
+                    counts[ST_CHECK], counts[ST_HCHECK], tail)

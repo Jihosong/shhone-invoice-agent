@@ -4,7 +4,7 @@
 
 common:
   credentials_file: C:/dev/secrets/gcp-service-account.json
-  poll_interval_sec: 30
+  poll_interval_sec: 15           # Sheets API 할당량 계산은 README '폴링 주기와 API 할당량'
   quote_settle_min: 5            # 마지막 수정 후 N분 무변화 → 가견적
   active_tab_rule: leftmost_month   # 가장 왼쪽의 "N월" 탭 하나만 감시
   month_tab_pattern: '^\d{1,2}월$'
@@ -24,26 +24,29 @@ common:
     - 견적완료(사람확인)          # 가견적 행 상태 칸만 비워 적힌 단가로 확정 (발행 조건상 견적완료)
     - 견적확인필요                # 견적확인필요 처리법: 상태 칸에 '확인'(또는 ok/OK) 입력 또는 비우기 → 견적완료(사람확인)
                                 #   / 단가 칸 수정 → 견적완료(사람수정). 그 밖의 모르는 글자는 건드리지 않음(WARNING)
-    - 발행대기                  # 발행 조건 충족 → data/outbox 파일에 담김, 사람이 업로드 후 작성자 AI → AI발행
-    - 발행대기-수정됨            # 파일에 담긴 뒤 행 수정 → 올린 파일과 어긋남, 사람이 확인 (작성자 AI/사람 이름으로 정리)
-    - 사람처리-발행확인          # 파일에 담긴 뒤 사람 작성자 → 경리나라 중복 발행 확인, 사람이 상태 칸 비우면 보통 사람처리
+    - 명세표발행대기                  # 발행 조건 충족 → data/outbox 파일에 담김, 사람이 업로드 후 작성자 AI → 명세표발행완료(AI)
+    - 명세표발행대기-수정됨            # 파일에 담긴 뒤 행 수정 → 올린 파일과 어긋남, 사람이 확인 (작성자 AI/사람 이름으로 정리)
+    - 사람처리-명세표중복확인          # 파일에 담긴 뒤 사람 작성자 → 경리나라 중복 발행 확인, 사람이 상태 칸 비우면 보통 사람처리
     - 진행중
-    - AI발행
+    - 명세표발행완료(AI)
+    - 명세표인쇄완료(AI)              # (2단계용 예약) 인쇄까지 끝남 — 지금은 에이전트가 쓰지 않음, 발행완료처럼 유지
     - 보류-동명
     - 보류-미등록
     - 보류-화면이상
     - 제외-월말일괄
     - 기존건-확인필요            # 최초 발견 시 이미 작업완료/출고완료 → 견적·발행 대상 아님
+  # 옛 이름(발행대기·발행대기-수정됨·AI발행·AI발행-인쇄됨·사람처리-발행확인)이 시트에 남아 있으면 다음 폴링에
+  # 새 이름으로 바꿔 씀 (watcher.LEGACY_STATUS_NAMES, DB rows.status도 시작할 때 이전)
   # (DB 전용 '삭제됨': 시트에서 row_id가 사라진 행 — 시트에는 쓰지 않으므로 위 목록에 넣지 않음)
 
 # 발행기 1단계 '반자동' (issuer/outbox.py) — 파일은 에이전트가, 업로드는 사람이
 #   발행 조건(묶음 단위): 모든 품목 행 견적완료(또는 견적확인필요 + 사람 단가) + 작성자 빈칸 + 기존건 아님
-#   + 모든 행 작업완료 TRUE + 그중 하나 이상 FALSE→TRUE를 에이전트가 봄 → 묶음 전체 '발행대기'.
-#   bundle_interval_min마다(또는 agent.py issue) 아직 파일에 없는 발행대기 묶음 → outbox_dir/YYYYMMDD_HHMM.xls.
-#   업로드 후 작성자를 AI로 → 묶음 전체 AI발행. 파일에 담긴 뒤 수정 → 발행대기-수정됨(WARNING).
+#   + 모든 행 작업완료 TRUE + 그중 하나 이상 FALSE→TRUE를 에이전트가 봄 → 묶음 전체 '명세표발행대기'.
+#   bundle_interval_min마다(또는 agent.py issue) 아직 파일에 없는 명세표발행대기 묶음 → outbox_dir/YYYYMMDD_HHMM.xls.
+#   업로드 후 작성자를 AI로 → 묶음 전체 명세표발행완료(AI). 파일에 담긴 뒤 수정 → 명세표발행대기-수정됨(WARNING).
 issue:
   outbox_dir: data/outbox
-  bundle_interval_min: 10
+  bundle_interval_min: 3
   # 공통메모(명세표마다 첫 줄에만). '(AI)'로 끝나야 월간 import가 AI 발행(statements.issued_by='AI')으로 알아봄.
   # 묶음 추적은 DB issue_file_blocks로 한다.
   memo_text: "(주)삼화호닝 기업 451-079229-04-018, 감사합니다. (AI)"

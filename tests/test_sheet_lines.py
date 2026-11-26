@@ -160,7 +160,7 @@ def test_monthly_import_replaces_sheet_lines(tmp_path, monkeypatch):
     assert len(pd.read_excel(tmp_path / "master.xlsx", sheet_name="거래내역")) == 1
 
 
-# ---------------------------------------------------------------- AI발행 마감 → 학습
+# ---------------------------------------------------------------- 명세표발행완료(AI) 마감 → 학습
 def test_ai_issue_close_learns_block_rows(monkeypatch):
     con = con_db()
     iss = ob.Issuer({"sheets": {"imgagong": JOB}, "common": {"author_ai_value": "AI"}, "issue": {}}, con,
@@ -168,7 +168,7 @@ def test_ai_issue_close_learns_block_rows(monkeypatch):
     rows = [job_row("막힘 Ø50+0.0~+0.05 / 300 / 2개", "45000"), job_row("Ø35 / 1개 + Ø40 / 3개", "40000/25000")]
     rows[0][14] = "AI"   # 사람이 업로드 후 작성자 AI
     s = {"label": "11월", "ws": SimpleNamespace(title="11월"), "rows": [
-        {"rownum": i + 3, "row_id": f"J{i}", "row": r, "fp": "f", "status": "발행대기", "author": "", "legacy": False,
+        {"rownum": i + 3, "row_id": f"J{i}", "row": r, "fp": "f", "status": "명세표발행대기", "author": "", "legacy": False,
          "block_id": "B1", "client_resolved": "가사", "client_reg_no": REG, "block_date": "11/26"}
         for i, r in enumerate(rows)]}
     con.execute("INSERT INTO issue_file_blocks(block_id, file_name, sheet) VALUES('B1', 'f.xls', 'imgagong')")
@@ -186,9 +186,9 @@ def test_ai_issue_close_learns_block_rows(monkeypatch):
     monkeypatch.setattr(ob, "SheetWriter", W)
     iss.process_sheet("imgagong", JOB, s)
     got = [(r[0], r[1], r[4], r[9], r[6], r[7], r[11]) for r in sheet_rows(con)]
-    assert got == [("J0", "2026-11-26", "막힘 시린더호닝", 50.0, 2.0, 45000, "AI발행"),
-                   ("J1", "2026-11-26", "시린더호닝", 35.0, 1.0, 40000, "AI발행"),
-                   ("J1", "2026-11-26", "시린더호닝", 40.0, 3.0, 25000, "AI발행")]
-    # 한 번 더 돌아도 (이미 AI발행) 중복 없음
+    assert got == [("J0", "2026-11-26", "막힘 시린더호닝", 50.0, 2.0, 45000, "명세표발행완료(AI)"),
+                   ("J1", "2026-11-26", "시린더호닝", 35.0, 1.0, 40000, "명세표발행완료(AI)"),
+                   ("J1", "2026-11-26", "시린더호닝", 40.0, 3.0, 25000, "명세표발행완료(AI)")]
+    # 한 번 더 돌아도 (이미 명세표발행완료(AI)) 중복 없음
     iss.process_sheet("imgagong", JOB, s)
     assert len(sheet_rows(con)) == 3

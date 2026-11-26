@@ -151,11 +151,11 @@ def con_db():
     return con
 
 
-def pipe_row(status="발행대기"):
+def pipe_row(status="명세표발행대기"):
     return ["11/26", "파이프사", "H.P", "80x90", "760", "1개", "TRUE", "FALSE", "", status, "39290", "", "P1"]
 
 
-def job_row(e, price, status="발행대기", d=""):
+def job_row(e, price, status="명세표발행대기", d=""):
     row = [""] * 28
     row[0], row[1], row[3], row[4], row[9], row[23], row[24], row[27] = "11/26", "가사", d, e, "TRUE", status, price, "J"
     return row
@@ -225,4 +225,4 @@ def test_job_block_goes_pending(tmp_path):
         iss.process_sheet("imgagong", JOB, s)
     finally:
         ob.SheetWriter = orig
-    assert writes == [(3, "status", "발행대기")]
+    assert writes == [(3, "status", "명세표발행대기")]

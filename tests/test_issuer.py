@@ -1,4 +1,4 @@
-"""발행기 1단계 '반자동': 발행 조건 → 발행대기 → outbox .xls → 작성자 AI → AI발행.
+"""발행기 1단계 '반자동': 발행 조건 → 명세표발행대기 → outbox .xls → 작성자 AI → 명세표발행완료(AI).
 
 watcher·pricer·issuer를 가짜 시트·메모리 DB로 한 바퀴씩 구동한다.
 파일 형식은 실제 업로드에 성공한 tests/fixtures/gyeongri/*.xls 와 셀 타입·값·서식을 비교한다.
@@ -90,7 +90,7 @@ class Rig:
 
 
 def ready(rows, tmp_path, **kw):
-    """견적완료 → 작업완료 체크 → 발행대기 + outbox 파일."""
+    """견적완료 → 작업완료 체크 → 명세표발행대기 + outbox 파일."""
     rig = Rig(rows, **kw).quoted().finish()
     path = rig.cycle(bundle=True, out=tmp_path)
     return rig, path
@@ -269,12 +269,12 @@ def test_edit_while_pending_marks_edited(tmp_path):
     assert rig.col("status") == [ST_PENDING_EDITED] * 3
     assert rig.col("basis")[0].startswith(f"[{CLIENT} 11/26 1/3] [→ {path.name} 뺌(수정됨)] ")
     assert rig.db("SELECT removed_at IS NOT NULL FROM issue_file_blocks") == [(1,)]
-    assert any("발행대기-수정됨" in m for m in warnings)
+    assert any("명세표발행대기-수정됨" in m for m in warnings)
     # 사람이 볼 때까지 유지 — 시간이 지나도 재견적·재발행 안 함
     age_all(rig.w)
     assert rig.cycle(bundle=True, out=tmp_path) is None
     assert rig.col("status") == [ST_PENDING_EDITED] * 3
-    # 사람이 정리하고 작성자 AI → AI발행
+    # 사람이 정리하고 작성자 AI → 명세표발행완료(AI)
     rig.set(2, "author", "AI")
     rig.cycle()
     assert rig.col("status") == [ST_ISSUED] * 3
@@ -288,9 +288,9 @@ def test_row_added_to_pending_block_marks_whole_block_edited(tmp_path):
 
 
 def test_edit_before_file_requotes(tmp_path):
-    """아직 파일에 안 담긴 발행대기는 아무도 올릴 수 없었으므로 일반 규칙(입력중 → 재견적)."""
+    """아직 파일에 안 담긴 명세표발행대기는 아무도 올릴 수 없었으므로 일반 규칙(입력중 → 재견적)."""
     rig = Rig(A_ROWS).quoted().finish()
-    rig.cycle()  # 발행대기 (bundle 안 함)
+    rig.cycle()  # 명세표발행대기 (bundle 안 함)
     assert rig.col("status") == [ST_PENDING]
     rig.set(2, "length", "800")
     rig.cycle(bundle=True, out=tmp_path)
@@ -340,7 +340,7 @@ def test_format_outbox(tmp_path):
     rig, path = ready(C_ROWS, tmp_path)
     lines = format_outbox(rig.w.con)
     assert lines[0].startswith(f"{path.name}  (") and "명세표 2장 2줄" in lines[0]
-    assert lines[1].startswith(f"  t / {CLIENT} / 2026-11-26 / 1줄 89,188 / 발행대기 / 묶음 ")
+    assert lines[1].startswith(f"  t / {CLIENT} / 2026-11-26 / 1줄 89,188 / 명세표발행대기 / 묶음 ")
 
 
 # ---------------------------------------------------------------- 줄 / 값
@@ -396,7 +396,7 @@ class Logs:
 
 
 def test_first_row_author_locks_whole_block_from_start(tmp_path):
-    """2행 묶음에서 1행만 작성자 '고문' → 2행(작성자 빈칸)까지 둘 다 사람처리, 발행대기 안 됨."""
+    """2행 묶음에서 1행만 작성자 '고문' → 2행(작성자 빈칸)까지 둘 다 사람처리, 명세표발행대기 안 됨."""
     rig = Rig(TWO_ROWS)
     rig.set(2, "author", "고문")
     rig.cycle()
@@ -441,13 +441,13 @@ def test_later_row_or_memo_row_author_locks_whole_block(tmp_path, author_row):
 
 def test_mixed_authors_human_wins_and_warns_once(tmp_path):
     """1행 고문, 2행 AI → 사람처리 + WARNING (판정이 그대로면 다음 바퀴엔 다시 안 찍음)."""
-    rig, _ = ready(TWO_ROWS, tmp_path)  # 발행대기 + 파일에 담김
+    rig, _ = ready(TWO_ROWS, tmp_path)  # 명세표발행대기 + 파일에 담김
     rig.set(2, "author", "고문")
     rig.set(3, "author", "AI")
     with Logs() as logs:
         rig.cycle()
         rig.cycle()
-    assert rig.col("status") == [ST_HUMAN_CHECK] * 2  # 파일에 담긴 뒤라 사람처리-발행확인, AI발행 마감 안 함
+    assert rig.col("status") == [ST_HUMAN_CHECK] * 2  # 파일에 담긴 뒤라 사람처리-명세표중복확인, 명세표발행완료(AI) 마감 안 함
     assert rig.col("author") == ["고문", "AI"]
     assert rig.db("SELECT issued_at FROM issue_file_blocks") == [(None,)]
     assert logs.count("작성자가 섞임", "WARNING") == 1
@@ -482,7 +482,7 @@ def test_client_judgement_logged_only_on_change():
     assert logs.count("거래처 미등록", "INFO") == 1
 
 
-# ---------------------------------------------------------------- 파일에 담긴 뒤 사람 작성자 → 사람처리-발행확인
+# ---------------------------------------------------------------- 파일에 담긴 뒤 사람 작성자 → 사람처리-명세표중복확인
 def test_filed_block_gets_human_author_flags_and_ack(tmp_path):
     rig, path = ready(TWO_ROWS, tmp_path)
     assert rig.col("status") == [ST_PENDING] * 2
@@ -497,7 +497,7 @@ def test_filed_block_gets_human_author_flags_and_ack(tmp_path):
     assert rig.col("basis")[1].startswith(f"[{CLIENT} 11/26 2/2] [→ {path.name}] {caution} 단가표 ")
     assert rig.col("basis")[1].endswith(" 사람 메모")
     assert logs.count("중복 발행 확인", "WARNING") == 1  # 다음 바퀴엔 반복 안 함
-    assert rig.db("SELECT issued_at FROM issue_file_blocks") == [(None,)]  # AI발행 아님
+    assert rig.db("SELECT issued_at FROM issue_file_blocks") == [(None,)]  # 명세표발행완료(AI) 아님
     # 사람이 확인하고 한 행의 상태 칸을 비움 → 묶음 전체 보통 사람처리, 주의 표시는 떼고 사람 메모는 남김
     rig.set(3, "status", "")
     rig.cycle()

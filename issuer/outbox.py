@@ -2,21 +2,21 @@
 
 업로드는 사람이 한다. 흐름 (매 바퀴 watcher → pricer 다음):
 0) 작성자 잠금(묶음 단위): 묶음 안 어느 행이든 사람 작성자가 있으면(다른 줄은 비어 있거나 AI여도) 사람 것 —
-   마감·발행대기·파일 담기 모두 안 함 (watcher가 이미 묶음 전체 사람처리로 둠).
-1) 마감: 상태 발행대기/발행대기-수정됨인 묶음에서 사람이 아무 행의 작성자를 'AI'로 바꿨고 그 묶음이 파일에
-   담겨 있으면 → 묶음 전체 AI발행, 모든 행 작성자 'AI'로 통일, rows.issued_at·issue_file_blocks.issued_at 기록.
+   마감·명세표발행대기·파일 담기 모두 안 함 (watcher가 이미 묶음 전체 사람처리로 둠).
+1) 마감: 상태 명세표발행대기/명세표발행대기-수정됨인 묶음에서 사람이 아무 행의 작성자를 'AI'로 바꿨고 그 묶음이 파일에
+   담겨 있으면 → 묶음 전체 명세표발행완료(AI), 모든 행 작성자 'AI'로 통일, rows.issued_at·issue_file_blocks.issued_at 기록.
    임가공이면 행마다 발행 줄을 lines(source='sheet')로 즉시 학습 (sheet_lines.py, 월간 import가 공식 줄로 대체).
-2) 발행대기 표시: 묶음 단위 조건 —
+2) 명세표발행대기 표시: 묶음 단위 조건 —
    - 모든 품목 행 상태 견적완료(호닝파이프는 견적확인필요인데 사람이 단가를 적은 것도), 이번 바퀴에 바뀐 상태가 아님.
      임가공은 견적완료만 — 견적확인필요 행에는 에이전트 가견적 단가가 적혀 있다 (사람 확인은 pricer가 견적완료(사람수정/사람확인)로 바꿈)
    - 모든 행 작성자 빈칸, 기존건 아님 (보류·동명확인·사람처리·제외는 위 상태 조건에서 이미 빠짐)
    - 모든 행 작업완료 TRUE, 그중 하나 이상은 에이전트가 FALSE→TRUE를 직접 봄(work_end_flipped_at)
    - 줄을 만들 수 있음(거래처 사업자번호·날짜·규격·수량·단가) — 시트 kind에 builder가 있어야 함(pipe, job)
    - 아직 어느 파일에도 담긴 적 없는 묶음
-   일부만 작업완료면 기다림. 작업완료가 먼저고 견적이 늦으면 견적완료된 다음 바퀴에 발행대기.
+   일부만 작업완료면 기다림. 작업완료가 먼저고 견적이 늦으면 견적완료된 다음 바퀴에 명세표발행대기.
 3) 묶음 파일(bundle — `agent.py issue`, run 루프에서는 issue.bundle_interval_min마다):
-   발행대기인데 아직 파일에 없는 묶음을 모아 data/outbox/YYYYMMDD_HHMM.xls 한 파일(묶음 하나 = 명세표 한 장).
-   쓰기 직전 시트를 다시 읽어 상태 발행대기·내용 그대로인 묶음만 담는다. DB issue_file_blocks의 block_id가
+   명세표발행대기인데 아직 파일에 없는 묶음을 모아 data/outbox/YYYYMMDD_HHMM.xls 한 파일(묶음 하나 = 명세표 한 장).
+   쓰기 직전 시트를 다시 읽어 상태 명세표발행대기·내용 그대로인 묶음만 담는다. DB issue_file_blocks의 block_id가
    PRIMARY KEY라 같은 묶음이 두 파일에 들어갈 수 없다(동시에 돌아도 DB가 막음). 산출근거 태그 뒤 '[→ 파일명]'.
 """
 from __future__ import annotations
@@ -109,7 +109,7 @@ class Issuer:
             statuses = {r["status"] for r in rows}
             authors = [self._cell(scfg, r, "author") for r in rows]
             if self.human_author(scfg, rows):
-                continue  # 묶음 안 사람 작성자가 하나라도 있으면 사람 것 — 마감·발행대기 안 함
+                continue  # 묶음 안 사람 작성자가 하나라도 있으면 사람 것 — 마감·명세표발행대기 안 함
             if statuses & {ST_PENDING, ST_PENDING_EDITED} and self.ai in authors:
                 if block_id in filed:
                     self._close(key, label, scfg, block_id, rows, writer, filed[block_id][0], snap)
@@ -133,11 +133,11 @@ class Issuer:
                 if not self.dry_run:
                     self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (ST_PENDING, r["row_id"]))
             counts[ST_PENDING] += 1
-            logger.info("issuer sheet={} row={} client={} 묶음 {} ({}줄) → 발행대기", label, rows[0]["rownum"],
+            logger.info("issuer sheet={} row={} client={} 묶음 {} ({}줄) → 명세표발행대기", label, rows[0]["rownum"],
                         rows[0].get("client_resolved"), block_id, len(rows))
         written = writer.flush(snap["ws"], self.dry_run)
         if counts:
-            logger.info("issuer sheet={} 발행대기={} AI발행={}{}", label, counts[ST_PENDING], counts[ST_ISSUED],
+            logger.info("issuer sheet={} 명세표발행대기={} 명세표발행완료(AI)={}{}", label, counts[ST_PENDING], counts[ST_ISSUED],
                         " (dry-run)" if self.dry_run else f" 쓰기={written}")
 
     def human_author(self, scfg: dict, rows: list[dict]) -> str | None:
@@ -149,7 +149,7 @@ class Issuer:
         return None
 
     def waiting_reason(self, scfg: dict, rows: list[dict]) -> str | None:
-        """발행대기로 갈 수 없는 이유 (None = 조건 충족). 대부분 '아직 기다림'이라 로그는 안 남김."""
+        """명세표발행대기로 갈 수 없는 이유 (None = 조건 충족). 대부분 '아직 기다림'이라 로그는 안 남김."""
         for r in rows:
             st = r["status"]
             if st != self._cell(scfg, r, "status"):
@@ -202,7 +202,7 @@ class Issuer:
 
     def _close(self, key, label, scfg, block_id, rows, writer: SheetWriter, file_name: str,
                snap: dict | None = None) -> None:
-        """사람이 업로드 후 작성자를 AI로 → 묶음 전체 AI발행 + 작성자 AI 통일.
+        """사람이 업로드 후 작성자를 AI로 → 묶음 전체 명세표발행완료(AI) + 작성자 AI 통일.
         임가공이면 행마다 발행 줄을 lines(source='sheet')로 즉시 학습 (sheet_lines)."""
         ts = now_iso()
         for r in rows:
@@ -221,11 +221,11 @@ class Issuer:
                              (ts, block_id))
             if scfg.get("kind") == "job" and snap is not None:
                 self._learn(scfg, snap, rows)
-        logger.info("issuer sheet={} row={} client={} 묶음 {} 작성자 AI 확인 → AI발행 ({})", label, rows[0]["rownum"],
+        logger.info("issuer sheet={} row={} client={} 묶음 {} 작성자 AI 확인 → 명세표발행완료(AI) ({})", label, rows[0]["rownum"],
                     rows[0].get("client_resolved"), block_id, file_name)
 
     def _learn(self, scfg: dict, snap: dict, rows: list[dict]) -> None:
-        """AI발행 마감 묶음의 임가공 행 → lines(source='sheet'). 줄을 못 만든 행은 로그만 (마감은 그대로)."""
+        """명세표발행완료(AI) 마감 묶음의 임가공 행 → lines(source='sheet'). 줄을 못 만든 행은 로그만 (마감은 그대로)."""
         import sheet_lines
 
         first = rows[0]
@@ -235,7 +235,7 @@ class Issuer:
         try:
             day = block_date(first.get("block_date") or "", getattr(snap.get("ws"), "title", ""), self.today)
         except LineError as e:
-            logger.warning("AI발행 줄 학습 건너뜀 묶음 {}: {}", first.get("block_id"), e)
+            logger.warning("명세표발행완료(AI) 줄 학습 건너뜀 묶음 {}: {}", first.get("block_id"), e)
             return
         ctx = LineCtx(client, reg_no, day, self.job_index())
         n = 0
@@ -245,14 +245,14 @@ class Issuer:
             try:
                 lines = LINE_BUILDERS["job"](lambda name, r=r: self._cell(scfg, r, name), ctx)
             except LineError as e:
-                logger.warning("AI발행 줄 학습 건너뜀 row={}: {}", r["rownum"], e)
+                logger.warning("명세표발행완료(AI) 줄 학습 건너뜀 row={}: {}", r["rownum"], e)
                 continue
-            n += sheet_lines.add_sheet_lines(self.con, r["row_id"], client, reg_no, day, lines, note="AI발행")
-        logger.info("AI발행 줄 학습 묶음 {} 거래처={} {} 줄 {}", first.get("block_id"), client, day, n)
+            n += sheet_lines.add_sheet_lines(self.con, r["row_id"], client, reg_no, day, lines, note="명세표발행완료(AI)")
+        logger.info("명세표발행완료(AI) 줄 학습 묶음 {} 거래처={} {} 줄 {}", first.get("block_id"), client, day, n)
 
     # ------------------------------------------------------------------ 파일 묶음
     def candidates(self, snapshots: dict[str, dict]) -> list[Candidate]:
-        """발행대기인데 아직 파일에 없는 묶음. 실제 실행이면 시트를 다시 읽어 상태·내용 그대로인 것만."""
+        """명세표발행대기인데 아직 파일에 없는 묶음. 실제 실행이면 시트를 다시 읽어 상태·내용 그대로인 것만."""
         out = []
         for key, scfg in self.cfg["sheets"].items():
             snap = snapshots.get(key)
@@ -273,7 +273,7 @@ class Issuer:
                 try:
                     st = self.statement(key, scfg, snap, bid, rows)
                 except LineError as e:
-                    warn_once(f"issuer sheet={snap.get('label', key)} 묶음 {bid} 발행대기지만 줄을 못 만듦: {e}")
+                    warn_once(f"issuer sheet={snap.get('label', key)} 묶음 {bid} 명세표발행대기지만 줄을 못 만듦: {e}")
                     continue
                 out.append(Candidate(key, snap["ws"].title, rows, st))
         return out
@@ -312,7 +312,7 @@ class Issuer:
             self.con.commit()  # 아래 실패 시 rollback이 앞 단계 기록까지 되돌리지 않게
         cands = self.candidates(snapshots)
         if not cands:
-            logger.info("issuer 파일 묶음: 새로 담을 발행대기 묶음 없음")
+            logger.info("issuer 파일 묶음: 새로 담을 명세표발행대기 묶음 없음")
             return None
         if out_dir is None:
             out_dir = Path(tempfile.mkdtemp(prefix="outbox_dryrun_")) if self.dry_run else self.outbox_dir()
