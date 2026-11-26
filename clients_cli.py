@@ -15,7 +15,7 @@ from pathlib import Path
 import yaml
 
 from feedback import norm_text
-from watcher import REG_NO_RE, compact_name
+from watcher import REG_NO_RE, NameNormalizer, compact_name
 
 REG_LIKE_RE = re.compile(r"^[\d\-\s]+$")
 SUGGEST_SINCE = "2025-01-01"
@@ -73,7 +73,7 @@ def print_find(con: sqlite3.Connection, query: str, year: str) -> None:
 
 
 # ---------------------------------------------------------------- aliases check
-SECTIONS = ("aliases", "homonyms", "manual_clients")
+SECTIONS = ("normalize", "aliases", "homonyms", "manual_clients")
 EMPTY = ("", "~", "null")
 
 
@@ -95,6 +95,24 @@ def check_aliases(path: Path, con: sqlite3.Connection) -> list[tuple[int, str, s
             problems.append((k.start_mark.line + 1, "경고", f"모르는 구역 '{k.value}' (무시됨)"))
     if not nodes:
         return [(1, "오류", "최상위에 aliases:/homonyms:/manual_clients: 구역이 없음")]
+
+    # normalize: 표기 변환표 — "원표기": "바꿀 표기". 아래 표기 비교도 해석과 같게 변환표를 거친 키로
+    pairs = []
+    nnode = nodes.get("normalize")
+    if isinstance(nnode, yaml.MappingNode):
+        for knode, vnode in nnode.value:
+            src = str(knode.value or "").strip()
+            dst = str(vnode.value or "").strip() if isinstance(vnode, yaml.ScalarNode) else ""
+            if not src or not dst:
+                problems.append((knode.start_mark.line + 1, "오류", f"normalize '{src}': 원표기·바꿀 표기 둘 다 필요"))
+            else:
+                pairs.append((src, dst))
+    elif nnode is not None and not (isinstance(nnode, yaml.ScalarNode) and nnode.value in EMPTY):
+        problems.append((nnode.start_mark.line + 1, "오류", "'normalize:' 아래는 '원표기: 바꿀 표기' 목록이어야 함"))
+    normalizer = NameNormalizer(pairs)
+
+    def compact_name(text):  # noqa: F811 — 해석(ClientMaster)과 같은 키
+        return normalizer.key(text)
 
     rows = _clients(con)
     names: dict[str, set[str]] = {}

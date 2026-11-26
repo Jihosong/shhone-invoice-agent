@@ -178,6 +178,46 @@ def compact_name(text: str) -> tuple[str, list[int]]:
     return "".join(c for c, _ in kept), [i for _, i in kept]
 
 
+class NameNormalizer:
+    """표기 변환표 (client_aliases.yaml normalize:) — compact_name 키에 차례로 적용.
+    시트 표기·마스터 등록명·별칭 모두 같은 변환을 거치므로 'ENG↔이엔지'처럼 양방향인 것도
+    한쪽으로 모으면 된다. 영문만으로 된 원표기(ENG 등)는 앞뒤가 영문자가 아닐 때만 바꾼다
+    (ENGINEERING 안의 eng는 그대로). 키 글자 → 원문 위치 대응은 바뀐 구간의 마지막 원문 위치로 유지."""
+
+    def __init__(self, pairs: list[tuple[str, str]] | None = None):
+        self.rules = []
+        for src, dst in pairs or []:
+            s, d = compact_name(src)[0], compact_name(dst)[0]
+            if not s or s == d:
+                continue
+            pat = re.escape(s)
+            if re.fullmatch(r"[a-z0-9]+", s):
+                pat = r"(?<![a-z])" + pat + r"(?![a-z])"
+            self.rules.append((re.compile(pat), d))
+
+    def __bool__(self) -> bool:
+        return bool(self.rules)
+
+    def apply(self, key: str, idx: list[int]) -> tuple[str, list[int]]:
+        for rx, dst in self.rules:
+            out, oidx, pos = [], [], 0
+            for m in rx.finditer(key):
+                out.append(key[pos:m.start()])
+                oidx += idx[pos:m.start()]
+                out.append(dst)
+                oidx += [idx[m.end() - 1]] * len(dst)
+                pos = m.end()
+            if pos:
+                out.append(key[pos:])
+                oidx += idx[pos:]
+                key, idx = "".join(out), oidx
+        return key, idx
+
+    def key(self, text: str) -> tuple[str, list[int]]:
+        k, idx = compact_name(text)
+        return self.apply(k, idx) if self.rules else (k, idx)
+
+
 REG_NO_RE = re.compile(r"^\d{3}-\d{2}-\d{5}$")
 ALIASES_YAML = Path(__file__).parent / "config" / "client_aliases.yaml"
 _warned: set[str] = set()
@@ -192,7 +232,7 @@ def warn_once(msg: str) -> None:
 
 def load_client_rules(path: Path | None) -> dict:
     """config/client_aliases.yaml → {'aliases': {표기: 정식명|번호}, 'homonyms': {이름: {법인, 개인, 기본}},
-    'manual': {표기: 사유}}. 파일이 없으면 모두 빈 dict."""
+    'manual': {표기: 사유}, 'normalize': [(원표기, 바꿀 표기)]}. 파일이 없으면 모두 빈 값."""
     data = {}
     if path and Path(path).exists():
         with open(path, encoding="utf-8") as f:
@@ -203,7 +243,8 @@ def load_client_rules(path: Path | None) -> dict:
 
     homonyms = {str(k): {str(a): str(b) for a, b in (v or {}).items() if b is not None}
                 for k, v in (data.get("homonyms") or {}).items() if isinstance(v, dict) or v is None}
-    return {"aliases": strmap("aliases"), "homonyms": homonyms, "manual": strmap("manual_clients")}
+    return {"aliases": strmap("aliases"), "homonyms": homonyms, "manual": strmap("manual_clients"),
+            "normalize": [(k, v) for k, v in strmap("normalize").items() if k.strip() and v.strip()]}
 
 
 _CORP_MARK_RE = re.compile(r"\(주\)|주\)|주식회사")  # NFKC 후 (㈜ → (주))
@@ -301,7 +342,9 @@ class ClientMaster:
     표기가 다른 등록 여럿 → 추측하지 않고 보류-미등록(후보는 로그). 별칭에 사업자번호를 적으면 그게 최우선."""
 
     def __init__(self, entries, aliases: dict[str, str] | None = None, today: date | None = None,
-                 homonyms: dict[str, dict] | None = None, manual: dict[str, str] | None = None):
+                 homonyms: dict[str, dict] | None = None, manual: dict[str, str] | None = None,
+                 normalize: list[tuple[str, str]] | None = None):
+        self.norm = NameNormalizer(normalize)  # 표기 변환표 — 별칭보다 먼저 (모든 키에 적용)
         self.by_key: dict[str, list[ClientRecord]] = {}
         self.by_reg: dict[str, ClientRecord] = {}
         self.by_name: dict[str, list[ClientRecord]] = {}
@@ -313,7 +356,7 @@ class ClientMaster:
         self.cutoff = (today - timedelta(days=365)).isoformat()
         for e in entries:
             rec = ClientRecord(e[0], "", e[1]) if len(e) == 2 else ClientRecord(*e)
-            key, _ = compact_name(rec.name or "")
+            key, _ = self.norm.key(rec.name or "")
             if not key:
                 continue
             if rec.weight < 0 and key in self.by_key:  # skip_clients 보충분: 마스터에 이미 있으면 무시
@@ -324,7 +367,7 @@ class ClientMaster:
             if rec.reg_no and (rec.reg_no not in self.by_reg or rec.weight > self.by_reg[rec.reg_no].weight):
                 self.by_reg[rec.reg_no] = rec
         for alias, target in (aliases or {}).items():
-            akey, _ = compact_name(alias)
+            akey, _ = self.norm.key(alias)
             target = (target or "").strip()
             if not akey or not target:
                 self.alias_errors.append(f"별칭 {alias!r}: 빈 값")
@@ -340,7 +383,7 @@ class ClientMaster:
                 else:
                     self.alias_errors.append(f"별칭 {alias!r}: 등록명 {target!r} 가 마스터에 없음")
         for name, spec in (homonyms or {}).items():
-            hkey, _ = compact_name(name)
+            hkey, _ = self.norm.key(name)
             sides, bad = {}, []
             for side in ("법인", "개인"):
                 reg = (spec.get(side) or "").strip()
@@ -358,7 +401,7 @@ class ClientMaster:
             elif hkey:
                 self.homonym[hkey] = (name, sides, default)
         for text, reason in (manual or {}).items():
-            mkey, _ = compact_name(text)
+            mkey, _ = self.norm.key(text)
             if mkey:
                 self.manual[mkey] = reason.strip() or "수동처리"
         for msg in self.alias_errors:
@@ -428,7 +471,7 @@ class ClientMaster:
 
     def resolve_full(self, text: str) -> Resolution:
         text = text or ""
-        key, idx = compact_name(text)
+        key, idx = self.norm.key(text)
         for n in range(len(key), 0, -1):
             k = key[:n]
             manual, alias, hom, cands = self.manual.get(k), self.alias.get(k), self.homonym.get(k), self.by_key.get(k)
@@ -444,7 +487,7 @@ class ClientMaster:
                 if kind == "reg":
                     rec = self.by_reg[target]
                     return Resolution(rec.name, note, rec.reg_no, how="별칭")
-                hom_target = self.homonym.get(compact_name(target)[0])
+                hom_target = self.homonym.get(self.norm.key(target)[0])
                 if hom_target:  # 별칭이 homonyms 이름을 가리키면 동명 규칙 (최근거래 규칙 아님)
                     return self._homonym(hom_target, text, note)
                 return self._decide(self.by_name[target], note, "별칭")
@@ -547,7 +590,7 @@ def load_client_master(con: sqlite3.Connection, extra_names=(), aliases: dict[st
         rows = []
     rules = rules or {}
     return ClientMaster(list(rows) + [(n, "", -1, None, None) for n in extra_names], aliases or rules.get("aliases"),
-                        today, rules.get("homonyms"), rules.get("manual"))
+                        today, rules.get("homonyms"), rules.get("manual"), rules.get("normalize"))
 
 
 class Watcher:

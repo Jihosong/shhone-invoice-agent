@@ -12,6 +12,7 @@
     python agent.py clients find <검색어>  # 마스터 이름 부분일치: 정식명/사업자번호/최근거래/올해 건수
     python agent.py clients add "<정식명>" <사업자번호>  # 경리나라 import에 없는 거래처 수동 등록
     python agent.py backtest build [--year 2026]  # 임가공 월 탭 전부(읽기만) + DB 실제 단가 → data/backtest/ 정답지
+    python agent.py backtest run --no-ai  # 정답지 match≠none 행에 사다리(사전단가·동일품) 채점 → results_noai.csv
     python agent.py backtest inflation  # DB 같은 거래처·같은 품목 연도별 단가 변화율 → data/backtest/inflation.csv
     python agent.py calibrate   # 화면 좌표/비전 보정
 """
@@ -188,6 +189,12 @@ def cmd_backtest_build(args: argparse.Namespace) -> None:
     backtest.build(args.year, samples=args.samples, none_samples=args.none_samples, seed=args.seed)
 
 
+def cmd_backtest_run(args: argparse.Namespace) -> None:
+    import backtest
+
+    backtest.run_scores(args.year, ai=args.ai, limit=args.limit, seed=args.seed, top=args.top)
+
+
 def cmd_backtest_inflation(args: argparse.Namespace) -> None:
     import sqlite3
     from pathlib import Path
@@ -243,6 +250,15 @@ def main() -> None:
     p_btb.add_argument("--none-samples", type=int, default=20, help="콘솔에 보일 match=none 샘플 수")
     p_btb.add_argument("--seed", type=int, default=0)
     p_btb.set_defaults(func=cmd_backtest_build)
+    p_btr = p_bt.add_parser("run", help="정답지 채점: --no-ai 사다리 a·b만 / --ai 미결 행 Claude 견적(B단계)")
+    g = p_btr.add_mutually_exclusive_group()
+    g.add_argument("--no-ai", dest="ai", action="store_false", help="사전단가·동일품만 (기본)")
+    g.add_argument("--ai", dest="ai", action="store_true", help="미결 행 일부를 Claude로 채점")
+    p_btr.set_defaults(ai=False, func=cmd_backtest_run)
+    p_btr.add_argument("--year", type=int, default=2026)
+    p_btr.add_argument("--limit", type=int, default=200, help="--ai: Claude로 채점할 미결 행 수")
+    p_btr.add_argument("--seed", type=int, default=0)
+    p_btr.add_argument("--top", type=int, default=20, help="틀린 것 상위 N건")
     p_bt.add_parser("inflation", help="DB 같은 거래처·같은 품목 연도별 단가 변화율 → data/backtest/inflation.csv"
                     ).set_defaults(func=cmd_backtest_inflation)
     sub.add_parser("calibrate", help="화면 좌표/비전 보정").set_defaults(func=cmd_calibrate)

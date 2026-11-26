@@ -19,12 +19,15 @@ from __future__ import annotations
 import random
 import re
 import sqlite3
-import unicodedata
 from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
 
 from cases import DbLine, LineIndex, load_job_lines
+from job_parse import (  # noqa: F401 — 공용 파서 (예전 import 경로 유지)
+    MATERIALS, RAW_FIELDS, SPECIALS, norm, parse_dias, parse_length, parse_materials, parse_qty, parse_ra,
+    parse_row, parse_specials, parse_tol,
+)
 
 ROOT = Path(__file__).parent
 OUT_DIR = ROOT / "data" / "backtest"
@@ -46,169 +49,10 @@ HEADER_FIELDS = {
     "post_size": ("호닝후치수",),
     "post_note": ("호닝후매니저노트",),
 }
-RAW_FIELDS = ("main_msg", "spec_qty", "difficulty", "pre_size", "pre_note", "post_size", "post_note")
 RAW_LETTERS = {"main_msg": "D", "spec_qty": "E", "difficulty": "F", "pre_size": "H", "pre_note": "S",
                "post_size": "T", "post_note": "U"}  # 콘솔 표시용 (11월 탭 기준 글자)
 
-# ---------------------------------------------------------------- 파서
-_N = r"\d+(?:\.\d+)?"
-_NUM_RE = re.compile(_N)
-_DIA_RE = re.compile(r"(?:Ø|파이|내경)\s*(" + _N + r")")
-_PAREN_RE = re.compile(r"\([^()]*\)")
-_QTY_UNIT = r"(?:개|ea|pcs|본|set|조)"
-_QTY_RE = re.compile(r"(\d+)\s*" + _QTY_UNIT + r"(?![a-z])", re.I)
-_HOLE_RE = re.compile(r"(\d+)\s*hole", re.I)
-
-
-def norm(text) -> str:
-    """NFKC, Φ/φ/∅ → Ø, 줄바꿈·연속 공백 → 한 칸."""
-    s = unicodedata.normalize("NFKC", str(text or ""))
-    s = re.sub(r"[ΦφØ∅⌀]", "Ø", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-_DIA_SUFFIX_RE = re.compile(r"(" + _N + r")\s*파이")
-# Ø 표기가 없을 때만: 숫자 바로 뒤 공차('스텐 100 +0.03~', 오타 'ㅊ55+0.0~'). 영문·숫자 뒤(모델명)는 제외
-_DIA_BARE_RE = re.compile(r"(?<![A-Za-z0-9.#~/-])(" + _N + r")\s*(?=[+-]\s*\d*\.\d|\+\s*-|±)")
-
-
-def _dia_spans(s: str) -> list[tuple[float, int, int]]:
-    """정규화된 글자에서 구경 후보 (값, 시작, 끝) — 위치 순."""
-    hits = [(float(m.group(1)), m.start(), m.end()) for rx in (_DIA_RE, _DIA_SUFFIX_RE) for m in rx.finditer(s)]
-    if not hits:
-        hits = [(float(m.group(1)), m.start(), m.end()) for m in _DIA_BARE_RE.finditer(s)
-                if float(m.group(1)) >= 3]
-    return sorted((h for h in hits if h[0] > 0), key=lambda h: h[1])
-
-
-def parse_dias(text) -> list[float]:
-    """'Ø100 ... + Ø58 ...' → [100.0, 58.0]. Ø·φ·파이·내경 앞뒤 숫자 (모델명 숫자 오인 방지)."""
-    out = []
-    for v, _, _ in _dia_spans(norm(text)):
-        if v not in out:
-            out.append(v)
-    return out
-
-
-def _first_segment(s: str) -> tuple[float | None, str]:
-    """첫 구경과 그 뒤 품목 구간(다음 구경 앞까지)."""
-    spans = _dia_spans(s)
-    if not spans:
-        return None, ""
-    v, _, end = spans[0]
-    nxt = next((st for _, st, _ in spans[1:] if st >= end), len(s))
-    return v, s[end:nxt]
-
-
-def _signed(sign: str, v: str) -> float:
-    return -float(v) if sign == "-" else float(v)
-
-
-def parse_tol(text) -> tuple[float | None, float | None]:
-    """첫 구경 바로 뒤 공차 → (lo, hi). 괄호 안(실측 메모)은 무시.
-    '+0.0~+0.07' / '0~ 0.1'(부호 없음=+) / '-0.0~-0.02' / '+-0.05'·'±0.05' / '+0.02'(→0~0.02) /
-    '-0.2'(→-0.2~0) / 'Ø88.722~88.773'(절대치수 → 0~0.051)."""
-    dia, seg = _first_segment(re.sub(r"~\s*Ø", "~", norm(text)))  # 'Ø11.005~Ø11.014'
-    if dia is None:
-        return None, None
-    seg = _PAREN_RE.sub(" ", seg.split("/")[0])
-    seg = re.sub(r"Ra\s*" + _N + r"(?:\s*~\s*" + _N + r")?", " ", seg, flags=re.I)
-    m = re.match(r"\s*~\s*Ø?\s*(" + _N + r")", seg)
-    if m and float(m.group(1)) >= 1:  # 절대치수 범위
-        return 0.0, round(float(m.group(1)) - dia, 4)
-    m = re.search(r"(?:±|\+\s*-|-\s*\+)\s*(" + _N + r")", seg)
-    if m:
-        v = float(m.group(1))
-        return -v, v
-    m = re.search(r"([+-]?)\s*(" + _N + r")\s*~\s*([+-]?)\s*(" + _N + r")", seg)
-    if m and float(m.group(2)) < 1 and float(m.group(4)) < 1:
-        a, b = _signed(m.group(1), m.group(2)), _signed(m.group(3), m.group(4))
-        return min(a, b), max(a, b)
-    m = re.search(r"(?<![\w.])([+-]?)\s*(" + _N + r")(?![\w.])", seg)
-    if m and float(m.group(2)) < 1:
-        v = _signed(m.group(1), m.group(2))
-        return (v, 0.0) if v < 0 else (0.0, v)
-    return None, None
-
-
-def parse_length(text) -> float | None:
-    """첫 품목 구간의 기장: '/ 862 / 149개' · '/1000(250) / 1개' · '/ 170L' · 'L300' · '기장 300'."""
-    s = norm(text)
-    dia, seg = _first_segment(s)
-    seg = seg if dia is not None else s
-    m = re.search(r"(?:기장|길이|(?<![A-Za-z0-9])L)\s*[:=]?\s*(" + _N + r")", seg)
-    if m:
-        return float(m.group(1))
-    m = re.search(r"(" + _N + r")\s*L(?![a-z])", seg, re.I) or re.search(r"×\s*(" + _N + r")", seg)
-    if m:
-        return float(m.group(1))
-    # '/ 862 /', '/1000(250) /', '/ 788~797 /'(앞 값), 끝의 '/ 300'
-    m = re.search(r"/\s*(" + _N + r")\s*(?:~\s*" + _N + r")?\s*(?:\([^()]*\))?\s*(?=/|\+|$|,)", seg)
-    return float(m.group(1)) if m else None
-
-
-def parse_qty(text) -> int | None:
-    """'N개'·'N EA'·'N본' 합계 ('/6개긴급 +8개' → 14, 여러 품목 → 합). 없으면 'N hole' 합."""
-    s = norm(text)
-    vals = [int(m.group(1)) for m in _QTY_RE.finditer(s)]
-    if not vals:
-        vals = [int(m.group(1)) for m in _HOLE_RE.finditer(s) if not re.match(r"\s*Ø", s[m.end():])]
-    vals = [v for v in vals if v > 0]
-    return sum(vals) if vals else None
-
-
-MATERIALS = [  # (라벨, 패턴) — 짧은 영문은 앞뒤 영문자 없을 때만
-    ("SUS", r"SUS|STS|스텐|스테인"),
-    ("AL", r"(?<![A-Z])AL(?![A-Z])|알루미|알미늄|A[5-7]0\d\d"),
-    ("FC", r"(?<![A-Z])FCD?(?![A-Z])|(?<![A-Z])FCD?\d+|주물|주철|덕타일"),
-    ("SCM", r"SCM"),
-    ("S45C", r"(?<![A-Z])SM?\d\dC(?![A-Z])"),
-    ("SKD", r"SKD"),
-    ("STKM", r"STKM"),
-    ("티타늄", r"티타늄|(?<![A-Z])TI(?![A-Z])"),
-    ("황동", r"황동|신주|BRASS"),
-    ("청동", r"청동|구리|COPPER"),
-    ("PVC", r"PVC"),
-    ("테프론", r"테프론|PTFE"),
-    ("인코넬", r"인코넬|INCONEL"),
-]
-SPECIALS = [
-    ("막힘", r"막힘|막힌|블라인드|BLIND"),
-    ("사각", r"사각"),
-    ("열처리", r"열처리|침탄|고주파|질화"),
-    ("도금", r"도금|크롬"),
-    ("조도", r"(?<![A-Z])RA\s*\d|(?<![A-Z])RZ\s*\d|조도|#\d{3,4}"),
-    ("치대", r"치대|연마량|호닝\s*전\s*[-+Ø]|MAKAN"),
-    ("용접", r"용접"),
-    ("얇은T", r"얇|박육|두께"),
-    ("수리/재작업", r"수리|재호닝|재생|2차\s*호닝|스크[랏래]치"),
-    ("면작업", r"면작업"),
-    ("릴리프", r"릴리프|도피"),
-    ("딥홀", r"딥홀|딮홀"),
-    ("다공", r"\d\s*(?:구멍|HOLE)"),
-    ("각도", r"각도"),
-    ("긴급", r"긴급|급함|PAGI"),
-]
-
-
-def _labels(table, text) -> list[str]:
-    s = norm(text).upper()
-    return [label for label, pat in table if re.search(pat, s)]
-
-
-def parse_materials(text) -> list[str]:
-    return _labels(MATERIALS, text)
-
-
-def parse_specials(text) -> list[str]:
-    return _labels(SPECIALS, text)
-
-
-def parse_ra(text) -> float | None:
-    m = re.search(r"Ra\s*(" + _N + r")", norm(text), re.I)
-    return float(m.group(1)) if m else None
-
-
+# ---------------------------------------------------------------- 날짜
 def parse_sheet_date(text, year: int, tab_month: int) -> date | None:
     """'2/13', '2.13', '2월13일', '2026-02-13'. 연도 없으면 탭 달 기준 (1월 탭의 12/29 → 전년)."""
     s = norm(text)
@@ -225,26 +69,6 @@ def parse_sheet_date(text, year: int, tab_month: int) -> date | None:
         return date(y, mo, d)
     except ValueError:
         return None
-
-
-def parse_row(raw: dict) -> dict:
-    """시트 원문(RAW_FIELDS) → 파싱 열. 치수·수량은 E 우선, 없으면 D."""
-    e, d = raw.get("spec_qty", ""), raw.get("main_msg", "")
-    src = e if parse_dias(e) else d
-    dias = parse_dias(src)
-    tol_lo, tol_hi = parse_tol(src)
-    qty = parse_qty(e) or parse_qty(d)
-    alltext = " ".join(raw.get(k, "") for k in RAW_FIELDS)
-    return {
-        "dia": dias[0] if dias else None,
-        "dia_all": " ".join(f"{v:g}" for v in dias),
-        "tol_lo": tol_lo, "tol_hi": tol_hi,
-        "length": parse_length(src) if dias else parse_length(e),
-        "qty": qty,
-        "material": ",".join(parse_materials(alltext)),
-        "specials": ",".join(parse_specials(alltext)),
-        "ra": parse_ra(e) or parse_ra(alltext),
-    }
 
 
 # ---------------------------------------------------------------- 시트 읽기
@@ -523,3 +347,136 @@ def build(year: int, samples: int = 30, none_samples: int = 20, seed: int = 0) -
         print(f"  [{r['tab']} {r['row']}행] {r['date']} {r['client_text']!r}→{r['client'] or '-'} "
               f"Ø{r['dia_all'] or '?'} L{r['length'] if r['length'] else '-'} : {r['match_reason']}"
               f"\n      E={r['raw_spec_qty']!r}")
+
+
+# ---------------------------------------------------------------- 채점 (backtest run)
+def _f(v) -> float | None:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if x == x else None  # NaN → None
+
+
+def load_answer_rows(year: int) -> list[dict]:
+    """정답지 CSV → 행 dict (빈칸은 '', 숫자 열은 그대로 문자열 — 쓰는 쪽에서 _f)."""
+    import csv
+
+    path = OUT_DIR / f"imgagong_{year}.csv"
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def score_rows(rows: list[dict], index: LineIndex) -> list[dict]:
+    """match≠none 행마다 사다리 a·b → 예측·실제·오차율. cutoff = 행 날짜, 정답 줄(line_id)은 후보에서 제외."""
+    from pricer_job import JobInput, quote_ladder
+
+    out = []
+    for r in rows:
+        if r.get("match") in ("", "none") or not r.get("date"):
+            continue
+        inp = JobInput.from_backtest(r)
+        lid = _f(r.get("line_id"))
+        q = quote_ladder(inp, index, inp.on_date, exclude_ids={int(lid)} if lid is not None else ())
+        actual = _f(r.get("actual_unit_price"))
+        err = (q.unit_price - actual) / actual if q.unit_price is not None and actual and actual > 0 else None
+        out.append({
+            "tab": r["tab"], "row": r["row"], "date": r["date"], "client": r["client"], "reg_no": r["reg_no"],
+            "raw_main_msg": r["raw_main_msg"], "raw_spec_qty": r["raw_spec_qty"],
+            "dia": inp.dia, "tol_lo": inp.tol_lo, "tol_hi": inp.tol_hi, "length": inp.length, "qty": inp.qty,
+            "keywords": ",".join(sorted(inp.item_keywords)),
+            "method": q.method, "pred": q.unit_price, "confidence": q.confidence or "", "basis": q.basis,
+            "ref_line_id": q.ref_line_id, "actual_unit_price": actual, "actual_qty": _f(r.get("actual_qty")),
+            "line_item": r.get("line_item", ""), "line_spec": r.get("line_spec", ""), "line_id": lid,
+            "err_rate": err, "abs_err": abs(err) if err is not None else None,
+        })
+    return out
+
+
+def accuracy_line(res: list[dict]) -> str:
+    import statistics
+
+    errs = [r["abs_err"] for r in res if r["abs_err"] is not None]
+    if not errs:
+        return f"{len(res)}건 (채점 가능 0)"
+    w10 = sum(1 for e in errs if e <= 0.10 + 1e-9)
+    w20 = sum(1 for e in errs if e <= 0.20 + 1e-9)
+    exact = sum(1 for e in errs if e < 1e-9)
+    skipped = len(res) - len(errs)
+    return (f"{len(errs)}건  중앙값 절대오차율 {statistics.median(errs):.1%}  정확일치 {exact / len(errs):.0%}"
+            f"  ±10% {w10 / len(errs):.0%}  ±20% {w20 / len(errs):.0%}"
+            + (f"  (실제 단가 0·없음 {skipped}건 제외)" if skipped else ""))
+
+
+def report_scores(res: list[dict], top: int = 20) -> list[str]:
+    n = len(res)
+    by = Counter(r["method"] for r in res)
+    out = [f"대상 match≠none {n}행",
+           "적용 비율: " + "  /  ".join(f"{m} {_pct(by[m], n)}" for m in ("사전단가", "동일품", "미결")
+                                         if m in by or m != "미결")]
+    applied = [r for r in res if r["pred"] is not None]
+    out.append("적용된 것 전체: " + accuracy_line(applied))
+    for m in ("사전단가", "동일품"):
+        sub = [r for r in applied if r["method"] == m]
+        if sub:
+            out.append(f"  {m}: " + accuracy_line(sub))
+    out.append("confidence별:")
+    for c in ("high", "mid", "low"):
+        sub = [r for r in applied if r["confidence"] == c]
+        if sub:
+            out.append(f"  {c}: " + accuracy_line(sub))
+            for m in ("사전단가", "동일품"):
+                sm = [r for r in sub if r["method"] == m]
+                if sm and len(sm) != len(sub):
+                    out.append(f"    {m}: " + accuracy_line(sm))
+    wrong = sorted((r for r in applied if r["abs_err"] is not None and r["abs_err"] > 1e-9),
+                   key=lambda r: -r["abs_err"])[:top]
+    out.append(f"틀린 것 상위 {len(wrong)}건 (오차율 큰 순):")
+    for r in wrong:
+        inp = (r["raw_main_msg"] + " | " if r["raw_main_msg"] else "") + r["raw_spec_qty"]
+        out.append(f"  {r['err_rate']:+.0%}  {r['client']}  [{r['tab']} {r['row']}행]  {inp[:70]!r}"
+                   f"  → 예측 {r['pred']:,} ({r['method']}/{r['confidence']})  실제 {r['actual_unit_price']:,.0f}"
+                   f"  | {r['basis'][:60]}")
+    return out
+
+
+def preset_diagnosis(res: list[dict]) -> list[str]:
+    """사전단가(D열 숫자) 가정 점검: 실제/D 배율 분포."""
+    from job_parse import norm as _norm
+
+    rows = [r for r in res if r["method"] == "사전단가" and r["actual_unit_price"]]
+    if not rows:
+        return ["사전단가 해당 행 없음"]
+    ratios = Counter()
+    for r in rows:
+        d = float(_norm(r["raw_main_msg"]).replace(",", ""))
+        k = r["actual_unit_price"] / d
+        lbl = ("×10,000" if abs(k - 10000) < 1e-6 else "×1(원 그대로)" if abs(k - 1) < 1e-6
+               else "×100,000" if abs(k - 100000) < 1e-6 else "×1,000" if abs(k - 1000) < 1e-6 else "기타")
+        ratios[(lbl, "D<1000" if d < 1000 else "D≥1000")] += 1
+    out = [f"사전단가 {len(rows)}건 — 실제 단가 / D값 배율:"]
+    for (lbl, band), c in sorted(ratios.items(), key=lambda kv: -kv[1]):
+        out.append(f"  {band} {lbl}: {c}")
+    return out
+
+
+def run_scores(year: int, ai: bool = False, limit: int = 200, seed: int = 0, top: int = 20) -> None:
+    import pandas as pd
+
+    from cases import load_job_lines
+    from config.settings import settings
+
+    if ai:
+        raise SystemExit("--ai (Claude 견적)은 B단계 — 아직 구현 안 됨")
+    db = (ROOT / settings.DB_PATH) if not Path(settings.DB_PATH).is_absolute() else Path(settings.DB_PATH)
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)  # DB 읽기 전용
+    index = LineIndex.build(load_job_lines(con))
+    res = score_rows(load_answer_rows(year), index)
+    path = OUT_DIR / "results_noai.csv"
+    pd.DataFrame(res).to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"== 백테스트 채점 (사다리 a·b, API 없음) {year} → {path.relative_to(ROOT)}")
+    for line in report_scores(res, top):
+        print(("  " if not line.startswith("  ") else "") + line)
+    print("\n== 사전단가(D열) 가정 점검")
+    for line in preset_diagnosis(res):
+        print(("  " if not line.startswith("  ") else "") + line)
