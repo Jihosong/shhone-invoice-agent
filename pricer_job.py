@@ -12,9 +12,11 @@
      과거 단가 없음 → mid, 그 외 high.
   b. 동일품 — 같은 거래처(사업자번호, 없으면 정규화 이름)의 DB lines(kind=job) 중
      구경 ±0.3mm, 공차 동일(둘 다 있을 때), 기장 ±5%(둘 다 있을 때), 치대 동일(둘 다 있을 때),
-     품목 성질 키워드(ITEM_KEYWORDS 7개) 집합 동일 → 가장 최근 건의 단가 그대로 (연 % 보정 없음):
-       6개월 이내 high / 6~24개월 mid '직전 YYYY-MM — 인상 검토' /
-       24개월 초과 → 미결 (Quote.hint에 직전 단가·날짜, B단계에서 인상 성향 보고 판단, max_conf=mid).
+     품목 성질 키워드(ITEM_KEYWORDS 7개) 집합 동일 → 가장 최근 건 기준, 경과 기간별:
+       6개월 이내 직전 단가 그대로 high / 6~12개월 그대로 high '직전 YYYY-MM, 동결 유지' /
+       12~24개월 직전 × 1.05 (100원 버림) mid '직전 40,000 (2025-09) → +5% 인상 제안'
+         — 거래처가 인상형(최근 3쌍 평균 인상률 > 5%, inflation.client_trend)이면 그 평균(상한 15%) /
+       24개월 초과 → 미결 (Quote.hint에 직전 단가·날짜 + '최소 +5% 이상 제안할 것', max_conf=mid).
      수량이 직전의 3배 이상 / ⅓ 이하면 동일품으로 확정하지 않고 미결 (Quote.hint로 직전 건을 B단계에 넘김).
   c. 미결 — B단계(Claude 견적, pricer_ai)로 넘김.
 모든 DB 검색은 cutoff_date **이전**(당일 제외) 자료만 — 백테스트 정답 누출 방지.
@@ -25,8 +27,10 @@ import re
 import statistics
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal
 
 from cases import DbLine, LineIndex
+from inflation import RAISE_DEFAULT
 from job_parse import (RAW_FIELDS, is_stock_removal, item_texts, norm, parse_chidae, parse_dias, parse_row,
                        parse_specials)
 
@@ -36,8 +40,9 @@ M_PENDING = "미결"
 
 SAME_DIA_TOL = 0.3       # mm
 SAME_LEN_TOL = 0.05      # 비율
-FRESH_DAYS = 183         # 6개월 이내 → high
-STALE_DAYS = 730         # 6~24개월 → mid(인상 검토), 24개월 초과 → AI(최대 mid)
+FRESH_DAYS = 183         # 6개월 이내 → 그대로 high
+FREEZE_DAYS = 365        # 6~12개월 → 그대로 high (동결 유지)
+STALE_DAYS = 730         # 12~24개월 → 인상 제안 mid, 24개월 초과 → AI(최대 mid, 최소 +5% 제안)
 CHIDAE_TOL = 1e-6
 QTY_RATIO = 3.0
 PRESET_MIN = 5_000       # 사전단가로 인정하는 범위 (원)
@@ -207,8 +212,11 @@ def _len_same(inp: JobInput, ln: DbLine) -> bool:
     return not inp.length or not ln.length or abs(ln.length - inp.length) <= SAME_LEN_TOL * inp.length
 
 
-def same_item_lines(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_ids=()) -> list[DbLine]:
-    """동일품 후보 (최근 순). cutoff_date 당일·이후와 exclude_ids(백테스트 정답 줄)는 제외."""
+def same_item_lines(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_ids=(),
+                    loose_kw: bool = False) -> list[DbLine]:
+    """동일품 후보 (최근 순). cutoff_date 당일·이후와 exclude_ids(백테스트 정답 줄)는 제외.
+    품목 성질 키워드는 같아야 한다. loose_kw면 시트 쪽 키워드가 명세표 쪽의 부분집합이어도 후보
+    (시트는 '용접' 같은 성질을 자주 빠뜨림 — 부록 B.2) — 키워드가 똑같은 후보가 먼저."""
     if cutoff_date is None:
         raise ValueError("cutoff_date 필수 (백테스트 정답 누출 방지)")
     if inp.dia is None or not (inp.reg_no or inp.client):
@@ -217,14 +225,15 @@ def same_item_lines(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_
     out = [ln for ln in index.client_lines(inp.reg_no, inp.client)
            if ln.date < cutoff_date and ln.id not in exclude_ids and ln.unit_price and ln.unit_price > 0
            and ln.dia is not None and abs(ln.dia - inp.dia) <= SAME_DIA_TOL
-           and _tol_same(inp, ln) and _len_same(inp, ln) and line_keywords(ln) == kw and _chidae_same(inp, ln)]
-    out.sort(key=lambda ln: (ln.date, ln.id), reverse=True)
+           and _tol_same(inp, ln) and _len_same(inp, ln) and _chidae_same(inp, ln)
+           and (line_keywords(ln) == kw or (loose_kw and kw < line_keywords(ln)))]
+    out.sort(key=lambda ln: (line_keywords(ln) == kw, ln.date, ln.id), reverse=True)
     return out
 
 
 def quote_same_item(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_ids=()) -> Quote | None:
     """동일품 Quote. 수량 차이가 크면 미결 Quote(hint=직전 건) — 사다리가 그대로 B단계로 넘긴다."""
-    cands = same_item_lines(inp, index, cutoff_date, exclude_ids)
+    cands = same_item_lines(inp, index, cutoff_date, exclude_ids, loose_kw=True)
     if not cands:
         return None
     ln = cands[0]
@@ -233,22 +242,51 @@ def quote_same_item(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_
     if qty_off or days > STALE_DAYS:
         why = []
         if days > STALE_DAYS:
-            why.append(f"{days // 30}개월 전 — 24개월 초과, 인상 성향 보고 판단")
+            why.append(f"{days // 30}개월 전 — 24개월 초과, 최소 +{RAISE_DEFAULT:.0%} 이상 제안할 것")
         if qty_off:
             why.append("수량 차이 큼")
-        hint = (f"직전 동일품 {ln.qty:g}개 {ln.unit_price:,} / 이번 {inp.qty or '?'}개 ({ln.date.isoformat()}; "
-                + ", ".join(why) + ")")
+        hint = (f"직전 동일품 단가 {ln.unit_price:,}원 ({ln.date.isoformat()}, {ln.qty:g}개) / "
+                f"이번 {inp.qty or '?'}개 — " + ", ".join(why))
         return Quote(M_PENDING, basis=f"동일품 미확정 ({hint})", ref_line_id=ln.id, hint=hint,
                      max_conf="mid" if days > STALE_DAYS else None)
-    conf = "high"
-    parts = [f"{ln.date.isoformat()} {ln.unit_price:,}원 Ø{ln.dia:g}"
-             + (f" L{ln.length:g}" if ln.length else "") + (f" {ln.qty:g}개" if ln.qty else "")]
-    if days > FRESH_DAYS:
+    detail = (f"{ln.date.isoformat()} {ln.unit_price:,}원 Ø{ln.dia:g}"
+              + (f" L{ln.length:g}" if ln.length else "") + (f" {ln.qty:g}개" if ln.qty else ""))
+    price, conf = int(ln.unit_price), "high"
+    if days <= FRESH_DAYS:
+        parts = [detail]
+    elif days <= FREEZE_DAYS:
+        parts = [f"직전 {ln.date:%Y-%m}, 동결 유지", detail]
+    else:
+        rate, why = raise_rate(inp, index, cutoff_date, exclude_ids)
+        price, conf = raised_price(price, rate), "mid"
+        parts = [f"직전 {ln.unit_price:,} ({ln.date:%Y-%m}) → {pct(rate)} 인상 제안" + (f" ({why})" if why else ""),
+                 detail]
+    extra = line_keywords(ln) - inp.item_keywords
+    if extra:  # 시트에 없는 성질 키워드가 명세표에만 → 같은 품목일 가능성이 높지만 확인 필요
         conf = "mid"
-        parts.append(f"직전 {ln.date:%Y-%m} — 인상 검토")
+        parts.append(f"명세표에만 '{','.join(sorted(extra))}' (시트엔 없음) → 최대 mid")
     if len(cands) > 1:
         parts.append(f"동일품 {len(cands)}건 중 최근")
-    return Quote(M_SAME, int(ln.unit_price), conf, " / ".join(parts), ln.id)
+    return Quote(M_SAME, price, conf, " / ".join(parts), ln.id)
+
+
+def pct(rate: float) -> str:
+    """0.05 → '+5%', 0.083 → '+8.3%'."""
+    return f"{rate * 100:+.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def raised_price(price: int, rate: float) -> int:
+    """직전 단가 × (1 + rate), 100원 단위 버림 (38,500 × 1.05 = 40,425 → 40,400)."""
+    return int(Decimal(price) * (1 + Decimal(str(rate))) // 100 * 100)
+
+
+def raise_rate(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_ids=()) -> tuple[float, str]:
+    """12~24개월 동일품 인상률: 거래처 인상형이면 최근 3쌍 평균(상한 15%), 아니면 5%. (률, 표시 사유)"""
+    from inflation import client_trend
+
+    lines = [ln for ln in index.client_lines(inp.reg_no, inp.client)
+             if ln.date < cutoff_date and ln.id not in exclude_ids]
+    return client_trend(lines).raise_rate()
 
 
 # ---------------------------------------------------------------- 다품목 (한 행에 품목 여럿)

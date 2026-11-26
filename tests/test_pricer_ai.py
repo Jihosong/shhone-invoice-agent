@@ -179,9 +179,9 @@ def test_ops_only_high_is_quoted(conf, status, tag):
 
 def test_ops_ladder_mid_is_gagyeon_too():
     price, basis, st, method, _ = mk_pricer(StubAi()).quote_job_row(
-        job("Ø50+0.0~+0.05 / 1개"), LineIndex.build([ln(1, "2025-06-01", 45000)]), CUT)  # 12개월 전 → mid
-    assert (price, st, method) == (45000, pricer.ST_CHECK, "동일품")
-    assert basis.startswith("[가견적-mid] 동일품") and "인상 검토" in basis
+        job("Ø50+0.0~+0.05 / 1개"), LineIndex.build([ln(1, "2025-04-01", 45000)]), CUT)  # 14개월 전 → mid +5%
+    assert (price, st, method) == (47200, pricer.ST_CHECK, "동일품")
+    assert basis.startswith("[가견적-mid] 동일품 | 직전 45,000 (2025-04) → +5% 인상 제안")
 
 
 def test_ops_stale_same_item_passes_hint_and_cap():

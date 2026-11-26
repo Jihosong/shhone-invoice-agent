@@ -11,6 +11,7 @@
     python agent.py aliases suggest   # 시트의 미해석 거래처 → 마스터 후보 (yaml 주석 형식)
     python agent.py clients find <검색어>  # 마스터 이름 부분일치: 정식명/사업자번호/최근거래/올해 건수
     python agent.py clients add "<정식명>" <사업자번호>  # 경리나라 import에 없는 거래처 수동 등록
+    python agent.py clients trend <거래처>  # 재주문 쌍(품목·날짜·단가 전후·변화율) + 동결형/인상형 판정 근거
     python agent.py backtest build [--year 2026]  # 임가공 월 탭 전부(읽기만) + DB 실제 단가 → data/backtest/ 정답지
     python agent.py backtest run --no-ai  # 정답지 match≠none 행에 사다리(사전단가·동일품) 채점 → results_noai.csv
     python agent.py backtest run --ai --limit 200 --seed 0  # 미결 행 표본 Claude 견적 채점 → results_ai.csv
@@ -184,6 +185,20 @@ def cmd_clients_add(args: argparse.Namespace) -> None:
     sys.exit(0 if ok else 1)
 
 
+def cmd_clients_trend(args: argparse.Namespace) -> None:
+    import sqlite3
+    import sys
+    from pathlib import Path
+
+    import clients_cli
+    from config.settings import settings
+
+    db = Path(settings.DB_PATH)
+    db = db if db.is_absolute() else Path(__file__).parent / db
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)  # DB 읽기 전용
+    sys.exit(0 if clients_cli.print_trend(con, " ".join(args.query)) else 1)
+
+
 def cmd_backtest_build(args: argparse.Namespace) -> None:
     import backtest
 
@@ -244,6 +259,9 @@ def main() -> None:
     p_add.add_argument("name", help="정식명")
     p_add.add_argument("reg_no", help="사업자번호 000-00-00000")
     p_add.set_defaults(func=cmd_clients_add)
+    p_tr = p_cl.add_parser("trend", help="재주문 쌍과 동결형/인상형 판정 근거 (DB 읽기 전용)")
+    p_tr.add_argument("query", nargs="+", help="거래처 이름 (정규화 일치 또는 부분일치 하나)")
+    p_tr.set_defaults(func=cmd_clients_trend)
     p_bt = sub.add_parser("backtest", help="임가공 견적 백테스트").add_subparsers(dest="backtest_cmd", required=True)
     p_btb = p_bt.add_parser("build", help="임가공 시트 월 탭 전부 + DB 실제 단가 → data/backtest/imgagong_<연도>.csv/.xlsx")
     p_btb.add_argument("--year", type=int, default=2026)

@@ -1,4 +1,4 @@
-"""거래처 별칭표 도구 (agent.py aliases check / aliases suggest / clients find).
+"""거래처 별칭표 도구 (agent.py aliases check / aliases suggest / clients find / clients trend).
 
 - check_aliases: config/client_aliases.yaml 각 줄 검사 → [(줄번호, 오류|경고|안내, 설명)]
 - find_clients: 마스터에서 이름 부분일치(정규화 키) → 정식명/사업자번호/최근거래일/올해 건수
@@ -310,3 +310,72 @@ def unresolved_from_sheets() -> list[str]:
             if r["client_resolved"] is None and r["block_label"] not in out and r["block_label"] != "?":
                 out.append(r["block_label"])
     return out
+
+
+# ---------------------------------------------------------------- clients trend
+def pick_client(con: sqlite3.Connection, query: str) -> tuple[dict | None, list[dict]]:
+    """검색어 → (거래처 하나, 후보들). 사업자번호 → 시트와 같은 해석(별칭·동명규칙·'이름(대표명)')
+    → 정규화 이름이 똑같은 것 하나 / 후보 하나 순으로 확정, 아니면 None."""
+    from datetime import date
+
+    import watcher
+
+    rows = find_clients(con, re.sub(r"\(.*", "", query).strip() or query, str(date.today().year))
+    q = query.strip()
+    if REG_NO_RE.match(q):
+        hit = next(({"name": n, "reg_no": r, "last_date": d or ""} for n, r, d in _clients(con) if r == q), None)
+        return hit, [hit] if hit else []
+    res = watcher.load_client_master(con, rules=watcher.load_client_rules(watcher.ALIASES_YAML)).resolve_full(q)
+    if res.name and res.reg_no and res.hold is None:
+        return {"name": res.name, "reg_no": res.reg_no, "last_date": "", "how": res.basis or res.how}, rows
+    qk = compact_name(query)[0]
+    exact = [r for r in rows if compact_name(r["name"])[0] == qk]
+    if len(exact) == 1:
+        return exact[0], rows
+    return (rows[0] if len(rows) == 1 else None), rows
+
+
+def trend_report(lines: list, name: str, reg_no: str, how: str = "") -> list[str]:
+    """한 거래처 임가공 줄 → 재주문 쌍 표 + 동결형/인상형 판정 근거 + 12~24개월 동일품 인상률."""
+    import inflation
+    from pricer_job import pct
+
+    t = inflation.client_trend(lines)
+    how = f", {how}" if how else ""
+    span = f"{min(ln.date for ln in lines)}~{max(ln.date for ln in lines)}" if lines else "-"
+    out = [f"== {name} ({reg_no or '사업자번호 없음'}{how}) 임가공 {len(lines)}줄 {span}",
+           f"재주문 쌍 {len(t.pairs)}개 — 같은 품목(구경 ±{inflation.ITEM_DIA_TOL:g}·기장 ±{inflation.ITEM_LEN_TOL:.0%}"
+           "·공차 동일)이 연속한 두 해에 나온 것, 해마다 단가 중앙값, 변화율은 연환산"]
+    if not t.pairs:
+        return out + ["판정: 모름 — 재주문 쌍 없음 → 12~24개월 동일품은 기본 +5%"]
+    recent = {id(p) for p in t.recent}
+    for p in t.pairs:
+        dims = f"Ø{p['dia']:g}" + (f" L{p['length']:g}" if p["length"] else "")
+        if p["tol_hi"] is not None:
+            dims += f" {p['tol_lo'] or 0:+g}~{p['tol_hi']:+g}"
+        mark = "*" if id(p) in recent else " "
+        out.append(f" {mark} {_pad((p['item'] or '-')[:18], 18)}  {_pad(dims, 22)}  "
+                   f"{p['date_a']} {p['price_a']:>9,.0f}({p['n_a']}건) → {p['date_b']} {p['price_b']:>9,.0f}({p['n_b']}건)"
+                   f"  {p['rate']:+.1%}")
+    rates = ", ".join(f"{p['rate']:+.1%}" for p in t.recent)
+    op = ">" if t.kind == "인상형" else "≤"
+    out.append(f"판정: {t.kind} — 최근 {len(t.recent)}쌍(*) 평균 ({rates}) = {t.mean_recent:+.1%} "
+               f"{op} {inflation.RAISE_THRESHOLD:.0%}")
+    rate, why = t.raise_rate()
+    out.append(f"12~24개월 동일품 인상률: {pct(rate)}" + (f" ({why})" if why else " (기본)"))
+    return out
+
+
+def print_trend(con: sqlite3.Connection, query: str) -> bool:
+    from cases import LineIndex, load_job_lines
+
+    hit, rows = pick_client(con, query)
+    if hit is None:
+        print(f"'{query}' " + ("일치 없음" if not rows else "후보가 여럿 — 정식명으로 다시:"))
+        for r in rows[:15]:
+            print(f"  {r['name']}  {r['reg_no'] or '-'}  최근 {r['last_date'] or '-'}")
+        return False
+    lines = LineIndex.build(load_job_lines(con)).client_lines(hit["reg_no"], hit["name"])
+    for line in trend_report(lines, hit["name"], hit["reg_no"], hit.get("how", "")):
+        print(line)
+    return True

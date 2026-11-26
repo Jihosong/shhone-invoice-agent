@@ -121,22 +121,15 @@ def other_client_cases(inp: JobInput, index: LineIndex, cutoff: date, exclude_id
 
 
 def client_tendency(inp: JobInput, index: LineIndex, cutoff: date, exclude_ids=()) -> str:
-    """같은 거래처 같은 품목의 연도쌍 단가 변화 (cutoff 이전) → 한 줄."""
+    """같은 거래처 재주문 쌍(같은 품목, 연속한 두 해)의 단가 변화 (cutoff 이전) → 한 줄.
+    최근 3쌍 평균 인상률 > 5%면 인상형 (inflation.client_trend — 동일품 12~24개월 규칙과 같은 판정)."""
     import inflation
 
     if not (inp.reg_no or inp.client):
         return "거래처 미상"
     lines = [ln for ln in index.client_lines(inp.reg_no, inp.client)
              if ln.date < cutoff and ln.id not in exclude_ids]
-    pairs = sorted(inflation.year_pairs(inflation.group_items(lines)), key=lambda p: (p["year_b"], p["year_a"]))
-    if not pairs:
-        return "같은 품목 여러 해 거래 없음 (성향 모름)"
-    last = pairs[-3:]
-    ups = sum(1 for p in last if p["rate"] > 0.001)
-    mean_all = sum(p["rate"] for p in pairs) / len(pairs)
-    kind = "인상형" if len(last) >= 2 and ups >= 2 else "동결형"
-    return (f"{kind} — 최근 {len(last)}쌍 중 인상 {ups}쌍, 전체 {len(pairs)}쌍 평균 연 {mean_all:+.1%} "
-            f"(" + ", ".join(f"{p['pair']} {p['rate']:+.1%}" for p in last) + ")")
+    return inflation.client_trend(lines).line()
 
 
 def build_user_message(inp: JobInput, index: LineIndex, cutoff: date, exclude_ids=(), hint: str = "") -> str:

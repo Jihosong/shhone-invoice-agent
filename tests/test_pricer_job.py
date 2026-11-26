@@ -150,31 +150,32 @@ def test_same_item_by_name_when_no_reg():
     assert got.unit_price == 1000
 
 
-@pytest.mark.parametrize("d,method,conf", [
-    ("2025-12-01", M_SAME, "high"),    # 182일 — 6개월 이내
-    ("2025-11-29", M_SAME, "mid"),     # 184일 — 6~24개월
-    ("2024-06-01", M_SAME, "mid"),     # 730일 — 24개월 (초과 아님)
-    ("2024-05-31", M_PENDING, None),   # 731일 — 24개월 초과 → AI
+@pytest.mark.parametrize("d,method,conf,price", [
+    ("2025-12-01", M_SAME, "high", 100000),    # 182일 — 6개월 이내: 그대로
+    ("2025-11-29", M_SAME, "high", 100000),    # 184일 — 6~12개월: 그대로 (동결 유지)
+    ("2025-06-01", M_SAME, "high", 100000),    # 365일 — 12개월 (초과 아님)
+    ("2025-05-31", M_SAME, "mid", 105000),     # 366일 — 12~24개월: +5%
+    ("2024-06-01", M_SAME, "mid", 105000),     # 730일 — 24개월 (초과 아님)
+    ("2024-05-31", M_PENDING, None, None),     # 731일 — 24개월 초과 → AI
 ])
-def test_same_item_period_rules(d, method, conf):
+def test_same_item_period_boundaries(d, method, conf, price):
     got = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, d, 100000)])
-    assert (got.method, got.confidence) == (method, conf)
-    if method == M_SAME:
-        assert got.unit_price == 100000  # 연 % 보정 없음
+    assert (got.method, got.confidence, got.unit_price) == (method, conf, price)
 
 
-def test_same_item_period_boundary_and_basis():
+def test_same_item_period_basis():
     assert q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2025-11-30", 1000)]).confidence == "high"  # 183일 = 6개월 이내
-    mid = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2025-03-15", 100000)])
-    assert "직전 2025-03 — 인상 검토" in mid.basis
-    assert "인상 검토" not in q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2026-05-01", 1000)]).basis
+    assert "동결" not in q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2026-05-01", 1000)]).basis
+    assert q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2025-09-15", 40000)]).basis.startswith("직전 2025-09, 동결 유지")
+    got = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2025-03-15", 40000)])
+    assert got.basis.startswith("직전 40,000 (2025-03) → +5% 인상 제안 / 2025-03-15 40,000원")
 
 
 def test_same_item_over_24_months_goes_to_ai_with_hint():
     got = q(job("Ø30+0.0~+0.05 / 2개"), [ln(5, "2023-11-02", 500000, dia=30, qty=1)])
     assert (got.method, got.unit_price, got.max_conf, got.ref_line_id) == (M_PENDING, None, "mid", 5)
-    assert got.hint.startswith("직전 동일품 1개 500,000 / 이번 2개 (2023-11-02;")
-    assert "24개월 초과" in got.hint
+    assert got.hint.startswith("직전 동일품 단가 500,000원 (2023-11-02, 1개) / 이번 2개")
+    assert "24개월 초과, 최소 +5% 이상 제안할 것" in got.hint
 
 
 @pytest.mark.parametrize("qty,method", [(3, M_PENDING), (2, M_SAME), (1, M_SAME)])
@@ -188,7 +189,7 @@ def test_same_item_qty_ratio_up(qty, method):
 def test_same_item_qty_ratio_down_and_hint():
     got = q(job("Ø50+0.0~+0.05 / 3개"), [ln(7, "2026-01-01", 410000, qty=9)])
     assert (got.method, got.unit_price, got.ref_line_id) == (M_PENDING, None, 7)
-    assert got.hint.startswith("직전 동일품 9개 410,000 / 이번 3개")
+    assert got.hint.startswith("직전 동일품 단가 410,000원 (2026-01-01, 9개) / 이번 3개 — 수량 차이 큼")
     assert q(job("Ø50+0.0~+0.05 / 4개"), [ln(1, "2026-01-01", 1000, qty=9)]).confidence == "high"
 
 

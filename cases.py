@@ -86,10 +86,13 @@ class LineIndex:
     def client_lines(self, reg_no: str, name: str) -> list[DbLine]:
         from watcher import compact_name
 
+        """같은 거래처 줄: 사업자번호가 같은 줄 + 이름(정규화)이 같고 번호가 없는 줄.
+        번호가 다른 동명 거래처(대진엔지니어링 3곳 등)의 줄은 넣지 않는다. reg_no가 없으면 이름만으로."""
         out = list(self.by_reg.get(reg_no, [])) if reg_no else []
         ids = {ln.id for ln in out}
         key = compact_name(name or "")[0]
-        out += [ln for ln in self.by_name.get(key, []) if ln.id not in ids] if key else []
+        out += [ln for ln in self.by_name.get(key, [])
+                if ln.id not in ids and not (reg_no and ln.reg_no)] if key else []
         return out
 
 

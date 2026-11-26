@@ -31,10 +31,15 @@ _DIA_SUFFIX_RE = re.compile(r"(" + _N + r")\s*파이")
 _DIA_BARE_RE = re.compile(r"(?<![A-Za-z0-9.#~/-])(" + _N + r")\s*(?=[+-]\s*\d*\.\d|\+\s*-|±)")
 
 
+# 바로 앞에 OD/외경 표시가 붙은 Ø는 외경 — 내경(구경)으로 쓰지 않는다 ('(OD Ø130) Ø31.75' → 31.75)
+_OD_BEFORE_RE = re.compile(r"(?:(?<![A-Za-z])O\.?D\.?|외경)\s*[:=]?\s*$", re.I)
+
+
 def _dia_spans(s: str) -> list[tuple[float, int, int]]:
-    """정규화된 글자에서 구경 후보 (값, 시작, 끝) — 위치 순."""
-    hits = [(float(m.group(1)), m.start(), m.end()) for rx in (_DIA_RE, _DIA_SUFFIX_RE) for m in rx.finditer(s)]
-    if not hits:
+    """정규화된 글자에서 구경 후보 (값, 시작, 끝) — 위치 순. OD/외경 표시가 붙은 것은 뺀다."""
+    found = [(float(m.group(1)), m.start(), m.end()) for rx in (_DIA_RE, _DIA_SUFFIX_RE) for m in rx.finditer(s)]
+    hits = [h for h in found if not _OD_BEFORE_RE.search(s[max(0, h[1] - 8):h[1]])]
+    if not found:
         hits = [(float(m.group(1)), m.start(), m.end()) for m in _DIA_BARE_RE.finditer(s)
                 if float(m.group(1)) >= 3]
     return sorted((h for h in hits if h[0] > 0), key=lambda h: h[1])
@@ -242,12 +247,22 @@ _HEAD_END_RE = re.compile(r"/|(?<![A-Za-z0-9])L\s*\d|\d+(?:\.\d+)?\s*L(?![a-z])|
 _NOTE_RE = re.compile(r"\([^()]*\)|\d+\s*[월일시]")   # 괄호 메모·날짜 ('(11월26일도착)')
 
 
+# '+' 바로 뒤에 (짧은 표시 'E,' 뒤) Ø가 오면 품목 구분: 'Ø67 / 1개 + Ø45 + Ø25 / 3개'
+_DIA_AFTER_PLUS_RE = re.compile(r"\s*(?:[A-Za-z가-힣]{1,4}\s*,?\s*)?Ø")
+_HOLE_WORD_RE = re.compile(r"HOLE", re.I)   # 'Ø40 / 1Hole + Ø28 / 8Hole' = 한 부품의 구멍들 → 안 나눔
+
+
 def _plus_parts(s: str) -> list[str]:
-    """수량 표기 뒤의 '+'에서 나눔 (공차 '+'는 안 나눔). 수량만 있는 꼬리('6개긴급 +8개')는 앞 구간에 붙임."""
+    """'+'에서 품목을 나눔: 앞에 수량 표기가 있거나, 뒤에 바로 Ø가 오는 '+' (공차 '+'는 안 나눔).
+    수량만 있는 꼬리('6개긴급 +8개')는 앞 구간에 붙임. 수량 없는 Ø 구간은 뒤에 오는 수량을 나눠 가짐."""
     parts, start = [], 0
+    hole = bool(_HOLE_WORD_RE.search(s))
     for m in re.finditer(r"\+", s):
-        if _QTY_RE.search(s[start:m.start()]) and not _TOL_AFTER_PLUS_RE.match(s, m.end()):
-            parts.append(s[start:m.start()])
+        before = s[start:m.start()]
+        by_qty = _QTY_RE.search(before) and not _TOL_AFTER_PLUS_RE.match(s, m.end())
+        by_dia = not hole and _dia_spans(before) and _DIA_AFTER_PLUS_RE.match(s, m.end())
+        if by_qty or by_dia:
+            parts.append(before)
             start = m.end()
     parts.append(s[start:])
     out: list[str] = []
@@ -258,6 +273,33 @@ def _plus_parts(s: str) -> list[str]:
             out[-1] = f"{out[-1]} + {p}"
         else:
             out.append(p)
+    return _spread_qty(out, s)
+
+
+def _spread_qty(parts: list[str], text: str) -> list[str]:
+    """수량 없는 Ø 구간들 + 뒤의 수량 있는 구간 = 한 묶음. 수량 표기 수가 묶음 품목 수와 같으면 차례로 나누고,
+    아니면(수량 하나) 각 품목에 같은 수량 + 경고 로그 ('각10개'처럼 '각'이 붙으면 경고 없음)."""
+    out, group = list(parts), []
+    for i, p in enumerate(parts):
+        qs = list(_QTY_RE.finditer(p))
+        if not qs:
+            if _dia_spans(p) and i < len(parts) - 1:
+                group.append(i)
+            continue
+        if group:
+            if len(qs) == len(group) + 1:
+                for j, q in zip(group, qs):
+                    out[j] = f"{parts[j]} / {q.group(0)}"
+                out[i] = (p[:qs[0].start()] + p[qs[-2].end():]).replace("  ", " ")
+            else:
+                for j in group:
+                    out[j] = f"{parts[j]} / {qs[-1].group(0)}"
+                if not re.search(r"각\s*$", p[:qs[-1].start()]):
+                    from loguru import logger
+
+                    logger.warning("임가공 품목 {}개에 수량 '{}' 하나 → 각 품목 같은 수량 ({!r})", len(group) + 1,
+                                   qs[-1].group(0), text[:80])
+        group = []
     return out
 
 

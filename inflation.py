@@ -70,12 +70,15 @@ def year_pairs(items: list[Item]) -> list[dict]:
         if len(years) < 2:
             continue
         client = Counter(ln.client for ln in it.lines).most_common(1)[0][0]
+        item = Counter(ln.item for ln in it.lines if ln.item).most_common(1)
         for ya, yb in zip(years, years[1:]):
             pa = statistics.median(ln.unit_price for ln in by_year[ya])
             pb = statistics.median(ln.unit_price for ln in by_year[yb])
             out.append({
                 "client": client, "client_key": it.client_key, "dia": it.dia, "length": it.length,
                 "tol_lo": it.tol[0], "tol_hi": it.tol[1], "band": dia_band(it.dia),
+                "item": item[0][0] if item else "",
+                "date_a": max(ln.date for ln in by_year[ya]), "date_b": max(ln.date for ln in by_year[yb]),
                 "year_a": ya, "year_b": yb, "pair": f"{ya % 100}→{yb % 100}",
                 "price_a": pa, "price_b": pb, "n_a": len(by_year[ya]), "n_b": len(by_year[yb]),
                 "rate": (pb / pa) ** (1 / (yb - ya)) - 1,
@@ -83,6 +86,48 @@ def year_pairs(items: list[Item]) -> list[dict]:
                 "line_ids_b": " ".join(str(ln.id) for ln in by_year[yb]),
             })
     return out
+
+
+# ---------------------------------------------------------------- 거래처 인상 성향 (동일품 12~24개월·AI 참고·clients trend)
+TREND_PAIRS = 3          # 최근 몇 쌍으로 판정
+RAISE_THRESHOLD = 0.05   # 최근 쌍 평균 인상률이 이보다 크면 인상형
+RAISE_DEFAULT = 0.05     # 12~24개월 동일품 기본 인상률
+RAISE_CAP = 0.15         # 인상형 평균 인상률 상한
+
+
+@dataclass
+class Trend:
+    pairs: list            # 재주문 쌍 전부 (오래된 → 최근)
+    recent: list           # 판정에 쓴 최근 TREND_PAIRS쌍
+    mean_recent: float | None
+    kind: str              # 인상형 / 동결형 / 모름
+
+    def raise_rate(self) -> tuple[float, str]:
+        """12~24개월 동일품 인상률과 그 사유: 인상형이면 최근 쌍 평균(상한 15%), 아니면 5%."""
+        if self.kind == "인상형":
+            r = min(round(self.mean_recent, 3), RAISE_CAP)
+            cap = f", 상한 {RAISE_CAP:.0%}" if self.mean_recent > RAISE_CAP else ""
+            return r, f"인상형: 최근 {len(self.recent)}쌍 평균 {self.mean_recent:+.1%}{cap}"
+        return RAISE_DEFAULT, ""
+
+    def line(self) -> str:
+        if not self.pairs:
+            return "같은 품목 여러 해 거래 없음 (성향 모름)"
+        ups = sum(1 for p in self.recent if p["rate"] > 0.001)
+        mean_all = statistics.mean(p["rate"] for p in self.pairs)
+        return (f"{self.kind} — 최근 {len(self.recent)}쌍 평균 {self.mean_recent:+.1%} (인상 {ups}쌍), "
+                f"전체 {len(self.pairs)}쌍 평균 연 {mean_all:+.1%} ("
+                + ", ".join(f"{p['pair']} {p['rate']:+.1%}" for p in self.recent) + ")")
+
+
+def client_trend(lines: list[DbLine]) -> Trend:
+    """한 거래처 줄들 → 재주문 쌍(같은 품목, 연속한 두 해)과 성향. 최근 3쌍 평균 인상률 > 5%면 인상형."""
+    pairs = sorted(year_pairs(group_items(lines)), key=lambda p: (p["date_b"], p["date_a"]))
+    recent = pairs[-TREND_PAIRS:]
+    if not recent:
+        return Trend([], [], None, "모름")
+    mean = statistics.mean(p["rate"] for p in recent)
+    return Trend(pairs, recent, mean, "인상형" if mean > RAISE_THRESHOLD else "동결형")
 
 
 def stats(rates: list[float]) -> str:
