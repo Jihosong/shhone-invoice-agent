@@ -12,7 +12,7 @@ import pytest
 import xlrd
 from loguru import logger
 
-from issuer.excel_upload import Line, LineError, Statement, block_date, pipe_line, write_xls
+from issuer.excel_upload import DEFAULT_MEMO_TEXT, Line, LineError, Statement, block_date, pipe_line, write_xls
 from issuer.outbox import Issuer, format_outbox
 from pricer import PriceEntry, Pricer
 from tests.test_watcher_settle import age_all, make
@@ -20,6 +20,7 @@ from watcher import (ST_CONFIRMED, ST_HUMAN_CHECK, ST_ISSUED, ST_PENDING, ST_PEN
                      ST_TYPING)
 
 FIX = Path(__file__).resolve().parent / "fixtures" / "gyeongri"
+MEMO = "(주)삼화호닝 기업 451-079229-04-018, 감사합니다. (AI)"
 CLIENT, REG = "테스트거래처(삼화)", "247-81-03793"
 TODAY = date(2026, 11, 26)
 
@@ -46,12 +47,12 @@ C_ROWS = [r("11/26", CLIENT, "60x70", "2106", "1개"), r("11/26", CLIENT, "105x1
 class Rig:
     """가짜 시트 + watcher/pricer/issuer 한 벌."""
 
-    def __init__(self, rows, memo=True, dry_run=False):
+    def __init__(self, rows, memo_text=MEMO, dry_run=False):
         self.w = make([list(x) for x in rows])
         self.w.con.execute("INSERT INTO clients(name, reg_no, n_statements) VALUES(?,?,5)", (CLIENT, REG))
         self.p = Pricer({"sheets": {"t": SCFG}}, self.w.con)
         self.p.table_for = lambda _scfg: TABLE
-        cfg = {"sheets": {"t": SCFG}, "common": {"author_ai_value": "AI"}, "issue": {"memo_block_id": memo}}
+        cfg = {"sheets": {"t": SCFG}, "common": {"author_ai_value": "AI"}, "issue": {"memo_text": memo_text}}
         self.iss = Issuer(cfg, self.w.con, dry_run=dry_run, today=TODAY)
 
     @property
@@ -101,7 +102,7 @@ def _fmt(book, sheet, r, c):
 
 
 def assert_like_fixture(path, fixture, memos):
-    """셀 타입·값·서식이 fixture와 같음. 품목비고(16)는 우리가 비움, 공통메모(19)는 'AI <block_id>'."""
+    """셀 타입·값·서식이 fixture와 같음. 품목비고(16)는 우리가 비움, 공통메모(19)는 memos[row] (없으면 빈 칸)."""
     fa = xlrd.open_workbook(str(FIX / fixture), formatting_info=True)
     ga = xlrd.open_workbook(str(path), formatting_info=True)
     assert ga.sheet_names() == ["Sheet1"]
@@ -133,27 +134,41 @@ def test_one_line_block_file_matches_fixture_A(tmp_path):
     rig, path = ready(A_ROWS, tmp_path)
     assert path.parent == tmp_path and path.suffix == ".xls"
     assert rig.col("status") == [ST_PENDING]
-    (bid,) = block_ids(rig)
-    assert_like_fixture(path, "A_1줄.xls", {1: f"AI {bid}"})
+    assert len(block_ids(rig)) == 1
+    assert_like_fixture(path, "A_1줄.xls", {1: MEMO})
 
 
 def test_three_line_block_file_matches_fixture_B(tmp_path):
     rig, path = ready(B_ROWS, tmp_path)
     assert rig.col("status") == [ST_PENDING] * 3
-    (bid,) = block_ids(rig)
-    assert_like_fixture(path, "B_1장3줄.xls", {1: f"AI {bid}"})  # 2·3번째 줄은 머리·메모 없음
+    assert len(block_ids(rig)) == 1
+    assert_like_fixture(path, "B_1장3줄.xls", {1: MEMO})  # 2·3번째 줄은 머리·메모 없음
 
 
 def test_two_blocks_in_one_file_match_fixture_C(tmp_path):
     rig, path = ready(C_ROWS, tmp_path)
-    b1, b2 = block_ids(rig)
-    assert_like_fixture(path, "C_2장.xls", {1: f"AI {b1}", 2: f"AI {b2}"})
+    assert len(block_ids(rig)) == 2
+    assert_like_fixture(path, "C_2장.xls", {1: MEMO, 2: MEMO})  # 명세표마다 첫 줄
     assert rig.db("SELECT n_blocks, n_lines, total FROM issue_files") == [(2, 2, 81080 + 8108 + 138040 + 13804)]
 
 
-def test_memo_can_be_turned_off(tmp_path):
-    _, path = ready(A_ROWS, tmp_path, memo=False)
-    assert_like_fixture(path, "A_1줄.xls", {})
+def test_memo_is_config_memo_text_on_first_line_only(tmp_path):
+    """공통메모 = issue.memo_text 그대로, 명세표 첫 줄에만 — 2번째 줄(이어지는 품목)은 빈 칸."""
+    text = "다른 문구 (AI)"
+    _, path = ready(B_ROWS, tmp_path, memo_text=text)
+    sh = xlrd.open_workbook(str(path)).sheet_by_index(0)
+    assert sh.cell_value(0, 19) == "공통메모"
+    assert sh.cell_value(1, 19) == text
+    assert sh.cell(2, 19).ctype == xlrd.XL_CELL_EMPTY
+    assert sh.cell(3, 19).ctype == xlrd.XL_CELL_EMPTY
+
+
+def test_memo_text_default_when_not_configured(tmp_path):
+    rig = Rig(A_ROWS).quoted().finish()
+    rig.iss.icfg.pop("memo_text")
+    path = rig.cycle(bundle=True, out=tmp_path)
+    assert DEFAULT_MEMO_TEXT == MEMO
+    assert xlrd.open_workbook(str(path)).sheet_by_index(0).cell_value(1, 19) == MEMO
 
 
 def test_basis_shows_file_name(tmp_path):

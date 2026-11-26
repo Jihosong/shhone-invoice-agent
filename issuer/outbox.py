@@ -29,7 +29,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from issuer.excel_upload import LINE_BUILDERS, LineError, Statement, block_date, parse_price, write_xls
+from issuer.excel_upload import DEFAULT_MEMO_TEXT, LINE_BUILDERS, LineError, Statement, block_date, parse_price, write_xls
 from watcher import (REG_NO_RE, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_SKIP, SheetWriter, bool_state, now_iso,
                      warn_once, with_block_tag)
 
@@ -65,8 +65,9 @@ class Issuer:
 
     # ------------------------------------------------------------------ 설정
     @property
-    def memo(self) -> bool:
-        return bool(self.icfg.get("memo_block_id", True))
+    def memo_text(self) -> str:
+        v = self.icfg.get("memo_text")
+        return DEFAULT_MEMO_TEXT if v is None else str(v)
 
     def outbox_dir(self) -> Path:
         p = Path(self.icfg.get("outbox_dir") or DEFAULT_OUTBOX)
@@ -277,7 +278,7 @@ class Issuer:
         n_lines = sum(len(s.lines) for s in statements)
         total = sum(s.supply + s.tax for s in statements)
         if self.dry_run:
-            write_xls(statements, path, self.memo)
+            write_xls(statements, path, self.memo_text)
         else:
             try:
                 self.con.execute("INSERT INTO issue_files(file_name, created_at, path, n_blocks, n_lines, total)"
@@ -288,7 +289,7 @@ class Issuer:
                     [(c.statement.block_id, name, c.sheet, c.tab, c.statement.client, c.statement.reg_no,
                       c.statement.day.isoformat(), len(c.statement.lines), c.statement.supply, c.statement.tax,
                       json.dumps([r["row_id"] for r in c.rows])) for c in cands])
-                write_xls(statements, path, self.memo)
+                write_xls(statements, path, self.memo_text)
                 self.con.commit()
             except Exception:
                 self.con.rollback()

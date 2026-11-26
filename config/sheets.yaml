@@ -41,7 +41,9 @@ common:
 issue:
   outbox_dir: data/outbox
   bundle_interval_min: 10
-  memo_block_id: true            # 공통메모에 'AI <block_id>' (명세표에 인쇄되면 false로)
+  # 공통메모(명세표마다 첫 줄에만). '(AI)'로 끝나야 월간 import가 AI 발행(statements.issued_by='AI')으로 알아봄.
+  # 묶음 추적은 DB issue_file_blocks로 한다.
+  memo_text: "(주)삼화호닝 기업 451-079229-04-018, 감사합니다. (AI)"
 
 # 묶음(block) 규칙 — 두 시트 공통 (watcher.py)
 #   날짜 칸이 있는 행 = 묶음 첫 행. 거래처는 이 행의 거래처 칸에서만 해석(별칭표 config/client_aliases.yaml

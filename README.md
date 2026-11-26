@@ -80,4 +80,6 @@ python agent.py issue             # 한 바퀴 돌고 outbox 파일 생성
 python agent.py outbox            # 파일별 포함 묶음·상태
 ```
 
-공통메모의 `AI <block_id>`는 `config/sheets.yaml`의 `issue.memo_block_id: false`로 끈다.
+공통메모는 `config/sheets.yaml`의 `issue.memo_text`를 명세표마다 첫 줄에만 그대로 넣는다(이어지는 품목 줄은 비움).
+끝의 `(AI)`로 월간 import(`feedback.py`)가 명세표 목록의 공통메모 열을 보고 AI 발행 건을 `statements.issued_by='AI'`로 표시한다
+(열이 없으면 건너뛰고 로그만). 묶음 추적은 DB(`issue_file_blocks`)로 한다.

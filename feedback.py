@@ -2,6 +2,7 @@
 경리나라 내려받기 → SQLite 적재 (feedback.py)
 
 입력 1: 매출거래명세표 목록 (.xls)   → clients, statements
+        공통메모 열이 있으면 '(AI)'로 끝나는 건 → statements.issued_by='AI' (발행기 issue.memo_text)
 입력 2: 품목별판매현황 (.xls)        → lines
 입력 3: 거래처 목록 (.xls/.xlsx)     → clients.ceo_name (대표자명, 동명 구분용) — import_client_list
         python agent.py import clients <파일>  (사업자번호 기준 갱신, 없으면 추가 source='list')
@@ -141,6 +142,22 @@ def load_statements(path):
     df["spec"] = sp[1].map(norm_text) if sp.shape[1] > 1 else None
     return df
 
+# 명세표 목록에서 공통메모 열 이름 후보 (발행기가 issue.memo_text를 넣는 칸)
+COMMON_MEMO_COLUMNS = ("공통메모",)
+AI_MEMO_SUFFIX = "(AI)"
+
+
+def common_memo_column(df):
+    """명세표 목록 DataFrame에서 공통메모 열 이름 (없으면 None)."""
+    return next((c for c in COMMON_MEMO_COLUMNS if c in df.columns), None)
+
+
+def issued_by_of(memo):
+    """공통메모가 '(AI)'로 끝나면 'AI' (발행기가 만든 파일로 올린 명세표), 아니면 None."""
+    m = norm_text(memo)
+    return "AI" if m and m.endswith(AI_MEMO_SUFFIX) else None
+
+
 def load_lines(path):
     df = pd.read_excel(path, header=2)
     df.columns = [str(c).strip() for c in df.columns]
@@ -159,7 +176,7 @@ CREATE TABLE IF NOT EXISTS clients(
 CREATE TABLE IF NOT EXISTS statements(
   id INTEGER PRIMARY KEY, date TEXT, client TEXT, reg_no TEXT,
   item TEXT, spec TEXT, extra_lines INTEGER, supply INTEGER, tax INTEGER, total INTEGER,
-  color TEXT, memo TEXT, source TEXT DEFAULT 'export');
+  color TEXT, memo TEXT, source TEXT DEFAULT 'export', issued_by TEXT);
 CREATE TABLE IF NOT EXISTS lines(
   id INTEGER PRIMARY KEY, date TEXT, client TEXT, item TEXT, spec TEXT,
   qty REAL, unit_price INTEGER, supply INTEGER, note TEXT,
@@ -175,6 +192,8 @@ LINES_EXTRA = {"reg_no": "TEXT", "spec_norm": "TEXT", "category": "TEXT"}
 # source: 'import' = 명세표 목록, 'manual' = agent.py clients add, 'list' = 거래처 목록에만 있음(명세표 없음)
 # ceo_name: 대표자명 (거래처 목록 import) — 시트 '거래처(대표명)'으로 동명 구분
 CLIENTS_EXTRA = {"source": "TEXT", "ceo_name": "TEXT"}
+# issued_by: 'AI' = 공통메모가 '(AI)'로 끝남(발행기 파일로 올린 명세표) — 중복·단가 대조용. 열이 없으면 NULL
+STATEMENTS_EXTRA = {"issued_by": "TEXT"}
 KEEP_SOURCES = ("manual", "list")  # 명세표 import가 지우지 않는 등록 (같은 번호가 import에 오면 import로 덮어씀)
 
 
@@ -184,10 +203,11 @@ def ensure_columns(con):
     for name, typ in LINES_EXTRA.items():
         if name not in have:
             con.execute(f"ALTER TABLE lines ADD COLUMN {name} {typ}")
-    have = {r[1] for r in con.execute("PRAGMA table_info(clients)")}
-    for name, typ in CLIENTS_EXTRA.items():
-        if name not in have:
-            con.execute(f"ALTER TABLE clients ADD COLUMN {name} {typ}")
+    for table, extra in (("clients", CLIENTS_EXTRA), ("statements", STATEMENTS_EXTRA)):
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for name, typ in extra.items():
+            if name not in have:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
 
 
 def replace_clients(con, imported):
@@ -334,11 +354,18 @@ def main(stm_path, line_path, db_path, master_path=None):
     n_rep, n_manual = replace_clients(con, [(norm_text(r.거래처명), str(r.등록번호), int(r.n), r.f, r.l)
                                            for r in g.itertuples()])
     print("수동 등록 거래처: import로 덮어씀=%d 남음=%d" % (n_rep, n_manual))
-    con.executemany("INSERT INTO statements(date,client,reg_no,item,spec,extra_lines,supply,tax,total,color,memo) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+    memo_col = common_memo_column(st)
+    if memo_col is None:
+        print("명세표 목록에 공통메모 열 없음 → AI 발행 표시(issued_by) 건너뜀 (열: %s)" % ", ".join(st.columns))
+    issued = [issued_by_of(v) for v in st[memo_col]] if memo_col else [None] * len(st)
+    con.executemany("INSERT INTO statements(date,client,reg_no,item,spec,extra_lines,supply,tax,total,color,memo,issued_by)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         [(r.거래일, norm_text(r.거래처명), str(r.등록번호), r.item, r.spec, int(r.extra),
           int(r.공급가액) if pd.notna(r.공급가액) else None, int(r.세액) if pd.notna(r.세액) else None,
           int(r.합계금액) if pd.notna(r.합계금액) else None, r.컬러 if pd.notna(r.컬러) else None,
-          norm_text(r.메모)) for r in st.itertuples()])
+          norm_text(r.메모), by) for r, by in zip(st.itertuples(), issued)])
+    if memo_col:
+        print("AI 발행 명세표(공통메모 '%s'로 끝남)=%d / %d" % (AI_MEMO_SUFFIX, sum(b == "AI" for b in issued), len(st)))
     regs = reg_no_map(con.execute("SELECT name, reg_no FROM clients").fetchall())
     rows = []
     for r in ln.itertuples():

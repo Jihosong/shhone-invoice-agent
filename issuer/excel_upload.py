@@ -5,7 +5,8 @@
 - 명세표(Statement) 하나 = 첫 줄에 거래일자~창고 + 품목, 2번째 줄부터는 품목월일~세액만.
 - 문자 칸은 텍스트 서식('@'), 수량·단가·공급가액·세액은 숫자. 빈 칸은 셀을 아예 쓰지 않음.
 - 공급가액 = 단가 × 수량, 세액 = 공급가액의 10% 내림.
-- 품목비고는 비움(명세표에 인쇄되어 고객에게 보임). 공통메모는 'AI <block_id>' (config로 끔).
+- 품목비고는 비움(명세표에 인쇄되어 고객에게 보임). 공통메모는 config issue.memo_text 그대로
+  (명세표마다 첫 줄에만, 이어지는 품목 줄은 비움). '(AI)'로 끝나서 월간 import가 AI 발행을 알아본다.
 
 줄 만들기는 시트 종류별 builder (블록의 한 행 → Line) — 지금은 호닝파이프(pipe)만. 임가공(job)은 나중에
 LINE_BUILDERS에 같은 인터페이스로 붙인다.
@@ -26,6 +27,7 @@ SHEET_NAME = "Sheet1"
 BIZ_TYPE = "사업자"
 VAT_TYPE = "별도"
 PIPE_NAME = "호닝파이프"
+DEFAULT_MEMO_TEXT = "(주)삼화호닝 기업 451-079229-04-018, 감사합니다. (AI)"
 
 
 class LineError(ValueError):
@@ -136,7 +138,7 @@ LINE_BUILDERS = {"pipe": pipe_line}
 
 
 # ---------------------------------------------------------------- .xls 쓰기
-def build_workbook(statements: list[Statement], memo: bool = True):
+def build_workbook(statements: list[Statement], memo_text: str = DEFAULT_MEMO_TEXT):
     import xlwt
 
     text = xlwt.easyxf(num_format_str="@")
@@ -164,8 +166,7 @@ def build_workbook(statements: list[Statement], memo: bool = True):
                 put(r, "거래처명", st.client)
                 put(r, "사업자번호", st.reg_no)
                 put(r, "부가세구분", VAT_TYPE)
-                if memo:
-                    put(r, "공통메모", f"AI {st.block_id}")
+                put(r, "공통메모", memo_text)  # 빈 문자열이면 안 씀
             put(r, "품목월일", st.day.strftime("%m%d"))
             put(r, "품목명", ln.name)
             put(r, "규격", ln.spec)
@@ -177,8 +178,8 @@ def build_workbook(statements: list[Statement], memo: bool = True):
     return wb
 
 
-def write_xls(statements: list[Statement], path: str | Path, memo: bool = True) -> Path:
+def write_xls(statements: list[Statement], path: str | Path, memo_text: str = DEFAULT_MEMO_TEXT) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    build_workbook(statements, memo).save(str(path))
+    build_workbook(statements, memo_text).save(str(path))
     return path
