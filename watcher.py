@@ -82,6 +82,8 @@ ST_PENDING = "발행대기"  # 발행 조건 충족 → data/outbox 파일에 �
 ST_PENDING_EDITED = "발행대기-수정됨"  # 파일에 담긴 뒤 행이 수정됨 → 올린 파일과 어긋남, 사람이 봐야 함
 # 파일에 담긴 뒤 사람 작성자가 붙음 → 사람처리지만 경리나라 중복 발행 확인 필요. 사람이 상태 칸을 비우면 보통 사람처리
 ST_HUMAN_CHECK = "사람처리-발행확인"
+# 상태 칸에 사람이 적는 '확인' 표시 — 상태 칸을 비운 것과 똑같이 취급 (견적확인필요 → 견적완료(사람확인) 등)
+HUMAN_OK_WORDS = frozenset({"확인", "ok"})  # casefold 비교: ok / OK / Ok
 HOLD_PREFIX = "보류-"
 # 산출근거 칸 맨 앞 묶음 표시 "[거래처(비고) 날짜 n/총줄수] "
 # 뒤에 붙는 안내 "[동명확인: …]" / "[수동처리: …]" / "[주의: …]" / 발행 파일 "[→ 20261126_1430.xls]"도
@@ -121,6 +123,13 @@ def post_quote_states(status_values: list[str]) -> set[str]:
     st = list(status_values)
     return (set(st[st.index(ST_QUOTED):]) | QUOTED_STATES) - {ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM, ST_HCHECK,
                                                               ST_HUMAN_CHECK}
+
+
+def known_states(status_values: list[str]) -> set[str]:
+    """시트 상태 칸에 에이전트가 쓰는 값 전부. 이 밖의 글자(+ 사람 확인 표시 제외)는 모르는 값 → 손대지 않음."""
+    return set(status_values) | QUOTED_STATES | {
+        ST_TYPING, ST_CONFIRMED, ST_ISSUED, ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM, ST_SCREEN, ST_HCHECK,
+        ST_PENDING, ST_PENDING_EDITED, ST_HUMAN_CHECK, "견적확인필요"}
 
 
 def ensure_columns(con: sqlite3.Connection) -> None:
@@ -684,6 +693,7 @@ class Watcher:
             human_map[bid] = (hf, ha)  # 사람처리-발행확인 표시한 때 / 사람이 확인(상태 칸 비움)한 때
 
         writer = SheetWriter(cols, scfg["data_start_row"], scfg["hash_columns"], label)
+        known = known_states(self.common["status_values"])
         counts = Counter()
         seen_ids: set[str] = set()
         snap_rows: list[dict] = []
@@ -858,16 +868,20 @@ class Watcher:
                     if rest != basis and "[주의:" in basis[:len(basis) - len(rest)]:
                         writer.add(rownum, "basis", rest, row, row_id=row_id, expect_fp=e["fp"])
                 new_status = e["new_status"]
-                if new_status is None:  # 사람 처리
+                if e["unknown_status"]:  # 모르는 글자: 상태 칸·DB 상태 그대로, 견적·발행 단계로도 안 넘어감
+                    counts["모르는상태"] += 1
+                    new_status = e["status_raw"]
+                elif new_status is None:  # 사람 처리
                     counts["사람처리"] += 1
                     new_status = ""
                 elif new_status == ST_SKIP:
                     counts["제외"] += 1
                 else:
                     counts[new_status] += 1
-                if new_status != e["status"]:
+                if new_status != e["status_raw"]:  # '확인'/'ok'는 비운 것으로 판정했어도 칸에는 남아 있음
                     writer.add(rownum, "status", new_status, row, row_id=row_id, expect_fp=e["fp"])
-                self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, row_id))
+                if not e["unknown_status"]:
+                    self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, row_id))
                 snap_rows.append({"rownum": rownum, "row_id": row_id, "row": row, "fp": e["fp"], "status": new_status,
                                   "author": e["author"], "legacy": e["legacy"],
                                   "work_end_flipped_at": e["flipped_at"], "block_id": blk["id"],
@@ -930,7 +944,21 @@ class Watcher:
             fp = fingerprint([cell(row, c) for c in scfg["hash_columns"]])
             item_fp = fingerprint([cell(row, c) for c in item_hash_cols])  # 거래처 칸 뺀 지문
             author = cell(row, "author")  # 묶음 작성자 잠금은 finish_block에서 (묶음 안 어느 행이든 사람 → 전체)
-            status = cell(row, "status")
+            status_raw = status = cell(row, "status")
+            unknown_status = False
+            if status.casefold() in HUMAN_OK_WORDS:
+                status = ""  # 사람이 '확인'/'ok'라고 씀 = 상태 칸 비움
+                self._log_on_change(("human_ok", key, row_id), "INFO", "sheet={} row={} client={} 상태 칸 {!r} → "
+                                    "상태 칸 비움과 같이 처리 (사람 확인)", label, rownum, client_log, status_raw)
+            elif status and status not in known:
+                unknown_status = True  # 모르는 글자 → 상태 칸 그대로 두고 처리 보류
+                self._log_on_change(("unknown_status", key, row_id), "WARNING",
+                                    "sheet={} row={} client={} 상태 칸에 모르는 값 {!r} → 건드리지 않음 "
+                                    "(확인은 '확인' 입력 또는 비우기)", label, rownum, client_log, status_raw)
+            else:
+                self._log_on_change(("human_ok", key, row_id), None)
+            if not unknown_status:
+                self._log_on_change(("unknown_status", key, row_id), None)
 
             work_end = bool_state(cell(row, "work_end")) if "work_end" in cols else "FALSE"
             just_flipped = False
@@ -990,6 +1018,7 @@ class Watcher:
             # 상태는 묶음이 끝날 때 함께 결정 (finish_block)
             block["entries"].append({
                 "rownum": rownum, "row_id": row_id, "row": row, "author": author, "status": status,
+                "status_raw": status_raw, "unknown_status": unknown_status,
                 "work_end": work_end, "just_flipped": just_flipped,
                 "fp": fp, "changed": changed, "items_changed": items_changed, "is_new": rec is None, "db_status": db_status if rec else None, "last_change": last_change, "legacy": legacy,
                 "flipped_at": flipped_at, "client_log": client_log, "client_note": client_note})
@@ -1020,6 +1049,8 @@ class Watcher:
             return "기존건"
         for e in entries:
             st = e["new_status"]
+            if e.get("unknown_status"):
+                return f"상태 칸 모르는 값 {e['status_raw']!r}"
             if st in (ST_SKIP, ST_HCHECK, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED) or (st or "").startswith(HOLD_PREFIX):
                 return st
             if e["author"]:

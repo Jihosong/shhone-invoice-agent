@@ -28,6 +28,7 @@ PRICE_SHEET = "삼화호닝"
 SOGWAN_RATE = Decimal("0.9")
 
 ST_CONFIRMED = "확정"
+HUMAN_BASIS_RE = re.compile(r"^사람 (?:수정|확인)")  # 사람 확정 행의 산출근거 머리 (process_job)
 ST_QUOTED = "견적완료"
 ST_CHECK = "견적확인필요"
 ST_LEGACY = "기존건-확인필요"
@@ -450,11 +451,23 @@ class Pricer:
             row, rownum = r["row"], r["rownum"]
             price_cell, body = cell(row, "unit_price"), strip_block_tag(cell(row, "basis"))
             tag = r.get("block_tag") or ""
-            if status not in (ST_CONFIRMED, ST_CHECK) and not hcheck:
-                continue
 
             def set_cell(rownum, name, value, row=row, r=r):
                 writer.add(rownum, name, value, row, row_id=r["row_id"], expect_fp=r.get("fp"))
+
+            if status == ST_QUOTED and HUMAN_BASIS_RE.match(body):
+                # 사람 확정인데 상태가 그냥 '견적완료' (라벨 도입 전에 확정된 행 등) → 라벨만 바로잡음 (재학습 없음)
+                new_status = ST_QUOTED_EDIT if body.startswith("사람 수정") else ST_QUOTED_OK
+                set_cell(rownum, "status", new_status)
+                counts[new_status] += 1
+                r["status"] = new_status
+                logger.info("pricer sheet={} row={} client={} {} → {} (산출근거 '{}')", label, rownum,
+                            cell(row, "client"), status, new_status, body[:5])
+                if not self.dry_run:
+                    self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
+                continue
+            if status not in (ST_CONFIRMED, ST_CHECK) and not hcheck:
+                continue
 
             def set_basis(text, tag=tag):
                 set_cell(rownum, "basis", with_block_tag(tag, text) if tag else text)
