@@ -12,3 +12,4 @@ data/거래내역_마스터.xlsx
 logs/
 data/outbox/*
 !data/outbox/.gitkeep
+data/backtest/

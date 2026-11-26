@@ -11,6 +11,7 @@
     python agent.py aliases suggest   # 시트의 미해석 거래처 → 마스터 후보 (yaml 주석 형식)
     python agent.py clients find <검색어>  # 마스터 이름 부분일치: 정식명/사업자번호/최근거래/올해 건수
     python agent.py clients add "<정식명>" <사업자번호>  # 경리나라 import에 없는 거래처 수동 등록
+    python agent.py backtest build [--year 2026]  # 임가공 월 탭 전부(읽기만) + DB 실제 단가 → data/backtest/ 정답지
     python agent.py calibrate   # 화면 좌표/비전 보정
 """
 import argparse
@@ -180,6 +181,12 @@ def cmd_clients_add(args: argparse.Namespace) -> None:
     sys.exit(0 if ok else 1)
 
 
+def cmd_backtest_build(args: argparse.Namespace) -> None:
+    import backtest
+
+    backtest.build(args.year, samples=args.samples, none_samples=args.none_samples, seed=args.seed)
+
+
 def cmd_calibrate(args: argparse.Namespace) -> None:
     print("calibrate: TODO")
 
@@ -216,6 +223,13 @@ def main() -> None:
     p_add.add_argument("name", help="정식명")
     p_add.add_argument("reg_no", help="사업자번호 000-00-00000")
     p_add.set_defaults(func=cmd_clients_add)
+    p_bt = sub.add_parser("backtest", help="임가공 견적 백테스트").add_subparsers(dest="backtest_cmd", required=True)
+    p_btb = p_bt.add_parser("build", help="임가공 시트 월 탭 전부 + DB 실제 단가 → data/backtest/imgagong_<연도>.csv/.xlsx")
+    p_btb.add_argument("--year", type=int, default=2026)
+    p_btb.add_argument("--samples", type=int, default=30, help="콘솔에 보일 시트 원문 샘플 수")
+    p_btb.add_argument("--none-samples", type=int, default=20, help="콘솔에 보일 match=none 샘플 수")
+    p_btb.add_argument("--seed", type=int, default=0)
+    p_btb.set_defaults(func=cmd_backtest_build)
     sub.add_parser("calibrate", help="화면 좌표/비전 보정").set_defaults(func=cmd_calibrate)
     args = parser.parse_args()
     args.func(args)

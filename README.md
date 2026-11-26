@@ -83,3 +83,17 @@ python agent.py outbox            # 파일별 포함 묶음·상태
 공통메모는 `config/sheets.yaml`의 `issue.memo_text`를 명세표마다 첫 줄에만 그대로 넣는다(이어지는 품목 줄은 비움).
 끝의 `(AI)`로 월간 import(`feedback.py`)가 명세표 목록의 공통메모 열을 보고 AI 발행 건을 `statements.issued_by='AI'`로 표시한다
 (열이 없으면 건너뛰고 로그만). 묶음 추적은 DB(`issue_file_blocks`)로 한다.
+
+## 임가공 백테스트 정답지
+
+```bash
+python agent.py backtest build            # 2026년 월 탭 전부 (시트·DB 읽기만)
+python agent.py backtest build --seed 3   # 콘솔 샘플만 다르게
+```
+
+임가공 시트의 그 해 월 탭 전부(1월~이번 달, 왼쪽 탭만이 아님)의 품목 행을 묶음 규칙대로 모아 거래처를 해석하고,
+D·E·F·호닝 전 치수(11월~: 연마량/치대)·호닝 전/후 노트·호닝 후 치수에서 구경·공차·기장·수량·재질·특이사항·Ra를
+뽑는다(못 뽑으면 빈칸, 원문은 `raw_*` 열). 탭마다 열 배치가 달라 2행 헤더 글자로 열을 찾는다.
+DB lines(kind='job')와 같은 사업자번호(또는 거래처명)·날짜 ±10일·구경 ±0.5mm(양쪽 기장 있으면 ±10%)로 짝을 지어
+`actual_unit_price`·`actual_qty`·`statement_id`를 붙인다: 후보 하나 `exact`, 여럿 → 가장 가까운 날짜 `nearest`,
+없음 `none` + `match_reason`. 결과 `data/backtest/imgagong_<연도>.csv`(UTF-8-SIG)·`.xlsx` (git 제외).
