@@ -4,7 +4,8 @@ v1: 호닝파이프(kind: pipe) — data/price_table.xlsx '삼화호닝' 시트 
     단가 = round10(1M당단가 × 가격인상상수 × 길이/1000), 소관이면 × 0.9
 임가공(kind: job) — pricer_job 사다리(사전단가·동일품) → 미결은 pricer_ai(Claude, 일일 상한).
     confidence high만 견적완료. mid/low는 단가 + '[가견적-mid]'/'[가견적-low]' + 견적확인필요(발행 차단).
-    사람이 상태 칸을 비우면 적힌 단가로, 단가를 고치면 고친 값으로 견적완료 (job_quotes 표와 비교). 발행기 미연결.
+    사람이 상태 칸을 비우면 적힌 단가로, 단가를 고치면 고친 값으로 견적완료 (job_quotes 표와 비교)
+    → 그 행은 lines(source='sheet')로 즉시 학습 (sheet_lines.py).
 
 watcher가 한 바퀴 돈 뒤 그 결과(snapshot)를 받아 처리한다.
 대상: 상태 '확정' + 작성자 빈칸 + 기존건 아님. 시트 쓰기는 시트당 batch_update 한 번.
@@ -283,10 +284,31 @@ class Pricer:
                 self._ai = False
         return self._ai or None
 
-    # 에이전트가 적은 임가공 단가·그때 지문 — 사람이 상태를 비웠는지/단가를 고쳤는지 판정용
+    # 에이전트가 적은 임가공 단가·그때 지문 — 사람이 상태를 비웠는지/단가를 고쳤는지 판정용.
+    # price·fp는 마지막으로 확인된 단가(사람 확정 뒤엔 사람 단가) — 판정용.
+    # agent_*는 에이전트 견적 그대로 남기고 human_*는 사람 확정 단가 → "에이전트 vs 사람" 교정 세션 재료.
+    JOB_QUOTES_EXTRA = {"agent_price": "TEXT", "agent_method": "TEXT", "agent_conf": "TEXT",
+                        "human_price": "TEXT", "human_at": "TEXT"}
+
     def _job_quotes_table(self) -> None:
+        if getattr(self, "_jq_ready", False):
+            return
         self.con.execute("CREATE TABLE IF NOT EXISTS job_quotes (row_id TEXT PRIMARY KEY, price TEXT, fp TEXT,"
                          " method TEXT, confidence TEXT, basis TEXT, quoted_at TEXT)")
+        have = {r[1] for r in self.con.execute("PRAGMA table_info(job_quotes)")}
+        new = [c for c in self.JOB_QUOTES_EXTRA if c not in have]
+        for c in new:
+            self.con.execute(f"ALTER TABLE job_quotes ADD COLUMN {c} {self.JOB_QUOTES_EXTRA[c]}")
+        if new:  # 옛 행 채우기: 에이전트 견적 행은 그대로, 사람 행은 산출근거 '(에이전트 X)'에서
+            self.con.execute("UPDATE job_quotes SET agent_price=price, agent_method=method, agent_conf=confidence"
+                             " WHERE agent_price IS NULL AND method NOT IN ('사람수정', '사람확인')")
+            for rid, basis, price in self.con.execute(
+                    "SELECT row_id, basis, price FROM job_quotes WHERE method IN ('사람수정', '사람확인')").fetchall():
+                m = re.search(r"\(에이전트 ([^)]*)\)", basis or "")
+                agent = (m.group(1) if m else price) if (m or (basis or "").startswith("사람 확인")) else None
+                self.con.execute("UPDATE job_quotes SET agent_price=?, human_price=? WHERE row_id=?",
+                                 (None if agent in (None, "없음") else norm_price_cell(agent), price, rid))
+        self._jq_ready = True
 
     def job_quote_get(self, row_id) -> tuple[str, str] | None:
         """(에이전트가 적은 단가, 그때 행 지문) 또는 None."""
@@ -294,14 +316,49 @@ class Pricer:
         return self.con.execute("SELECT price, fp FROM job_quotes WHERE row_id=?", (row_id,)).fetchone()
 
     def job_quote_put(self, row_id, price, fp, method="", conf="", basis="") -> None:
+        """에이전트 견적 기록 (agent_*도 같은 값, human_* 비움)."""
         if self.dry_run:
             return
         from datetime import datetime
 
         self._job_quotes_table()
-        self.con.execute("INSERT OR REPLACE INTO job_quotes VALUES (?,?,?,?,?,?,?)",
-                         (row_id, norm_price_cell(price), fp or "", method, conf or "", basis,
-                          datetime.now().isoformat(timespec="seconds")))
+        p = norm_price_cell(price)
+        self.con.execute("INSERT OR REPLACE INTO job_quotes(row_id, price, fp, method, confidence, basis, quoted_at,"
+                         " agent_price, agent_method, agent_conf, human_price, human_at)"
+                         " VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)",
+                         (row_id, p, fp or "", method, conf or "", basis, datetime.now().isoformat(timespec="seconds"),
+                          p, method, conf or ""))
+
+    def job_quote_human(self, row_id, price, fp, method, basis) -> None:
+        """사람 확정 기록: price·fp·method·basis는 사람 것으로, agent_*는 그대로 두고 human_price·human_at 기록."""
+        if self.dry_run:
+            return
+        from datetime import datetime
+
+        self._job_quotes_table()
+        p, ts = norm_price_cell(price), datetime.now().isoformat(timespec="seconds")
+        self.con.execute("UPDATE job_quotes SET price=?, fp=?, method=?, confidence='', basis=?, quoted_at=?,"
+                         " human_price=?, human_at=? WHERE row_id=?", (p, fp or "", method, basis, ts, p, ts, row_id))
+
+    def learn_sheet_row(self, r: dict, row: list, cols: dict, title: str) -> None:
+        """사람이 확정한 임가공 행 → lines(source='sheet') 즉시 추가 (sheet_lines). 줄을 못 만들면 로그만."""
+        if self.dry_run:
+            return
+        from issuer.excel_upload import LineCtx, LineError, block_date, job_lines
+        import sheet_lines
+
+        client, reg_no = r.get("client_resolved") or "", r.get("client_reg_no") or ""
+        if not client:
+            return
+        try:
+            day = block_date(r.get("block_date") or "", title)
+            get = lambda name: (row[cols[name] - 1].strip() if cols.get(name) and cols[name] - 1 < len(row) else "")
+            lines = job_lines(get, LineCtx(client, reg_no, day, self.job_index()))
+        except LineError as e:
+            logger.warning("시트 확정 줄 학습 건너뜀 row_id={} 거래처={}: {}", r["row_id"], client, e)
+            return
+        n = sheet_lines.add_sheet_lines(self.con, r["row_id"], client, reg_no, day, lines, note="시트 확정")
+        logger.info("시트 확정 줄 학습 row_id={} 거래처={} {} 줄 {}", r["row_id"], client, day, n)
 
     def quote_job_row(self, inp, index, cutoff) -> tuple[str, str, str, str, str]:
         """JobInput → (단가 칸, 산출근거, 상태, method, confidence). 사다리 → 미결이면 Claude.
@@ -400,6 +457,7 @@ class Pricer:
             def set_basis(text, tag=tag):
                 set_cell(rownum, "basis", with_block_tag(tag, text) if tag else text)
 
+            learn = False   # 사람 확정 → lines(source='sheet') 즉시 학습
             prev = self.job_quote_get(r["row_id"]) if status in (ST_CONFIRMED, ST_CHECK) else None
             human_price = norm_price_cell(price_cell)
             human_edit = human_price and prev is not None and (
@@ -422,7 +480,8 @@ class Pricer:
                 new_status = ST_QUOTED
                 basis = f"사람 수정 {price_cell} (에이전트 {prev[0] or '없음'}) | {_job_body(body)}"
                 set_basis(basis)
-                self.job_quote_put(r["row_id"], human_price, r.get("fp"), "사람수정", "", basis)
+                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis)
+                learn = True
                 msg = f"사람 단가 {price_cell} → 견적완료"
             elif (status == ST_CONFIRMED and prev is not None and prev[1] == (r.get("fp") or "")
                   and human_price and GAGYEON_RE.match(body)):
@@ -431,7 +490,8 @@ class Pricer:
                 who = "사람 확인" if human_price == prev[0] else f"사람 수정 {price_cell} (에이전트 {prev[0]})"
                 basis = f"{who} | {_job_body(body)}"
                 set_basis(basis)
-                self.job_quote_put(r["row_id"], human_price, r.get("fp"), "사람확인", "", basis)
+                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람확인", basis)
+                learn = True
                 msg = f"{who} (상태 칸 비움) → 견적완료"
             elif price_cell and not body:
                 new_status, msg = ST_QUOTED, "사람 입력 가격 유지"
@@ -452,6 +512,8 @@ class Pricer:
                 msg += " (동명확인 — 발행 안 함)"
             else:
                 set_cell(rownum, "status", new_status)
+                if learn:  # 동명확인(거래처 미정)은 학습 안 함
+                    self.learn_sheet_row(r, row, cols, getattr(snap.get("ws"), "title", ""))
             counts[new_status] += 1
             r["status"] = new_status
             logger.info("pricer sheet={} row={} client={} {} : {}", label, rownum, cell(row, "client"),

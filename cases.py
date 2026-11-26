@@ -39,8 +39,10 @@ class DbLine:
         return self.reg_no or "name:" + compact_name(self.client)[0]
 
 
-def load_job_lines(con: sqlite3.Connection, start: str = "0000-00-00", end: str = "9999-99-99") -> list[DbLine]:
-    """lines(kind='job') + 같은 날·같은 거래처 명세표 → 사업자번호·statement_id. 날짜·id 순."""
+def load_job_lines(con: sqlite3.Connection, start: str = "0000-00-00", end: str = "9999-99-99",
+                   official_only: bool = False) -> list[DbLine]:
+    """lines(kind='job') + 같은 날·같은 거래처 명세표 → 사업자번호·statement_id. 날짜·id 순.
+    시트 확정 줄(source='sheet', sheet_lines.py)도 포함 — official_only=True면 공식 import 줄만 (백테스트)."""
     stm = defaultdict(list)
     for sid, d, client, reg, item, spec in con.execute(
             "SELECT id, date, client, reg_no, item, spec FROM statements WHERE date BETWEEN ? AND ?", (start, end)):
@@ -51,7 +53,8 @@ def load_job_lines(con: sqlite3.Connection, start: str = "0000-00-00", end: str 
     out = []
     for lid, d, client, item, spec, qty, up, sup, dia, length, lo, hi, reg in con.execute(
             "SELECT id, date, client, item, spec, qty, unit_price, supply, dia, length, tol_lo, tol_hi, reg_no"
-            " FROM lines WHERE kind='job' AND date BETWEEN ? AND ? ORDER BY date, id", (start, end)):
+            " FROM lines WHERE kind='job' AND date BETWEEN ? AND ?"
+            + (" AND COALESCE(source, 'export')<>'sheet'" if official_only else "") + " ORDER BY date, id", (start, end)):
         cands = stm.get((d, client), [])
         pick = [c for c in cands if c[2] == item and (c[3] or "") == (spec or "")] or cands
         sid = "|".join(str(c[0]) for c in pick) if len(pick) > 1 and len(cands) > 1 else (

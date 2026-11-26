@@ -318,7 +318,7 @@ def build(year: int, samples: int = 30, none_samples: int = 20, seed: int = 0) -
                                         rules=watcher.load_client_rules(watcher.ALIASES_YAML))
     tabs = fetch_tabs(cfg, year)
     rows, per_tab, dup = collect_rows(tabs, year, master, cfg["sheets"]["imgagong"]["data_start_row"])
-    idx = LineIndex.build(load_job_lines(con, f"{year - 2}-10-01", f"{year + 1}-01-31"))
+    idx = LineIndex.build(load_job_lines(con, f"{year - 2}-10-01", f"{year + 1}-01-31", official_only=True))
     for r in rows:
         r.update(match_row(r, idx))
     csv, xlsx = write_outputs(rows, year)
@@ -487,7 +487,7 @@ def run_scores(year: int, ai: bool = False, limit: int = 200, seed: int = 0, top
 
     db = (ROOT / settings.DB_PATH) if not Path(settings.DB_PATH).is_absolute() else Path(settings.DB_PATH)
     con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)  # DB 읽기 전용
-    index = LineIndex.build(load_job_lines(con))
+    index = LineIndex.build(load_job_lines(con, official_only=True))  # 시트 확정 줄 제외
     if ai:
         return run_ai_scores(load_answer_rows(year), index, limit=limit, seed=seed, top=top)
     res = score_rows(load_answer_rows(year), index)

@@ -189,7 +189,8 @@ CREATE INDEX IF NOT EXISTS ix_lines_pipe ON lines(pipe_id, pipe_od);
 CREATE INDEX IF NOT EXISTS ix_stm_key ON statements(date, reg_no);
 """
 
-LINES_EXTRA = {"reg_no": "TEXT", "spec_norm": "TEXT", "category": "TEXT"}
+# lines.source: 'export' = 품목별판매현황 import, 'sheet' = 시트 확정 단가 즉시 학습(sheet_lines.py, row_id=시트 행)
+LINES_EXTRA = {"reg_no": "TEXT", "spec_norm": "TEXT", "category": "TEXT", "row_id": "TEXT"}
 # source: 'import' = 명세표 목록, 'manual' = agent.py clients add, 'list' = 거래처 목록에만 있음(명세표 없음)
 # ceo_name: 대표자명 (거래처 목록 import) — 시트 '거래처(대표명)'으로 동명 구분
 CLIENTS_EXTRA = {"source": "TEXT", "ceo_name": "TEXT"}
@@ -381,7 +382,12 @@ def main(stm_path, line_path, db_path, master_path=None):
                      regs.get(client), normalize_spec(r.spec), category_of(r.item, p["kind"])))
     con.executemany("INSERT INTO lines(date,client,item,spec,qty,unit_price,supply,note,kind,dia,tol_lo,tol_hi,length,pipe_id,pipe_od,"
                     "reg_no,spec_norm,category) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    import sheet_lines
+
+    n_gone = sheet_lines.replace_by_official(con)
     con.commit()
+    print("시트 확정 줄(source=sheet): 공식 줄로 대체되어 삭제=%d 남음=%d" % (
+        n_gone, con.execute("SELECT COUNT(*) FROM lines WHERE source='sheet'").fetchone()[0]))
     def q(s):
         return con.execute(s).fetchone()[0]
     print("clients=%d statements=%d lines=%d" % (q("select count(*) from clients"), q("select count(*) from statements"), q("select count(*) from lines")))

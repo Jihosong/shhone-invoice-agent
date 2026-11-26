@@ -5,6 +5,7 @@
    마감·발행대기·파일 담기 모두 안 함 (watcher가 이미 묶음 전체 사람처리로 둠).
 1) 마감: 상태 발행대기/발행대기-수정됨인 묶음에서 사람이 아무 행의 작성자를 'AI'로 바꿨고 그 묶음이 파일에
    담겨 있으면 → 묶음 전체 AI발행, 모든 행 작성자 'AI'로 통일, rows.issued_at·issue_file_blocks.issued_at 기록.
+   임가공이면 행마다 발행 줄을 lines(source='sheet')로 즉시 학습 (sheet_lines.py, 월간 import가 공식 줄로 대체).
 2) 발행대기 표시: 묶음 단위 조건 —
    - 모든 품목 행 상태 견적완료(호닝파이프는 견적확인필요인데 사람이 단가를 적은 것도), 이번 바퀴에 바뀐 상태가 아님.
      임가공은 견적완료만 — 견적확인필요 행에는 에이전트 가견적 단가가 적혀 있다 (사람 확인은 pricer가 견적완료로 바꿈)
@@ -111,7 +112,7 @@ class Issuer:
                 continue  # 묶음 안 사람 작성자가 하나라도 있으면 사람 것 — 마감·발행대기 안 함
             if statuses & {ST_PENDING, ST_PENDING_EDITED} and self.ai in authors:
                 if block_id in filed:
-                    self._close(key, label, scfg, block_id, rows, writer, filed[block_id][0])
+                    self._close(key, label, scfg, block_id, rows, writer, filed[block_id][0], snap)
                     counts[ST_ISSUED] += 1
                 else:
                     warn_once(f"issuer sheet={label} 묶음 {block_id} 작성자 AI인데 아직 파일에 없음 → 마감 안 함")
@@ -179,7 +180,7 @@ class Issuer:
             raise LineError("거래처 미해석")
         if not REG_NO_RE.match(reg_no):
             raise LineError(f"사업자번호 없음/형식 아님({reg_no!r})")
-        day = block_date(first.get("block_date") or "", snap["ws"].title, self.today)
+        day = block_date(first.get("block_date") or "", getattr(snap.get("ws"), "title", ""), self.today)
         builder = LINE_BUILDERS[scfg["kind"]]
         ctx = LineCtx(client, reg_no, day, self.job_index() if scfg["kind"] == "job" else None)
         lines = []
@@ -199,8 +200,10 @@ class Issuer:
             self._job_index = (key, LineIndex.build(load_job_lines(self.con)))
         return self._job_index[1]
 
-    def _close(self, key, label, scfg, block_id, rows, writer: SheetWriter, file_name: str) -> None:
-        """사람이 업로드 후 작성자를 AI로 → 묶음 전체 AI발행 + 작성자 AI 통일."""
+    def _close(self, key, label, scfg, block_id, rows, writer: SheetWriter, file_name: str,
+               snap: dict | None = None) -> None:
+        """사람이 업로드 후 작성자를 AI로 → 묶음 전체 AI발행 + 작성자 AI 통일.
+        임가공이면 행마다 발행 줄을 lines(source='sheet')로 즉시 학습 (sheet_lines)."""
         ts = now_iso()
         for r in rows:
             if r["status"] in ("", None, ST_SKIP):  # 사람처리·제외 행은 손대지 않음
@@ -216,8 +219,36 @@ class Issuer:
         if not self.dry_run:
             self.con.execute("UPDATE issue_file_blocks SET issued_at=COALESCE(issued_at, ?) WHERE block_id=?",
                              (ts, block_id))
+            if scfg.get("kind") == "job" and snap is not None:
+                self._learn(scfg, snap, rows)
         logger.info("issuer sheet={} row={} client={} 묶음 {} 작성자 AI 확인 → AI발행 ({})", label, rows[0]["rownum"],
                     rows[0].get("client_resolved"), block_id, file_name)
+
+    def _learn(self, scfg: dict, snap: dict, rows: list[dict]) -> None:
+        """AI발행 마감 묶음의 임가공 행 → lines(source='sheet'). 줄을 못 만든 행은 로그만 (마감은 그대로)."""
+        import sheet_lines
+
+        first = rows[0]
+        client, reg_no = first.get("client_resolved") or "", first.get("client_reg_no") or ""
+        if not client:
+            return
+        try:
+            day = block_date(first.get("block_date") or "", getattr(snap.get("ws"), "title", ""), self.today)
+        except LineError as e:
+            logger.warning("AI발행 줄 학습 건너뜀 묶음 {}: {}", first.get("block_id"), e)
+            return
+        ctx = LineCtx(client, reg_no, day, self.job_index())
+        n = 0
+        for r in rows:
+            if r["status"] != ST_ISSUED:
+                continue
+            try:
+                lines = LINE_BUILDERS["job"](lambda name, r=r: self._cell(scfg, r, name), ctx)
+            except LineError as e:
+                logger.warning("AI발행 줄 학습 건너뜀 row={}: {}", r["rownum"], e)
+                continue
+            n += sheet_lines.add_sheet_lines(self.con, r["row_id"], client, reg_no, day, lines, note="AI발행")
+        logger.info("AI발행 줄 학습 묶음 {} 거래처={} {} 줄 {}", first.get("block_id"), client, day, n)
 
     # ------------------------------------------------------------------ 파일 묶음
     def candidates(self, snapshots: dict[str, dict]) -> list[Candidate]:
