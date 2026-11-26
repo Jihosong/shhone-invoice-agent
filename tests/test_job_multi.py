@@ -179,11 +179,11 @@ def test_human_price_count_must_match_items(env):
     p.process_job("imgagong", scfg, snap((5, sheet_row(e=EX3, status="견적확인필요", price="60000/55000",
                                                        basis=bad), "견적확인필요", "fp1")))
     assert FakeWriter.last.writes == {}
-    # 3개로 고침 → 견적완료, 불일치 표시는 뗌
+    # 3개로 고침 → 견적완료(사람수정), 불일치 표시는 뗌
     p.process_job("imgagong", scfg, snap((5, sheet_row(e=EX3, status="견적확인필요", price="60,000/55,000/52,000",
                                                        basis=bad), "견적확인필요", "fp1")))
     w = FakeWriter.last.writes
-    assert w[(5, "status")] == pricer.ST_QUOTED
+    assert w[(5, "status")] == pricer.ST_QUOTED_EDIT
     assert w[(5, "basis")].startswith("사람 수정 60,000/55,000/52,000 (에이전트 60000/55000/50000) | 다품목 3구간")
     assert con.execute("SELECT price FROM job_quotes").fetchone() == ("60000/55000/52000",)
 
@@ -205,7 +205,7 @@ def test_single_item_row_single_price_still_quoted(env):
     basis = FakeWriter.last.writes[(5, "basis")]
     p.process_job("imgagong", scfg, snap((5, sheet_row(status="견적확인필요", price="55,000", basis=basis),
                                           "견적확인필요", "fp1")))
-    assert FakeWriter.last.writes[(5, "status")] == pricer.ST_QUOTED
+    assert FakeWriter.last.writes[(5, "status")] == pricer.ST_QUOTED_EDIT
 
 
 # ---------------------------------------------------------------- 블록 규칙: 임가공 2번째 줄 이후

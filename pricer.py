@@ -4,7 +4,8 @@ v1: 호닝파이프(kind: pipe) — data/price_table.xlsx '삼화호닝' 시트 
     단가 = round10(1M당단가 × 가격인상상수 × 길이/1000), 소관이면 × 0.9
 임가공(kind: job) — pricer_job 사다리(사전단가·동일품) → 미결은 pricer_ai(Claude, 일일 상한).
     confidence high만 견적완료. mid/low는 단가 + '[가견적-mid]'/'[가견적-low]' + 견적확인필요(발행 차단).
-    사람이 상태 칸을 비우면 적힌 단가로, 단가를 고치면 고친 값으로 견적완료 (job_quotes 표와 비교)
+    사람이 상태 칸을 비우면 적힌 단가로 '견적완료(사람확인)', 단가를 고치면 고친 값으로 '견적완료(사람수정)'
+    (job_quotes 표와 비교). 발행기·watcher는 둘 다 견적완료로 본다 (watcher.QUOTED_STATES)
     → 그 행은 lines(source='sheet')로 즉시 학습 (sheet_lines.py).
 
 watcher가 한 바퀴 돈 뒤 그 결과(snapshot)를 받아 처리한다.
@@ -20,7 +21,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from watcher import ST_HCHECK, SheetWriter, strip_block_tag, with_block_tag
+from watcher import QUOTED_STATES, ST_HCHECK, ST_QUOTED_EDIT, ST_QUOTED_OK, SheetWriter, strip_block_tag, with_block_tag
 
 ROOT = Path(__file__).parent
 PRICE_SHEET = "삼화호닝"
@@ -258,7 +259,8 @@ class Pricer:
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
 
         written = writer.flush(snap["ws"], self.dry_run)
-        logger.info("pricer sheet={} 견적완료={} 견적확인필요={} 동명확인가견적={}{}", label, counts[ST_QUOTED],
+        logger.info("pricer sheet={} 견적완료={} (사람수정 {} 사람확인 {}) 견적확인필요={} 동명확인가견적={}{}", label,
+                    sum(counts[s] for s in QUOTED_STATES), counts[ST_QUOTED_EDIT], counts[ST_QUOTED_OK],
                     counts[ST_CHECK], counts[ST_HCHECK],
                     f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run else f" 쓰기={written}")
 
@@ -477,22 +479,24 @@ class Pricer:
                 # 견적확인필요 + 사람이 단가를 고침(빈칸이던 것을 채운 것 포함) → 그 값으로 견적완료
                 if prev is None or not human_price or human_price == (prev[0] or ""):
                     continue
-                new_status = ST_QUOTED
+                new_status = ST_QUOTED_EDIT
                 basis = f"사람 수정 {price_cell} (에이전트 {prev[0] or '없음'}) | {_job_body(body)}"
                 set_basis(basis)
                 self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis)
                 learn = True
-                msg = f"사람 단가 {price_cell} → 견적완료"
+                msg = f"사람 단가 {price_cell} → {new_status}"
             elif (status == ST_CONFIRMED and prev is not None and prev[1] == (r.get("fp") or "")
                   and human_price and GAGYEON_RE.match(body)):
                 # 가견적 행인데 내용 그대로 확정으로 돌아옴 = 사람이 상태 칸을 비움 → 적힌 단가로 견적완료
-                new_status = ST_QUOTED
-                who = "사람 확인" if human_price == prev[0] else f"사람 수정 {price_cell} (에이전트 {prev[0]})"
+                # 단가도 고쳤으면 사람수정, 상태 칸만 비웠으면 사람확인
+                same = human_price == prev[0]
+                new_status = ST_QUOTED_OK if same else ST_QUOTED_EDIT
+                who = "사람 확인" if same else f"사람 수정 {price_cell} (에이전트 {prev[0]})"
                 basis = f"{who} | {_job_body(body)}"
                 set_basis(basis)
-                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람확인", basis)
+                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람확인" if same else "사람수정", basis)
                 learn = True
-                msg = f"{who} (상태 칸 비움) → 견적완료"
+                msg = f"{who} (상태 칸 비움) → {new_status}"
             elif price_cell and not body:
                 new_status, msg = ST_QUOTED, "사람 입력 가격 유지"
             else:
@@ -522,6 +526,7 @@ class Pricer:
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
 
         written = writer.flush(snap["ws"], self.dry_run)
-        logger.info("pricer sheet={} 견적완료={} 견적확인필요={} 동명확인가견적={}{}", label, counts[ST_QUOTED],
+        logger.info("pricer sheet={} 견적완료={} (사람수정 {} 사람확인 {}) 견적확인필요={} 동명확인가견적={}{}", label,
+                    sum(counts[s] for s in QUOTED_STATES), counts[ST_QUOTED_EDIT], counts[ST_QUOTED_OK],
                     counts[ST_CHECK], counts[ST_HCHECK],
                     f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run else f" 쓰기={written}")

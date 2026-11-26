@@ -8,7 +8,7 @@
    임가공이면 행마다 발행 줄을 lines(source='sheet')로 즉시 학습 (sheet_lines.py, 월간 import가 공식 줄로 대체).
 2) 발행대기 표시: 묶음 단위 조건 —
    - 모든 품목 행 상태 견적완료(호닝파이프는 견적확인필요인데 사람이 단가를 적은 것도), 이번 바퀴에 바뀐 상태가 아님.
-     임가공은 견적완료만 — 견적확인필요 행에는 에이전트 가견적 단가가 적혀 있다 (사람 확인은 pricer가 견적완료로 바꿈)
+     임가공은 견적완료만 — 견적확인필요 행에는 에이전트 가견적 단가가 적혀 있다 (사람 확인은 pricer가 견적완료(사람수정/사람확인)로 바꿈)
    - 모든 행 작성자 빈칸, 기존건 아님 (보류·동명확인·사람처리·제외는 위 상태 조건에서 이미 빠짐)
    - 모든 행 작업완료 TRUE, 그중 하나 이상은 에이전트가 FALSE→TRUE를 직접 봄(work_end_flipped_at)
    - 줄을 만들 수 있음(거래처 사업자번호·날짜·규격·수량·단가) — 시트 kind에 builder가 있어야 함(pipe, job)
@@ -33,8 +33,8 @@ from loguru import logger
 
 from issuer.excel_upload import (DEFAULT_MEMO_TEXT, LINE_BUILDERS, LineCtx, LineError, Statement, block_date, parse_price,
                                  write_xls)
-from watcher import (REG_NO_RE, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_SKIP, SheetWriter, bool_state, now_iso,
-                     warn_once, with_block_tag)
+from watcher import (QUOTED_STATES, REG_NO_RE, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_SKIP, SheetWriter,
+                     bool_state, now_iso, warn_once, with_block_tag)
 
 ROOT = Path(__file__).resolve().parent.parent
 ST_QUOTED = "견적완료"
@@ -161,7 +161,7 @@ class Issuer:
                     parse_price(self._cell(scfg, r, "unit_price"))
                 except LineError:
                     return "견적확인필요 (사람 단가 없음)"
-            elif st != ST_QUOTED:
+            elif st not in QUOTED_STATES:
                 return f"상태 {st or '사람처리'}"
             if self._cell(scfg, r, "author") or r.get("author"):
                 return "작성자 있음"

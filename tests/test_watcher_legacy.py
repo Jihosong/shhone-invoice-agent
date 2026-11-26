@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from watcher import ST_CONFIRMED, ST_LEGACY, ST_TYPING, ST_SKIP, Watcher, ensure_columns
+from watcher import ST_CONFIRMED, ST_LEGACY, ST_SKIP, ST_TYPING, Watcher, ensure_columns, post_quote_states
 
 # A 날짜, B 거래처, C 작업완료, D 출고완료, E 작성자, F 상태, G 행ID
 COLS = {"date": 1, "client": 2, "work_end": 3, "shipped": 4, "author": 5, "status": 6, "row_id": 7}
@@ -57,7 +57,7 @@ def make_watcher(rows, skip_clients=(), clients=("가", "나", "다"), scfg=SCFG
     w.con.executemany("INSERT INTO clients(name, reg_no, n_statements, last_date) VALUES(?,?,?,?)",
                       [(c + (None,))[:4] if isinstance(c, tuple) else (c, "", 1, None) for c in clients])
     w.snapshots = {}
-    w.post_quote = set(STATUS_VALUES[STATUS_VALUES.index("견적완료"):]) - {ST_SKIP, ST_LEGACY}
+    w.post_quote = post_quote_states(STATUS_VALUES)
     return w
 
 

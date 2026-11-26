@@ -58,10 +58,10 @@ def test_human_fix_then_same_month_reorder_is_high_with_new_price(env):
     assert w[(5, "basis")].startswith("[가견적-mid] 동일품") and "동결 유지 — 확인" in w[(5, "basis")]
     assert sheet_rows(con) == []   # 에이전트 가견적만으로는 학습 안 함
 
-    # 사람이 단가를 45,000으로 고침 → 견적완료 + lines(source='sheet') 즉시 추가
+    # 사람이 단가를 45,000으로 고침 → 견적완료(사람수정) + lines(source='sheet') 즉시 추가
     p.process_job("imgagong", scfg, row_snap((5, "R1", sheet_row(e=E, status="견적확인필요", price="45,000",
                                                                 basis=w[(5, "basis")]), "견적확인필요")))
-    assert FakeWriter.last.writes[(5, "status")] == pricer.ST_QUOTED
+    assert FakeWriter.last.writes[(5, "status")] == pricer.ST_QUOTED_EDIT
     assert sheet_rows(con) == [("R1", TODAY.isoformat(), "가사", REG, "시린더호닝", "Ø50 +0~+0.05 / 300", 2.0, 45000,
                                 "job", 50.0, 300.0, "시트 확정")]   # 규격 표기는 직전 명세표 그대로 (발행 줄과 같음)
     # job_quotes: 에이전트 단가 vs 사람 단가 둘 다 남음
@@ -81,9 +81,9 @@ def test_human_clears_status_learns_agent_price(env):
     export_line(con, TODAY - timedelta(days=250), 40000)
     p.process_job("imgagong", scfg, row_snap((5, "R1", sheet_row(e=E), "확정")))
     basis = FakeWriter.last.writes[(5, "basis")]
-    # 사람이 상태 칸을 비움(내용 그대로) → 적힌 단가로 견적완료 + 학습
+    # 사람이 상태 칸을 비움(내용 그대로) → 적힌 단가로 견적완료(사람확인) + 학습
     p.process_job("imgagong", scfg, row_snap((5, "R1", sheet_row(e=E, status="", price="40000", basis=basis), "확정")))
-    assert FakeWriter.last.writes[(5, "status")] == pricer.ST_QUOTED
+    assert FakeWriter.last.writes[(5, "status")] == pricer.ST_QUOTED_OK
     assert [r[7] for r in sheet_rows(con)] == [40000]
     assert con.execute("SELECT agent_price, human_price, method FROM job_quotes").fetchone() == ("40000", "40000",
                                                                                                 "사람확인")

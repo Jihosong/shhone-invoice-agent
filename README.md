@@ -131,7 +131,8 @@ python agent.py backtest run --ai --limit 200 --seed 0   # 미결 행 표본을 
   참고 사례(같은 거래처 8 · 타 거래처 5 · 인상 성향). 부록 B.5 JSON(structured outputs), max_tokens 300.
   호출마다 `logs/ai_calls.jsonl`에 토큰·비용. 운영 호출은 하루 300건, 운영 첫날은 60건.
 - **운영** (`pricer.py` kind=job): confidence high만 견적완료. mid/low → 단가 + `[가견적-mid]`/`[가견적-low]`
-  + 견적확인필요(발행 차단). 사람이 상태 칸을 비우면 적힌 단가로, 단가를 고치면 고친 값으로 견적완료
+  + 견적확인필요(발행 차단). 사람이 상태 칸을 비우면 적힌 단가로 `견적완료(사람확인)`, 단가를 고치면 고친 값으로 `견적완료(사람수정)`
+  (발행기·watcher는 둘 다 견적완료로 취급)
   (에이전트가 적은 단가·지문은 DB `job_quotes` — `agent_price/agent_method/agent_conf`는 에이전트 견적 그대로,
   `human_price/human_at`은 사람 확정 단가: 교정 세션 재료). 미결·AI 실패 → 단가 비우고 견적확인필요.
 - **시트 확정 즉시 학습** (`sheet_lines.py`): 사람이 단가를 확정(상태 칸 비움·단가 수정 → 견적완료)하거나 묶음이

@@ -67,6 +67,9 @@ SHEET_LABELS = {"imgagong": "임가공", "pipe": "파이프"}  # 로그 표시�
 ST_TYPING = "입력중"
 ST_CONFIRMED = "확정"
 ST_QUOTED = "견적완료"
+ST_QUOTED_EDIT = "견적완료(사람수정)"   # 견적확인필요 행에서 사람이 단가 칸을 고쳐 확정
+ST_QUOTED_OK = "견적완료(사람확인)"     # 가견적 행 상태 칸만 비워 적힌 단가로 확정
+QUOTED_STATES = frozenset({ST_QUOTED, ST_QUOTED_EDIT, ST_QUOTED_OK})  # 발행기·watcher는 셋 다 견적완료로 봄
 ST_ISSUED = "AI발행"
 ST_SKIP = "제외-월말일괄"
 ST_LEGACY = "기존건-확인필요"
@@ -106,6 +109,18 @@ FILE_BLOCK_EXTRA = {"human_flag_at": "TEXT", "human_ack_at": "TEXT"}
 EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT",
                  "legacy": "INTEGER", "block_id": "TEXT", "client_resolved": "TEXT", "client_note": "TEXT",
                  "deleted_at": "TEXT", "client_reg_no": "TEXT", "item_fp": "TEXT"}
+
+
+def post_quote_states(status_values: list[str]) -> set[str]:
+    """'견적완료' 이후 단계로 보는 상태들 — 내용이 그대로면 유지 (제외는 별도 규칙).
+    견적완료(사람수정/사람확인)은 status_values에 없어도 포함.
+    기존건은 시트 값이 아니라 DB(rows.status)로만 판정한다
+    보류-미등록/보류-동명은 매 바퀴 거래처 마스터로 다시 판정 (조건이 풀리면 자동 해제)
+    보류-화면이상은 유지 — 사람이 묶음 안 한 행의 상태 칸을 비우면 묶음 전체 재평가
+    동명확인은 매 바퀴 다시 판정 (거래처 칸을 고치면 확정으로)"""
+    st = list(status_values)
+    return (set(st[st.index(ST_QUOTED):]) | QUOTED_STATES) - {ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM, ST_HCHECK,
+                                                              ST_HUMAN_CHECK}
 
 
 def ensure_columns(con: sqlite3.Connection) -> None:
@@ -605,14 +620,7 @@ class Watcher:
         # 시트별 마지막 바퀴 결과 (pricer 등 후속 단계가 사용)
         self.snapshots: dict[str, dict] = {}
         self.alias_path: Path | None = ALIASES_YAML  # 매 바퀴 다시 읽음 (고치면 재시작 없이 반영)
-        st = self.common["status_values"]
-        # '견적완료' 이후 단계로 보는 상태들 (제외는 별도 규칙)
-        # 기존건은 시트 값이 아니라 DB(rows.status)로만 판정한다
-        # 보류-미등록/보류-동명은 매 바퀴 거래처 마스터로 다시 판정 (조건이 풀리면 자동 해제)
-        # 보류-화면이상은 유지 — 사람이 묶음 안 한 행의 상태 칸을 비우면 묶음 전체 재평가
-        # 동명확인은 매 바퀴 다시 판정 (거래처 칸을 고치면 확정으로)
-        self.post_quote = set(st[st.index(ST_QUOTED):]) - {ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM, ST_HCHECK,
-                                                           ST_HUMAN_CHECK}
+        self.post_quote = post_quote_states(self.common["status_values"])
         self._log_state: dict[tuple, tuple | None] = {}
 
     def _log_on_change(self, ident: tuple, level: str | None, msg: str = "", *args) -> None:

@@ -282,10 +282,10 @@ def test_process_job_flow_gagyeon_then_human_clears_status(job_env, caplog):
     p.process_job("imgagong", scfg, snap_of(sheet_row(status="견적확인필요", price="61,000",
                                                       basis=w[(5, "basis")]), "견적확인필요"))
     assert FakeWriter.last.writes == {} and ai.calls == 1
-    # 사람이 상태 칸을 비움 → watcher가 확정으로(지문 같음) → 적힌 단가로 견적완료, AI 안 부름
+    # 사람이 상태 칸을 비움 → watcher가 확정으로(지문 같음) → 적힌 단가로 견적완료(사람확인), AI 안 부름
     p.process_job("imgagong", scfg, snap_of(sheet_row(price="61,000", basis=w[(5, "basis")]), "확정"))
     w2 = FakeWriter.last.writes
-    assert w2[(5, "status")] == pricer.ST_QUOTED and ai.calls == 1
+    assert w2[(5, "status")] == pricer.ST_QUOTED_OK and ai.calls == 1
     assert w2[(5, "basis")].startswith("사람 확인 | AI-유사품")
 
 
@@ -296,7 +296,7 @@ def test_process_job_human_edits_price(job_env):
     p.process_job("imgagong", scfg, snap_of(sheet_row(status="견적확인필요", price="55,000", basis=basis),
                                             "견적확인필요"))
     w = FakeWriter.last.writes
-    assert w[(5, "status")] == pricer.ST_QUOTED and (5, "unit_price") not in w  # 사람 값 그대로 둠
+    assert w[(5, "status")] == pricer.ST_QUOTED_EDIT and (5, "unit_price") not in w  # 사람 값 그대로 둠
     assert w[(5, "basis")].startswith("사람 수정 55,000 (에이전트 61000) | AI-유사품")
     assert con.execute("SELECT price FROM job_quotes").fetchone() == ("55000",)
 
