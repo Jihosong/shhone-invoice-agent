@@ -6,7 +6,7 @@ import pytest
 import backtest
 import clients_cli
 from cases import DbLine, LineIndex
-from pricer_job import M_PENDING, M_PRESET, M_SAME, JobInput, preset_price, quote_ladder
+from pricer_job import M_PENDING, M_PRESET, M_SAME, JobInput, item_keywords, preset_price, quote_ladder
 from watcher import ClientMaster, NameNormalizer, load_client_rules
 
 REG = "111-11-11111"
@@ -27,13 +27,15 @@ def q(inp, lines, exclude=()):
 
 # ---------------------------------------------------------------- a. 사전단가
 @pytest.mark.parametrize("d,price", [("8", 80000), ("1.5", 15000), ("5.5", 55000), (" 8 ", 80000),
-                                     ("1000", 1000), ("45000", 45000), ("1,400", 1400), ("999", 9990000)])
+                                     ("0.5", 5000), ("5000", 5000), ("45000", 45000), ("1,400,000", 1400000),
+                                     ("500", 5000000)])
 def test_preset_price(d, price):
     assert preset_price(d) == price
 
 
-@pytest.mark.parametrize("d", ["", "긴급", "8만", "33,42,48", "Ø50", "0", "A84401413-004", "2/13"])
-def test_preset_price_not_number(d):
+@pytest.mark.parametrize("d", ["", "긴급", "8만", "33,42,48", "Ø50", "0", "A84401413-004",
+                               "0.4", "1000", "1,400", "4999", "501", "999", "5000001"])  # 5천 미만·500만 초과
+def test_preset_price_not_number_or_out_of_range(d):
     assert preset_price(d) is None
 
 
@@ -41,6 +43,48 @@ def test_preset_wins_over_same_item():
     got = q(job("Ø50+0.0~+0.05 / 2개", d="8"), [ln(1, "2026-05-01", 30000)])
     assert (got.method, got.unit_price, got.confidence) == (M_PRESET, 80000, "high")
     assert "D열 8 ×10,000" in got.label()
+
+
+def test_preset_out_of_range_falls_to_same_item():
+    got = q(job("Ø125+0.0~+0.05 / 1개", d="600"), [ln(1, "2026-05-01", 40000, dia=125)])
+    assert (got.method, got.unit_price) == (M_SAME, 40000)
+
+
+def test_preset_confidence_by_client_history():
+    e = "Ø50+0.0~+0.05 / 2개"
+    assert q(job(e, d="20"), []).confidence == "mid"                       # 과거 단가 없음
+    hist = [ln(1, "2025-01-01", 10000, dia=10), ln(2, "2025-02-01", 12000, dia=11)]  # 중앙값 11,000
+    assert q(job(e, d="3"), hist).confidence == "high"                     # 30,000 < 33,000
+    low = q(job(e, d="20"), hist)                                          # 200,000 ≥ 3배
+    assert (low.method, low.unit_price, low.confidence) == (M_PRESET, 200000, "low")
+    assert "3배 이상 차이" in low.basis
+    assert q(job(e, d="0.5"), [ln(1, "2025-01-01", 15000, dia=10)]).confidence == "low"  # ⅓ 이하
+    # 다른 거래처·cutoff 이후·정답 줄은 과거 단가로 안 봄
+    other = [ln(3, "2025-01-01", 11000, reg="999-99-99999", client="나사"), ln(4, "2026-07-01", 11000)]
+    assert q(job(e, d="20"), other).confidence == "mid"
+    assert q(job(e, d="20"), hist, exclude={1, 2}).confidence == "mid"
+
+
+def test_preset_multi_per_item():
+    e = "SUSØ35+0.0~+0.03 / 330 / 1개 + SUSØ40+0.0~+0.03 / 175 / 1개"
+    got = q(job(e, d="4 /2.5"), [])
+    assert (got.method, got.unit_price, got.item_prices) == (M_PRESET, 40000, [(35.0, 40000), (40.0, 25000)])
+    assert "Ø35 40,000 / Ø40 25,000" in got.basis
+
+
+@pytest.mark.parametrize("d,e", [("11/15", "Ø75-0.005~-0.008 /1개"),          # 숫자 2개, 품목 1개
+                                 ("20/30/40", "Ø30 / 1개 + Ø40 / 1개"),
+                                 ("5.5/0.1", "Ø30 / 1개 + Ø40 / 1개")])        # 하나라도 범위 밖
+def test_preset_multi_mismatch_pending(d, e):
+    assert q(job(e, d=d), []).method == M_PENDING
+
+
+def test_backtest_picks_item_price_by_line_dia():
+    rows = [{"match": "exact", "date": "2026-06-01", "client": "가사", "reg_no": REG, "tab": "6월", "row": "3",
+             "raw_main_msg": "5.5/7", "raw_spec_qty": "Ø30.18 +0~+0.02 / 20개 + Ø70 +0~+0.02 / 20개",
+             "line_id": "9", "actual_unit_price": "70000", "actual_qty": "20"}]
+    res = backtest.score_rows(rows, LineIndex.build([ln(9, "2026-06-02", 70000, dia=70)]))
+    assert (res[0]["method"], res[0]["pred"], res[0]["err_rate"]) == (M_PRESET, 70000, 0)
 
 
 # ---------------------------------------------------------------- b. 동일품
@@ -78,22 +122,41 @@ def test_same_item_by_name_when_no_reg():
     assert got.unit_price == 1000
 
 
-def test_same_item_stale_adds_5pct_per_year_mid():
+def test_same_item_stale_keeps_price_mid():
     got = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2024-06-01", 100000)])  # 정확히 730일 = 24개월
-    assert got.confidence == "mid" and got.unit_price == 110000  # 100,000 × 1.05^2 = 110,250 → 천 원
-    assert "2.0년 경과" in got.basis
+    assert (got.method, got.unit_price, got.confidence) == (M_SAME, 100000, "mid")  # 보정 없음
+    assert "직전 2024-06" in got.basis
     recent = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2024-06-03", 100000)])  # 728일
     assert (recent.confidence, recent.unit_price) == ("high", 100000)
+    assert "직전 " not in recent.basis
 
 
-@pytest.mark.parametrize("qty,conf", [(3, "mid"), (2, "high"), (1, "high")])
-def test_same_item_qty_ratio_up(qty, conf):
-    assert q(job(f"Ø50+0.0~+0.05 / {qty}개"), [ln(1, "2026-01-01", 1000, qty=1)]).confidence == conf
+@pytest.mark.parametrize("qty,method", [(3, M_PENDING), (2, M_SAME), (1, M_SAME)])
+def test_same_item_qty_ratio_up(qty, method):
+    got = q(job(f"Ø50+0.0~+0.05 / {qty}개"), [ln(1, "2026-01-01", 410000, qty=1)])
+    assert got.method == method
+    if method == M_SAME:
+        assert got.confidence == "high"
 
 
-def test_same_item_qty_ratio_down():
-    assert q(job("Ø50+0.0~+0.05 / 3개"), [ln(1, "2026-01-01", 1000, qty=9)]).confidence == "mid"
+def test_same_item_qty_ratio_down_and_hint():
+    got = q(job("Ø50+0.0~+0.05 / 3개"), [ln(7, "2026-01-01", 410000, qty=9)])
+    assert (got.method, got.unit_price, got.ref_line_id) == (M_PENDING, None, 7)
+    assert got.hint.startswith("직전 동일품 9개 410,000 / 이번 3개")
     assert q(job("Ø50+0.0~+0.05 / 4개"), [ln(1, "2026-01-01", 1000, qty=9)]).confidence == "high"
+
+
+@pytest.mark.parametrize("text,kw", [
+    ("막힘 사각 다공 3구멍 딥홀 용접 열처리 도금", {"막힘", "사각", "다공", "딥홀", "용접", "열처리", "도금"}),
+    ("Ra0.2 치대 0.3 긴급 각도 얇은 수리 면작업 릴리프", set()),   # 작업 조건·지시는 비교 안 함
+])
+def test_item_keywords_only_seven(text, kw):
+    assert item_keywords(text) == frozenset(kw)
+
+
+def test_same_item_ignores_non_item_keywords():
+    got = q(job("Ø50+0.0~+0.05 Ra0.2 / 1개"), [ln(1, "2026-01-01", 1000, item="시린더 치대작업")])
+    assert got.method == M_SAME
 
 
 def test_pending_when_nothing():

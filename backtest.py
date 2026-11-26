@@ -372,25 +372,41 @@ def score_rows(rows: list[dict], index: LineIndex) -> list[dict]:
     from pricer_job import JobInput, quote_ladder
 
     out = []
+    by_id = {ln.id: ln for ln in index.lines}
     for r in rows:
         if r.get("match") in ("", "none") or not r.get("date"):
             continue
         inp = JobInput.from_backtest(r)
         lid = _f(r.get("line_id"))
         q = quote_ladder(inp, index, inp.on_date, exclude_ids={int(lid)} if lid is not None else ())
-        actual = _f(r.get("actual_unit_price"))
-        err = (q.unit_price - actual) / actual if q.unit_price is not None and actual and actual > 0 else None
-        out.append({
-            "tab": r["tab"], "row": r["row"], "date": r["date"], "client": r["client"], "reg_no": r["reg_no"],
-            "raw_main_msg": r["raw_main_msg"], "raw_spec_qty": r["raw_spec_qty"],
-            "dia": inp.dia, "tol_lo": inp.tol_lo, "tol_hi": inp.tol_hi, "length": inp.length, "qty": inp.qty,
-            "keywords": ",".join(sorted(inp.item_keywords)),
-            "method": q.method, "pred": q.unit_price, "confidence": q.confidence or "", "basis": q.basis,
-            "ref_line_id": q.ref_line_id, "actual_unit_price": actual, "actual_qty": _f(r.get("actual_qty")),
-            "line_item": r.get("line_item", ""), "line_spec": r.get("line_spec", ""), "line_id": lid,
-            "err_rate": err, "abs_err": abs(err) if err is not None else None,
-        })
+        out.append(score_entry(r, inp, q, by_id.get(int(lid)) if lid is not None else None))
     return out
+
+
+def pick_item_price(q, line: DbLine | None) -> int | None:
+    """품목별 사전단가면 정답 줄 구경에 가장 가까운 품목의 단가, 아니면 q.unit_price."""
+    if q.item_prices and line is not None and line.dia is not None:
+        return min(q.item_prices, key=lambda it: abs(it[0] - line.dia))[1]
+    return q.unit_price
+
+
+def score_entry(r: dict, inp, q, line: DbLine | None = None) -> dict:
+    """정답지 행 + 견적 → 결과 행 (예측·실제·오차율)."""
+    pred = pick_item_price(q, line)
+    actual = _f(r.get("actual_unit_price"))
+    lid = _f(r.get("line_id"))
+    err = (pred - actual) / actual if pred is not None and actual and actual > 0 else None
+    return {
+        "tab": r["tab"], "row": r["row"], "date": r["date"], "client": r["client"], "reg_no": r["reg_no"],
+        "raw_main_msg": r["raw_main_msg"], "raw_spec_qty": r["raw_spec_qty"],
+        "dia": inp.dia, "tol_lo": inp.tol_lo, "tol_hi": inp.tol_hi, "length": inp.length, "qty": inp.qty,
+        "keywords": ",".join(sorted(inp.item_keywords)),
+        "method": q.method, "pred": pred, "confidence": q.confidence or "", "basis": q.basis,
+        "hint": q.hint, "ref_line_id": q.ref_line_id, "cost_usd": q.cost_usd,
+        "actual_unit_price": actual, "actual_qty": _f(r.get("actual_qty")),
+        "line_item": r.get("line_item", ""), "line_spec": r.get("line_spec", ""), "line_id": lid,
+        "err_rate": err, "abs_err": abs(err) if err is not None else None,
+    }
 
 
 def accuracy_line(res: list[dict]) -> str:
@@ -411,12 +427,14 @@ def accuracy_line(res: list[dict]) -> str:
 def report_scores(res: list[dict], top: int = 20) -> list[str]:
     n = len(res)
     by = Counter(r["method"] for r in res)
-    out = [f"대상 match≠none {n}행",
-           "적용 비율: " + "  /  ".join(f"{m} {_pct(by[m], n)}" for m in ("사전단가", "동일품", "미결")
-                                         if m in by or m != "미결")]
+    order = [m for m in ("사전단가", "동일품") if m in by or not by] + sorted(
+        (m for m in by if m not in ("사전단가", "동일품", "미결", "AI실패")), key=lambda m: -by[m])
+    tail = [m for m in ("AI실패", "미결") if m in by]
+    out = [f"대상 {n}행",
+           "적용 비율: " + "  /  ".join(f"{m} {_pct(by[m], n)}" for m in order + tail)]
     applied = [r for r in res if r["pred"] is not None]
     out.append("적용된 것 전체: " + accuracy_line(applied))
-    for m in ("사전단가", "동일품"):
+    for m in order:
         sub = [r for r in applied if r["method"] == m]
         if sub:
             out.append(f"  {m}: " + accuracy_line(sub))
@@ -425,7 +443,7 @@ def report_scores(res: list[dict], top: int = 20) -> list[str]:
         sub = [r for r in applied if r["confidence"] == c]
         if sub:
             out.append(f"  {c}: " + accuracy_line(sub))
-            for m in ("사전단가", "동일품"):
+            for m in order:
                 sm = [r for r in sub if r["method"] == m]
                 if sm and len(sm) != len(sub):
                     out.append(f"    {m}: " + accuracy_line(sm))
@@ -444,7 +462,8 @@ def preset_diagnosis(res: list[dict]) -> list[str]:
     """사전단가(D열 숫자) 가정 점검: 실제/D 배율 분포."""
     from job_parse import norm as _norm
 
-    rows = [r for r in res if r["method"] == "사전단가" and r["actual_unit_price"]]
+    rows = [r for r in res if r["method"] == "사전단가" and r["actual_unit_price"]
+            and "/" not in r["raw_main_msg"]]  # 품목별(20/30)은 배율 점검에서 뺀다
     if not rows:
         return ["사전단가 해당 행 없음"]
     ratios = Counter()
@@ -466,11 +485,11 @@ def run_scores(year: int, ai: bool = False, limit: int = 200, seed: int = 0, top
     from cases import load_job_lines
     from config.settings import settings
 
-    if ai:
-        raise SystemExit("--ai (Claude 견적)은 B단계 — 아직 구현 안 됨")
     db = (ROOT / settings.DB_PATH) if not Path(settings.DB_PATH).is_absolute() else Path(settings.DB_PATH)
     con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)  # DB 읽기 전용
     index = LineIndex.build(load_job_lines(con))
+    if ai:
+        return run_ai_scores(load_answer_rows(year), index, limit=limit, seed=seed, top=top)
     res = score_rows(load_answer_rows(year), index)
     path = OUT_DIR / "results_noai.csv"
     pd.DataFrame(res).to_csv(path, index=False, encoding="utf-8-sig")
@@ -480,3 +499,70 @@ def run_scores(year: int, ai: bool = False, limit: int = 200, seed: int = 0, top
     print("\n== 사전단가(D열) 가정 점검")
     for line in preset_diagnosis(res):
         print(("  " if not line.startswith("  ") else "") + line)
+
+
+# ---------------------------------------------------------------- B단계 채점 (backtest run --ai)
+def ai_pending(rows: list[dict], index: LineIndex):
+    """사다리 결과 → (적용된 결과 행들, 미결 [(정답지 행, JobInput, 미결 Quote, 정답 줄 id, 정답 DbLine)])."""
+    from pricer_job import M_PENDING, JobInput, quote_ladder
+
+    by_id = {ln.id: ln for ln in index.lines}
+    applied, pending = [], []
+    for r in rows:
+        if r.get("match") in ("", "none") or not r.get("date"):
+            continue
+        inp = JobInput.from_backtest(r)
+        lid = _f(r.get("line_id"))
+        lid = int(lid) if lid is not None else None
+        q = quote_ladder(inp, index, inp.on_date, exclude_ids={lid} if lid is not None else ())
+        if q.method == M_PENDING:
+            pending.append((r, inp, q, lid, by_id.get(lid)))
+        else:
+            applied.append(score_entry(r, inp, q, by_id.get(lid)))
+    return applied, pending
+
+
+def run_ai_scores(rows: list[dict], index: LineIndex, *, limit: int = 200, seed: int = 0, top: int = 20,
+                  ai=None, workers: int = 4, out_path: Path | None = None) -> list[dict]:
+    """미결 행에서 seed로 limit개를 뽑아 Claude 견적 → results_ai.csv + 리포트. ai: AiPricer (테스트 주입)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import pandas as pd
+
+    from pricer_ai import AiError, AiPricer, sample_pending
+    from pricer_job import Quote
+
+    applied, pending = ai_pending(rows, index)
+    picked = sample_pending(pending, limit, seed)
+    ai = ai or AiPricer(source="backtest", daily_limit=None)
+
+    def one(item):
+        r, inp, q0, lid, line = item
+        try:
+            q = ai.quote(inp, index, inp.on_date, exclude_ids={lid} if lid is not None else (), hint=q0.hint,
+                         tag=f"{r['tab']} {r['row']}행")
+        except AiError as e:
+            q = Quote("AI실패", basis=str(e))
+        q.hint = q0.hint
+        return score_entry(r, inp, q, line)
+
+    res = []
+    if picked:
+        res.append(one(picked[0]))  # 첫 호출 단독 → 시스템 프롬프트 캐시를 만든 뒤 병렬
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            res += list(ex.map(one, picked[1:]))
+    path = out_path or OUT_DIR / "results_ai.csv"
+    pd.DataFrame(res).to_csv(path, index=False, encoding="utf-8-sig")
+
+    total = len(applied) + len(pending)
+    cost = sum(r["cost_usd"] or 0 for r in res)
+    print(f"== 백테스트 채점 B단계 (Claude {len(res)}건, seed={seed}) → {path.name}")
+    print(f"  사다리: 대상 {total}행 중 사전단가·동일품 {len(applied)} / 미결 {len(pending)} → 표본 {len(picked)}")
+    print(f"  비용: 총 ${cost:.3f}  (건당 ${cost / max(len(res), 1):.4f})")
+    print("\n== AI 표본")
+    for line in report_scores(res, top):
+        print(("  " if not line.startswith("  ") else "") + line)
+    fails = Counter(r["basis"] for r in res if r["method"] == "AI실패")
+    if fails:
+        print("  AI실패 사유: " + "  ".join(f"{k} {v}" for k, v in fails.most_common()))
+    return res

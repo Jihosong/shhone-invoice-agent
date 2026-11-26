@@ -13,6 +13,7 @@
     python agent.py clients add "<정식명>" <사업자번호>  # 경리나라 import에 없는 거래처 수동 등록
     python agent.py backtest build [--year 2026]  # 임가공 월 탭 전부(읽기만) + DB 실제 단가 → data/backtest/ 정답지
     python agent.py backtest run --no-ai  # 정답지 match≠none 행에 사다리(사전단가·동일품) 채점 → results_noai.csv
+    python agent.py backtest run --ai --limit 200 --seed 0  # 미결 행 표본 Claude 견적 채점 → results_ai.csv
     python agent.py backtest inflation  # DB 같은 거래처·같은 품목 연도별 단가 변화율 → data/backtest/inflation.csv
     python agent.py calibrate   # 화면 좌표/비전 보정
 """

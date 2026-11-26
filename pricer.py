@@ -2,7 +2,8 @@
 
 v1: 호닝파이프(kind: pipe) — data/price_table.xlsx '삼화호닝' 시트 단가표로 결정적 계산.
     단가 = round10(1M당단가 × 가격인상상수 × 길이/1000), 소관이면 × 0.9
-임가공(kind: job) — DB 과거 사례 + config/pricing_rules.md 규칙 + Claude 판단 (TODO)
+임가공(kind: job) — pricer_job 사다리(사전단가·동일품) → 미결은 pricer_ai(Claude, 일일 상한).
+    high/mid → 견적완료, low → 단가 + '[가견적-확인필요]' + 견적확인필要(발행 차단). 발행기 미연결.
 
 watcher가 한 바퀴 돈 뒤 그 결과(snapshot)를 받아 처리한다.
 대상: 상태 '확정' + 작성자 빈칸 + 기존건 아님. 시트 쓰기는 시트당 batch_update 한 번.
@@ -27,6 +28,7 @@ ST_CONFIRMED = "확정"
 ST_QUOTED = "견적완료"
 ST_CHECK = "견적확인필요"
 ST_LEGACY = "기존건-확인필요"
+LOW_TAG = "[가견적-확인필요]"   # 임가공 confidence=low: 단가는 적되 발행 차단
 
 H_P = "H.P"
 SOGWAN = "소관"
@@ -170,10 +172,14 @@ class Pricer:
 
     def run_once(self, snapshots: dict[str, dict]) -> None:
         for key, scfg in self.cfg["sheets"].items():
-            if scfg.get("kind") != "pipe" or key not in snapshots:
+            kind = scfg.get("kind")
+            if kind not in ("pipe", "job") or key not in snapshots:
                 continue
             try:
-                self.process_pipe(key, scfg, snapshots[key])
+                if kind == "pipe":
+                    self.process_pipe(key, scfg, snapshots[key])
+                else:
+                    self.process_job(key, scfg, snapshots[key])
             except Exception:
                 logger.exception("pricer sheet={} 처리 실패", key)
         if not self.dry_run:
@@ -225,6 +231,105 @@ class Pricer:
             counts[new_status] += 1
             r["status"] = new_status
             logger.info("pricer sheet={} row={} client={} {} : {}", label, rownum, cell(row, "client"), new_status, msg)
+            if not self.dry_run:
+                self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
+
+        written = writer.flush(snap["ws"], self.dry_run)
+        logger.info("pricer sheet={} 견적완료={} 견적확인필요={} 동명확인가견적={}{}", label, counts[ST_QUOTED],
+                    counts[ST_CHECK], counts[ST_HCHECK],
+                    f" (dry-run, 미기록 쓰기 {len(writer)}건)" if self.dry_run else f" 쓰기={written}")
+
+    # ------------------------------------------------------------ 임가공 (kind: job)
+    def job_index(self):
+        """DB lines(kind=job) 색인. 줄 수·마지막 id가 바뀌면(import 후) 다시 만든다."""
+        from cases import LineIndex, load_job_lines
+
+        key = self.con.execute("SELECT COUNT(*), MAX(id) FROM lines WHERE kind='job'").fetchone()
+        if getattr(self, "_job_index", None) is None or self._job_index[0] != key:
+            self._job_index = (key, LineIndex.build(load_job_lines(self.con)))
+        return self._job_index[1]
+
+    def ai(self):
+        """AiPricer (처음 필요할 때 생성). 만들 수 없으면 None → 미결 행은 견적확인필요."""
+        if getattr(self, "_ai", None) is None:
+            try:
+                from pricer_ai import AiPricer
+
+                self._ai = AiPricer(source="ops")
+            except Exception as e:  # 키 없음·규칙 파일 없음 등
+                logger.warning("AI 견적기 준비 실패 → 미결 행은 견적확인필요: {}", e)
+                self._ai = False
+        return self._ai or None
+
+    def quote_job_row(self, inp, index, cutoff) -> tuple[str, str, str]:
+        """JobInput → (단가 칸, 산출근거, 상태). 사다리 → 미결이면 Claude → confidence로 상태."""
+        from pricer_ai import AiError
+        from pricer_job import M_PENDING, quote_ladder
+
+        q = quote_ladder(inp, index, cutoff)
+        if q.method == M_PENDING:
+            if self.dry_run:  # 시트에 안 쓰면 다음 바퀴에 또 미결 → 매 바퀴 API 비용. dry-run은 호출 안 함
+                return "", f"미결 | {q.basis} | dry-run AI 생략", ST_CHECK
+            ai = self.ai()
+            if ai is None:
+                return "", f"미결 | {q.basis} | AI 없음", ST_CHECK
+            try:
+                q = ai.quote(inp, index, cutoff, hint=q.hint, tag=inp.client)
+            except AiError as e:
+                return "", f"미결 | {q.basis} | {e}", ST_CHECK
+        price = "/".join(str(p) for _, p in q.item_prices) if q.item_prices else q.unit_price
+        if q.confidence == "low":
+            return price, f"{LOW_TAG} {q.label()}", ST_CHECK
+        return price, q.label(), ST_QUOTED
+
+    def process_job(self, key: str, scfg: dict, snap: dict) -> None:
+        """임가공: 사다리(사전단가·동일품) → 미결은 Claude. high/mid → 견적완료,
+        low → 단가 적고 '[가견적-확인필요]' + 견적확인필요(발행 차단). 임가공은 아직 발행기 미연결."""
+        from datetime import date, timedelta
+
+        from pricer_job import JobInput
+
+        cols = dict(scfg["columns"])
+        cols.setdefault("pre_size", cols.get("stock_removal"))  # 시트 H 연마량/치대 = 정답지 pre_size
+        label = snap.get("label", key)
+        writer = SheetWriter(scfg["columns"], scfg["data_start_row"], scfg["hash_columns"], label)
+        counts = Counter()
+        index = None
+        cutoff = date.today() + timedelta(days=1)  # 운영: 오늘까지의 DB 자료 전부
+
+        def cell(row, name):
+            i = cols.get(name)
+            return row[i - 1].strip() if i and i - 1 < len(row) else ""
+
+        for r in snap["rows"]:
+            hcheck = r["status"] == ST_HCHECK and r.get("needs_quote")
+            if (r["status"] != ST_CONFIRMED and not hcheck) or r["author"] or r.get("legacy"):
+                continue
+            row, rownum = r["row"], r["rownum"]
+
+            def set_cell(rownum, name, value, row=row, r=r):
+                writer.add(rownum, name, value, row, row_id=r["row_id"], expect_fp=r.get("fp"))
+
+            tag = r.get("block_tag") or ""
+            if cell(row, "unit_price") and not strip_block_tag(cell(row, "basis")):
+                new_status, msg = ST_QUOTED, "사람 입력 가격 유지"
+            else:
+                index = index or self.job_index()
+                inp = JobInput.from_sheet_row(row, cols, r.get("client_resolved") or "",
+                                              r.get("client_reg_no") or "", date.today())
+                price, basis, new_status = self.quote_job_row(inp, index, cutoff)
+                set_cell(rownum, "unit_price", price)
+                set_cell(rownum, "basis", with_block_tag(tag, basis) if tag else basis)
+                msg = f"{price} ({basis})"
+            if hcheck:
+                new_status = ST_HCHECK
+                msg += " (동명확인 — 발행 안 함)"
+            else:
+                set_cell(rownum, "status", new_status)
+            counts[new_status] += 1
+            r["status"] = new_status
+            logger.info("pricer sheet={} row={} client={} {} : {}", label, rownum, cell(row, "client"),
+                        new_status, msg)
             if not self.dry_run:
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
 

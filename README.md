@@ -106,3 +106,19 @@ DB lines(kind='job')와 같은 사업자번호(또는 거래처명)·날짜 ±15
 
 견적 엔진용 유사건 검색은 `cases.find_similar_cases(index, query, cutoff_date)` — cutoff_date **이전**(당일 제외) 자료만 본다
 (백테스트 정답 누출 방지, cutoff 없으면 오류).
+
+## 임가공 견적 (pricer_job → pricer_ai)
+
+```bash
+python agent.py backtest run --no-ai                     # 사다리(사전단가·동일품)만 → results_noai.csv
+python agent.py backtest run --ai --limit 200 --seed 0   # 미결 행 표본을 Claude로 → results_ai.csv (API 비용 발생)
+```
+
+- **A 사다리** (`pricer_job.py`): 사전단가(D열 숫자, 5천~500만 원만; `20/30`은 E 품목 수와 같을 때 품목별;
+  같은 거래처 과거 단가 중앙값과 3배 이상 차이 → low, 과거 없음 → mid) → 동일품(최근 건 단가 그대로, 24개월↑ mid,
+  수량 3배↑/⅓↓이면 미결 + 직전 건 hint) → 미결.
+- **B Claude** (`pricer_ai.py`): `claude-sonnet-5-5`, 시스템 = `config/pricing_rules.md` 전문(prompt caching),
+  참고 사례(같은 거래처 8 · 타 거래처 5 · 인상 성향), 부록 B.5 JSON(structured outputs), max_tokens 300.
+  호출마다 `logs/ai_calls.jsonl`에 토큰·비용. 운영 호출은 하루 300건까지.
+- **운영** (`pricer.py` kind=job): high/mid → 견적완료, low → 단가 + `[가견적-확인필요]` + 견적확인필요,
+  미결·AI 실패 → 단가 비우고 견적확인필요. `--dry-run`은 AI를 부르지 않는다. 임가공은 아직 발행기 미연결.
