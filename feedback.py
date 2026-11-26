@@ -3,6 +3,8 @@
 
 입력 1: 매출거래명세표 목록 (.xls)   → clients, statements
 입력 2: 품목별판매현황 (.xls)        → lines
+입력 3: 거래처 목록 (.xls/.xlsx)     → clients.ceo_name (대표자명, 동명 구분용) — import_client_list
+        python agent.py import clients <파일>  (사업자번호 기준 갱신, 없으면 추가 source='list')
 출력  : agent.db (SQLite), data/거래내역_마스터.xlsx (거래내역/거래처마스터/동명거래처)
 
 사용: python feedback.py <거래명세표목록.xls> <품목별판매현황.xls> <agent.db>
@@ -170,7 +172,10 @@ CREATE INDEX IF NOT EXISTS ix_stm_key ON statements(date, reg_no);
 """
 
 LINES_EXTRA = {"reg_no": "TEXT", "spec_norm": "TEXT", "category": "TEXT"}
-CLIENTS_EXTRA = {"source": "TEXT"}  # 'manual' = agent.py clients add (경리나라 import에 아직 없는 거래처)
+# source: 'import' = 명세표 목록, 'manual' = agent.py clients add, 'list' = 거래처 목록에만 있음(명세표 없음)
+# ceo_name: 대표자명 (거래처 목록 import) — 시트 '거래처(대표명)'으로 동명 구분
+CLIENTS_EXTRA = {"source": "TEXT", "ceo_name": "TEXT"}
+KEEP_SOURCES = ("manual", "list")  # 명세표 import가 지우지 않는 등록 (같은 번호가 import에 오면 import로 덮어씀)
 
 
 def ensure_columns(con):
@@ -186,16 +191,95 @@ def ensure_columns(con):
 
 
 def replace_clients(con, imported):
-    """import 거래처로 clients 교체. 수동 등록(source='manual')은 남기되, 같은 사업자번호가 import에
-    들어오면 import 정보로 덮어씀. imported = [(이름, 번호, 명세표수, 첫거래, 최근거래)] → (덮어쓴 수, 남은 수동 수)"""
-    con.execute("DELETE FROM clients WHERE COALESCE(source, '') != 'manual'")
+    """import 거래처로 clients 교체. 수동 등록(source='manual')·거래처 목록 전용(source='list')은 남기되,
+    같은 사업자번호가 import에 들어오면 import 정보로 덮어씀. 대표자명(ceo_name)은 사업자번호 기준으로 유지.
+    imported = [(이름, 번호, 명세표수, 첫거래, 최근거래)] → (덮어쓴 수동 수, 남은 수동 수)"""
+    ensure_columns(con)
+    ceo = {reg: c for reg, c in con.execute("SELECT reg_no, ceo_name FROM clients WHERE ceo_name IS NOT NULL")}
+    keep = ",".join("?" * len(KEEP_SOURCES))
+    con.execute(f"DELETE FROM clients WHERE COALESCE(source, '') NOT IN ({keep})", KEEP_SOURCES)
     regs = {r[1] for r in imported}
     replaced = [reg for (reg,) in con.execute("SELECT reg_no FROM clients WHERE source='manual'") if reg in regs]
-    con.executemany("DELETE FROM clients WHERE source='manual' AND reg_no=?", [(r,) for r in replaced])
-    con.executemany("INSERT INTO clients(name, reg_no, n_statements, first_date, last_date, source)"
-                    " VALUES(?,?,?,?,?,'import')", imported)
+    con.executemany(f"DELETE FROM clients WHERE source IN ({keep}) AND reg_no=?",
+                    [(*KEEP_SOURCES, r) for r in regs])
+    con.executemany("INSERT INTO clients(name, reg_no, n_statements, first_date, last_date, source, ceo_name)"
+                    " VALUES(?,?,?,?,?,'import',?)", [(*r[:5], ceo.get(r[1])) for r in imported])
     kept = con.execute("SELECT COUNT(*) FROM clients WHERE source='manual'").fetchone()[0]
     return len(replaced), kept
+
+
+# 거래처 목록 엑셀 열 이름 (공백·괄호 무시 비교) — 경리나라 내려받기 표기가 바뀌어도 맞도록 후보 여럿
+CLIENT_LIST_COLUMNS = {
+    "name": ("거래처명", "상호", "상호명", "거래처", "회사명", "업체명"),
+    "reg_no": ("사업자번호", "사업자등록번호", "등록번호", "사업자등록번호주민번호", "사업자주민번호"),
+    "ceo": ("대표자명", "대표자", "대표명", "대표자성명", "성명대표자", "대표"),
+}
+
+
+def _header_key(v):
+    return re.sub(r"[\s()（）/·.]", "", unicodedata.normalize("NFKC", str(v))) if v is not None else ""
+
+
+def format_reg_no(v):
+    """'1234567890' / '123-45-67890' / 1234567890.0 → '123-45-67890' (10자리가 아니면 정리만)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    s = str(v).strip()
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    d = re.sub(r"\D", "", s)
+    return f"{d[:3]}-{d[3:5]}-{d[5:]}" if len(d) == 10 else s
+
+
+def load_client_list(path):
+    """거래처 목록 → [(거래처명, 사업자번호, 대표자명)]. 머리글 행은 위 10줄 안에서 세 열이 모두 있는 행.
+    거래처명·사업자번호·대표자명 열이 없으면 ValueError (찾은 머리글을 알려줌)."""
+    raw = pd.read_excel(path, header=None, dtype=str)
+    want = {k: {_header_key(c) for c in cands} for k, cands in CLIENT_LIST_COLUMNS.items()}
+    for hi in range(min(10, len(raw))):
+        heads = [_header_key(v) for v in raw.iloc[hi]]
+        # 정확히 같은 머리글 우선, 없으면 4글자 이상 후보를 포함하는 머리글 ('상호(거래처명)' 등)
+        where = {k: next((i for i, h in enumerate(heads) if h in keys), None)
+                 if any(h in keys for h in heads) else
+                 next((i for i, h in enumerate(heads) if any(len(c) >= 4 and c in h for c in keys)), None)
+                 for k, keys in want.items()}
+        if all(v is not None for v in where.values()):
+            break
+    else:
+        first = [str(v) for v in raw.iloc[0].tolist()] if len(raw) else []
+        raise ValueError("거래처 목록에서 거래처명·사업자번호·대표자명 열을 못 찾음 (첫 줄: %s)" % first)
+    out = []
+    for row in raw.iloc[hi + 1:].itertuples(index=False):
+        name, reg, ceo = (row[where[k]] for k in ("name", "reg_no", "ceo"))
+        name, reg, ceo = norm_text(name), format_reg_no(reg), norm_text(ceo)
+        if name and reg:
+            out.append((name, reg, ceo))
+    return out
+
+
+def import_client_list(con, entries):
+    """거래처 목록 → clients. 사업자번호 기준: 있으면 대표자명 갱신(이름은 명세표 표기 유지), 없으면 추가
+    (source='list', 명세표 0건). 반환 (갱신 행 수, 추가 수, 대표자명 빈 수)."""
+    ensure_columns(con)
+    updated = added = no_ceo = 0
+    for name, reg, ceo in entries:
+        no_ceo += not ceo
+        cur = con.execute("UPDATE clients SET ceo_name=? WHERE reg_no=?", (ceo, reg))
+        if cur.rowcount:
+            updated += cur.rowcount
+        else:
+            con.execute("INSERT INTO clients(name, reg_no, n_statements, first_date, last_date, source, ceo_name)"
+                        " VALUES(?,?,0,NULL,NULL,'list',?)", (name, reg, ceo))
+            added += 1
+    con.commit()
+    return updated, added, no_ceo
+
+
+def main_clients(path, db_path):
+    con = sqlite3.connect(db_path)
+    entries = load_client_list(path)
+    updated, added, no_ceo = import_client_list(con, entries)
+    print("거래처 목록 %d건: 대표자명 갱신=%d 추가(source=list)=%d 대표자명 빈칸=%d" % (len(entries), updated, added, no_ceo))
 
 
 def add_manual_client(con, name, reg_no):

@@ -16,7 +16,8 @@ from issuer.excel_upload import Line, LineError, Statement, block_date, pipe_lin
 from issuer.outbox import Issuer, format_outbox
 from pricer import PriceEntry, Pricer
 from tests.test_watcher_settle import age_all, make
-from watcher import ST_CONFIRMED, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_QUOTED, ST_TYPING
+from watcher import (ST_CONFIRMED, ST_HUMAN_CHECK, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_QUOTED,
+                     ST_TYPING)
 
 FIX = Path(__file__).resolve().parent / "fixtures" / "gyeongri"
 CLIENT, REG = "테스트거래처(삼화)", "247-81-03793"
@@ -431,10 +432,11 @@ def test_mixed_authors_human_wins_and_warns_once(tmp_path):
     with Logs() as logs:
         rig.cycle()
         rig.cycle()
-    assert rig.col("status") == ["", ""]  # AI발행으로 마감하지 않음
+    assert rig.col("status") == [ST_HUMAN_CHECK] * 2  # 파일에 담긴 뒤라 사람처리-발행확인, AI발행 마감 안 함
     assert rig.col("author") == ["고문", "AI"]
     assert rig.db("SELECT issued_at FROM issue_file_blocks") == [(None,)]
     assert logs.count("작성자가 섞임", "WARNING") == 1
+    assert logs.count("중복 발행 확인", "WARNING") == 1
 
 
 def test_issue_candidate_log_only_when_block_qualifies(tmp_path):
@@ -463,3 +465,38 @@ def test_client_judgement_logged_only_on_change():
         poll(w)
         poll(w)
     assert logs.count("거래처 미등록", "INFO") == 1
+
+
+# ---------------------------------------------------------------- 파일에 담긴 뒤 사람 작성자 → 사람처리-발행확인
+def test_filed_block_gets_human_author_flags_and_ack(tmp_path):
+    rig, path = ready(TWO_ROWS, tmp_path)
+    assert rig.col("status") == [ST_PENDING] * 2
+    rig.set(3, "basis", rig.col("basis")[1] + " 사람 메모")
+    rig.set(2, "author", "고문")  # 경리나라에 이미 올렸을 수도 있는데 사람이 직접 처리하려 함
+    with Logs() as logs:
+        rig.cycle(bundle=True, out=tmp_path)
+        rig.cycle(bundle=True, out=tmp_path)
+    assert rig.col("status") == [ST_HUMAN_CHECK] * 2
+    caution = f"[주의: 파일 {path.name}에 담긴 뒤 작성자 변경 → 경리나라 중복 발행 확인]"
+    assert rig.col("basis")[0].startswith(f"[{CLIENT} 11/26 1/2] [→ {path.name}] {caution}")
+    assert rig.col("basis")[1].startswith(f"[{CLIENT} 11/26 2/2] [→ {path.name}] {caution} 단가표 ")
+    assert rig.col("basis")[1].endswith(" 사람 메모")
+    assert logs.count("중복 발행 확인", "WARNING") == 1  # 다음 바퀴엔 반복 안 함
+    assert rig.db("SELECT issued_at FROM issue_file_blocks") == [(None,)]  # AI발행 아님
+    # 사람이 확인하고 한 행의 상태 칸을 비움 → 묶음 전체 보통 사람처리, 주의 표시는 떼고 사람 메모는 남김
+    rig.set(3, "status", "")
+    rig.cycle()
+    assert rig.col("status") == ["", ""]
+    basis = rig.col("basis")
+    assert not any("[주의:" in b or "[→" in b for b in basis)
+    assert basis[0].startswith("단가표 40x50") and basis[1].endswith("29,700/m × 500mm 사람 메모")
+    age_all(rig.w)
+    rig.cycle()
+    assert rig.col("status") == ["", ""]  # 다시 표시하지 않음
+
+
+def test_unfiled_block_human_author_is_plain_human(tmp_path):
+    rig = Rig(TWO_ROWS).quoted()
+    rig.set(3, "author", "고문")
+    rig.cycle()
+    assert rig.col("status") == ["", ""]

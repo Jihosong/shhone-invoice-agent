@@ -86,7 +86,15 @@ def cmd_import(args: argparse.Namespace) -> None:
     from config.settings import settings
 
     Path(settings.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    feedback.main(args.statements, args.lines, settings.DB_PATH)
+    files = args.files
+    if files[0] == "clients":  # python agent.py import clients <거래처목록.xls>
+        if len(files) != 2:
+            raise SystemExit("사용: python agent.py import clients <거래처목록.xls>")
+        feedback.main_clients(files[1], settings.DB_PATH)
+        return
+    if len(files) != 2:
+        raise SystemExit("사용: python agent.py import <매출거래명세표목록.xls> <품목별판매현황.xls>")
+    feedback.main(files[0], files[1], settings.DB_PATH)
 
 
 def format_blocks(snap_rows: list[dict]) -> list[str]:
@@ -183,9 +191,9 @@ def main() -> None:
     p_run.add_argument("--once", action="store_true", help="한 바퀴만 돌고 종료")
     p_run.add_argument("--dry-run", action="store_true", help="시트/DB에 쓰지 않고 요약만 출력")
     p_run.set_defaults(func=cmd_run)
-    p_imp = sub.add_parser("import", help="경리나라 내려받기 DB 적재")
-    p_imp.add_argument("statements", help="매출거래명세표 목록 (.xls)")
-    p_imp.add_argument("lines", help="품목별판매현황 (.xls)")
+    p_imp = sub.add_parser("import", help="경리나라 내려받기 DB 적재 (명세표목록 품목별판매현황 | clients 거래처목록)")
+    p_imp.add_argument("files", nargs="+", metavar="FILE",
+                       help="<매출거래명세표목록.xls> <품목별판매현황.xls>  또는  clients <거래처목록.xls>")
     p_imp.set_defaults(func=cmd_import)
     sub.add_parser("blocks", help="현재 월 탭 묶음 목록 출력 (dry-run)").set_defaults(func=cmd_blocks)
     p_iss = sub.add_parser("issue", help="발행대기 묶음 → data/outbox/YYYYMMDD_HHMM.xls (경리나라 엑셀일괄등록)")
