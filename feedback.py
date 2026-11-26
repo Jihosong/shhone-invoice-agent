@@ -142,8 +142,9 @@ def load_statements(path):
     df["spec"] = sp[1].map(norm_text) if sp.shape[1] > 1 else None
     return df
 
-# 명세표 목록에서 공통메모 열 이름 후보 (발행기가 issue.memo_text를 넣는 칸)
-COMMON_MEMO_COLUMNS = ("공통메모",)
+# 명세표 목록에서 공통메모 열 이름 후보, 앞쪽 우선 (발행기가 issue.memo_text를 넣는 칸).
+# 경리나라 목록은 공통메모를 '메모'로 내보낼 수 있음 — '(AI)'로 끝나는 값만 표시하니 오인 위험 없음
+COMMON_MEMO_COLUMNS = ("공통메모", "메모")
 AI_MEMO_SUFFIX = "(AI)"
 
 
@@ -358,12 +359,13 @@ def main(stm_path, line_path, db_path, master_path=None):
     if memo_col is None:
         print("명세표 목록에 공통메모 열 없음 → AI 발행 표시(issued_by) 건너뜀 (열: %s)" % ", ".join(st.columns))
     issued = [issued_by_of(v) for v in st[memo_col]] if memo_col else [None] * len(st)
+    memos = [norm_text(v) for v in st["메모"]] if "메모" in st.columns else [None] * len(st)
     con.executemany("INSERT INTO statements(date,client,reg_no,item,spec,extra_lines,supply,tax,total,color,memo,issued_by)"
                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         [(r.거래일, norm_text(r.거래처명), str(r.등록번호), r.item, r.spec, int(r.extra),
           int(r.공급가액) if pd.notna(r.공급가액) else None, int(r.세액) if pd.notna(r.세액) else None,
           int(r.합계금액) if pd.notna(r.합계금액) else None, r.컬러 if pd.notna(r.컬러) else None,
-          norm_text(r.메모), by) for r, by in zip(st.itertuples(), issued)])
+          memo, by) for r, memo, by in zip(st.itertuples(), memos, issued)])
     if memo_col:
         print("AI 발행 명세표(공통메모 '%s'로 끝남)=%d / %d" % (AI_MEMO_SUFFIX, sum(b == "AI" for b in issued), len(st)))
     regs = reg_no_map(con.execute("SELECT name, reg_no FROM clients").fetchall())

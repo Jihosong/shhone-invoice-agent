@@ -9,14 +9,20 @@ import feedback
 MEMO = "(주)삼화호닝 기업 451-079229-04-018, 감사합니다. (AI)"
 
 
-def write_stm(path, memos=None):
+def write_stm(path, memos=None, memo_col="공통메모", plain_memo=True):
     rows = [["2026-11-20", "호닝파이프 / 80x90 L760", "대진엔지니어링", "111-11-11111", 51700, 5170, 56870, None, None],
             ["2026-11-21", "호닝파이프 / 40x50 L500 외 2건", "대진엔지니어링", "111-11-11111", 100000, 10000, 110000, None, None],
             ["2026-11-22", "임가공 / Ø50", "새로운상사", "888-88-88888", 30000, 3000, 33000, None, "메모"]]
     cols = ["거래일", "품목/규격", "거래처명", "등록번호", "공급가액", "세액", "합계금액", "컬러", "메모"]
+    if not plain_memo:  # '메모' 열도 없는 목록
+        cols.pop()
+        rows = [r[:-1] for r in rows]
     if memos is not None:
-        cols.append("공통메모")
-        rows = [r + [m] for r, m in zip(rows, memos)]
+        if memo_col in cols:
+            rows = [r[:-1] + [m] for r, m in zip(rows, memos)]
+        else:
+            cols.append(memo_col)
+            rows = [r + [m] for r, m in zip(rows, memos)]
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
         pd.DataFrame([["매출거래명세표 목록"]]).to_excel(xw, index=False, header=False, startrow=0)
         pd.DataFrame(rows, columns=cols).to_excel(xw, index=False, startrow=1)
@@ -31,12 +37,12 @@ def write_lines(path):
     return path
 
 
-def run(tmp_path, memos):
+def run(tmp_path, memos, cols=("date", "issued_by"), **kw):
     db = tmp_path / "agent.db"
-    feedback.main(write_stm(tmp_path / "stm.xlsx", memos), write_lines(tmp_path / "lines.xlsx"), db,
+    feedback.main(write_stm(tmp_path / "stm.xlsx", memos, **kw), write_lines(tmp_path / "lines.xlsx"), db,
                   tmp_path / "master.xlsx")
     con = sqlite3.connect(db)
-    return [r for r in con.execute("SELECT date, issued_by FROM statements ORDER BY date")]
+    return [r for r in con.execute(f"SELECT {', '.join(cols)} FROM statements ORDER BY date")]
 
 
 def test_ai_memo_marks_issued_by(tmp_path, capsys):
@@ -45,9 +51,22 @@ def test_ai_memo_marks_issued_by(tmp_path, capsys):
     assert "AI 발행 명세표" in capsys.readouterr().out
 
 
-def test_no_common_memo_column_skips_with_log(tmp_path, capsys):
-    got = run(tmp_path, None)
-    assert [b for _, b in got] == [None, None, None]
+def test_plain_memo_column_used_when_no_common_memo(tmp_path, capsys):
+    """'공통메모' 열이 없고 '메모' 열에 발행기 문구가 있으면 그것으로 표시 ('(AI)'로 끝나는 값만)."""
+    got = run(tmp_path, [MEMO, "AI 문의 메모", "메모"], cols=("date", "memo", "issued_by"), memo_col="메모")
+    assert got == [("2026-11-20", MEMO, "AI"), ("2026-11-21", "AI 문의 메모", None), ("2026-11-22", "메모", None)]
+    assert "AI 발행 명세표" in capsys.readouterr().out
+
+
+def test_common_memo_column_preferred_over_plain_memo(tmp_path):
+    """둘 다 있으면 '공통메모' 열 기준 — '메모' 열 값은 statements.memo에만."""
+    got = run(tmp_path, [None, MEMO, None], cols=("memo", "issued_by"))
+    assert got == [(None, None), (None, "AI"), ("메모", None)]
+
+
+def test_no_memo_columns_skips_with_log(tmp_path, capsys):
+    got = run(tmp_path, None, cols=("memo", "issued_by"), plain_memo=False)
+    assert got == [(None, None)] * 3
     assert "공통메모 열 없음" in capsys.readouterr().out
 
 
