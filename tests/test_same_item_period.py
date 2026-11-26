@@ -39,7 +39,7 @@ def raise_history(rates=(0.10, 0.10, 0.10)):
 # ---------------------------------------------------------------- 기간 정책
 @pytest.mark.parametrize("d,months,method,price,conf,basis", [
     ("2026-01-01", 5, M_SAME, 40000, "high", "2026-01-01 40,000원 Ø50 1개"),
-    ("2025-09-01", 9, M_SAME, 40000, "high", "직전 2025-09, 동결 유지 / 2025-09-01 40,000원"),
+    ("2025-09-01", 9, M_SAME, 40000, "mid", "직전 2025-09, 동결 유지 — 확인 / 2025-09-01 40,000원"),
     ("2025-04-01", 14, M_SAME, 42000, "mid", "직전 40,000 (2025-04) → +5% 인상 제안 / 2025-04-01 40,000원"),
     ("2023-12-01", 30, M_PENDING, None, None, "동일품 미확정 (직전 동일품 단가 40,000원 (2023-12-01, 1개)"),
 ])
@@ -49,6 +49,33 @@ def test_period_policy(d, months, method, price, conf, basis):
     assert got.basis.startswith(basis)
     if method == M_PENDING:
         assert got.max_conf == "mid" and "30개월 전 — 24개월 초과, 최소 +5% 이상 제안할 것" in got.hint
+
+
+def test_freeze_confidence_switch(tmp_path, monkeypatch):
+    import pricer_job
+
+    import os
+
+    cfg = tmp_path / "sheets.yaml"
+    for k, (value, want) in enumerate([("high", "high"), ("mid", "mid"), ("low", "mid")], 1):  # 그 외 값 → mid
+        cfg.write_text(f"pricing:\n  same_item_6_12m_confidence: {value}\n", encoding="utf-8")
+        os.utime(cfg, (k, k))   # 파일이 바뀌면(mtime) 다시 읽음
+        assert pricer_job.freeze_conf(cfg) == want
+    cfg.write_text("common: {}\n", encoding="utf-8")
+    os.utime(cfg, (99, 99))
+    assert pricer_job.freeze_conf(cfg) == "mid"                                # 설정 없음 → mid
+    assert pricer_job.freeze_conf(tmp_path / "없음.yaml") == "mid"
+    # high로 바꾸면 견적완료 대상(high), 근거에 '확인' 없음
+    monkeypatch.setattr(pricer_job, "FREEZE_CONF", "high")
+    got = q(job("Ø50+0.0~+0.05 / 1개"), [ln(1, "2025-09-01", 40000)])
+    assert (got.confidence, got.unit_price) == ("high", 40000)
+    assert got.basis.startswith("직전 2025-09, 동결 유지 / ")
+
+
+def test_repo_config_default_is_mid():
+    import pricer_job
+
+    assert pricer_job.freeze_conf() == "mid"
 
 
 def test_raise_rounds_down_to_100():

@@ -13,7 +13,9 @@
   b. 동일품 — 같은 거래처(사업자번호, 없으면 정규화 이름)의 DB lines(kind=job) 중
      구경 ±0.3mm, 공차 동일(둘 다 있을 때), 기장 ±5%(둘 다 있을 때), 치대 동일(둘 다 있을 때),
      품목 성질 키워드(ITEM_KEYWORDS 7개) 집합 동일 → 가장 최근 건 기준, 경과 기간별:
-       6개월 이내 직전 단가 그대로 high / 6~12개월 그대로 high '직전 YYYY-MM, 동결 유지' /
+       6개월 이내 직전 단가 그대로 high /
+       6~12개월 그대로, confidence는 config/sheets.yaml pricing.same_item_6_12m_confidence (기본 mid)
+         — mid면 '직전 YYYY-MM, 동결 유지 — 확인', high면 '직전 YYYY-MM, 동결 유지' /
        12~24개월 직전 × 1.05 (100원 버림) mid '직전 40,000 (2025-09) → +5% 인상 제안'
          — 거래처가 인상형(최근 3쌍 평균 인상률 > 5%, inflation.client_trend)이면 그 평균(상한 15%) /
        24개월 초과 → 미결 (Quote.hint에 직전 단가·날짜 + '최소 +5% 이상 제안할 것', max_conf=mid).
@@ -41,7 +43,9 @@ M_PENDING = "미결"
 SAME_DIA_TOL = 0.3       # mm
 SAME_LEN_TOL = 0.05      # 비율
 FRESH_DAYS = 183         # 6개월 이내 → 그대로 high
-FREEZE_DAYS = 365        # 6~12개월 → 그대로 high (동결 유지)
+FREEZE_DAYS = 365        # 6~12개월 → 그대로 (동결 유지), confidence는 freeze_conf()
+FREEZE_CONF_DEFAULT = "mid"
+FREEZE_CONF: str | None = None   # 지정하면 config보다 우선 (테스트용)
 STALE_DAYS = 730         # 12~24개월 → 인상 제안 mid, 24개월 초과 → AI(최대 mid, 최소 +5% 제안)
 CHIDAE_TOL = 1e-6
 QTY_RATIO = 3.0
@@ -255,7 +259,8 @@ def quote_same_item(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_
     if days <= FRESH_DAYS:
         parts = [detail]
     elif days <= FREEZE_DAYS:
-        parts = [f"직전 {ln.date:%Y-%m}, 동결 유지", detail]
+        conf = freeze_conf()
+        parts = [f"직전 {ln.date:%Y-%m}, 동결 유지" + (" — 확인" if conf == "mid" else ""), detail]
     else:
         rate, why = raise_rate(inp, index, cutoff_date, exclude_ids)
         price, conf = raised_price(price, rate), "mid"
@@ -268,6 +273,35 @@ def quote_same_item(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_
     if len(cands) > 1:
         parts.append(f"동일품 {len(cands)}건 중 최근")
     return Quote(M_SAME, price, conf, " / ".join(parts), ln.id)
+
+
+_freeze_cache: tuple[str, float, str] | None = None   # (경로, mtime, 값)
+
+
+def freeze_conf(path=None) -> str:
+    """6~12개월 동일품 confidence: FREEZE_CONF > config/sheets.yaml pricing.same_item_6_12m_confidence > mid.
+    파일이 바뀌면(mtime) 다시 읽는다. high/mid 외 값은 경고 후 mid."""
+    global _freeze_cache
+    if FREEZE_CONF:
+        return FREEZE_CONF
+    from pathlib import Path
+
+    path = Path(path or Path(__file__).parent / "config" / "sheets.yaml")
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return FREEZE_CONF_DEFAULT
+    if _freeze_cache is None or _freeze_cache[:2] != (str(path), mtime):
+        import yaml
+        from loguru import logger
+
+        with open(path, encoding="utf-8") as f:
+            v = ((yaml.safe_load(f) or {}).get("pricing") or {}).get("same_item_6_12m_confidence", FREEZE_CONF_DEFAULT)
+        if v not in ("high", "mid"):
+            logger.warning("sheets.yaml pricing.same_item_6_12m_confidence={!r} — high/mid만 가능 → mid", v)
+            v = FREEZE_CONF_DEFAULT
+        _freeze_cache = (str(path), mtime, v)
+    return _freeze_cache[2]
 
 
 def pct(rate: float) -> str:

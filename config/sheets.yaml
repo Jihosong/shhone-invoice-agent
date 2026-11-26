@@ -45,6 +45,10 @@ issue:
   # 묶음 추적은 DB issue_file_blocks로 한다.
   memo_text: "(주)삼화호닝 기업 451-079229-04-018, 감사합니다. (AI)"
 
+# 임가공 견적 정책 (pricer_job) — 운영·백테스트 공통. 고치면 다음 견적부터 반영 (재시작 불필요)
+pricing:
+  same_item_6_12m_confidence: mid   # 6~12개월 동일품(직전 단가 그대로): high → 견적완료 / mid → 가견적·견적확인필요
+
 # 묶음(block) 규칙 — 두 시트 공통 (watcher.py)
 #   날짜 칸이 있는 행 = 묶음 첫 행. 거래처는 이 행의 거래처 칸에서만 해석(별칭표 config/client_aliases.yaml
 #   > 마스터 정확일치 > 최장 일치, ㈜/(주)/주식회사/공백 무시), 일치 뒤 남은 글자는 client_note.
