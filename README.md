@@ -87,13 +87,22 @@ python agent.py outbox            # 파일별 포함 묶음·상태
 ## 임가공 백테스트 정답지
 
 ```bash
-python agent.py backtest build            # 2026년 월 탭 전부 (시트·DB 읽기만)
+python agent.py backtest build            # 2026년 월 탭 전부 + 남은 2025년 탭(12월) (시트·DB 읽기만)
 python agent.py backtest build --seed 3   # 콘솔 샘플만 다르게
+python agent.py backtest inflation        # DB 같은 거래처·같은 품목 연도별 단가 변화율
 ```
 
 임가공 시트의 그 해 월 탭 전부(1월~이번 달, 왼쪽 탭만이 아님)의 품목 행을 묶음 규칙대로 모아 거래처를 해석하고,
 D·E·F·호닝 전 치수(11월~: 연마량/치대)·호닝 전/후 노트·호닝 후 치수에서 구경·공차·기장·수량·재질·특이사항·Ra를
 뽑는다(못 뽑으면 빈칸, 원문은 `raw_*` 열). 탭마다 열 배치가 달라 2행 헤더 글자로 열을 찾는다.
-DB lines(kind='job')와 같은 사업자번호(또는 거래처명)·날짜 ±10일·구경 ±0.5mm(양쪽 기장 있으면 ±10%)로 짝을 지어
+DB lines(kind='job')와 같은 사업자번호(또는 거래처명)·날짜 ±15일·구경 ±max(1.0mm, 1%)(양쪽 기장 있으면 ±10%)로 짝을 지어
 `actual_unit_price`·`actual_qty`·`statement_id`를 붙인다: 후보 하나 `exact`, 여럿 → 가장 가까운 날짜 `nearest`,
 없음 `none` + `match_reason`. 결과 `data/backtest/imgagong_<연도>.csv`(UTF-8-SIG)·`.xlsx` (git 제외).
+미해석 거래처는 `aliases suggest`와 같은 형식으로 `data/backtest/unresolved_clients.txt`에 (행 많은 순) — yaml에 옮겨 쓴다.
+
+`backtest inflation`: DB lines(job) 전체에서 같은 거래처 + 같은 품목(구경 ±0.5, 공차 동일, 기장은 양쪽 다 있으면 ±10%,
+한쪽만 있으면 다른 품목)의 연도별 단가 중앙값 → 품목이 나온 연속한 두 해마다 연환산 변화율. 전체·연도쌍·구경대·거래처 상위 20,
+매뉴얼 '연 9%'와 비교 한 줄. `data/backtest/inflation.csv`.
+
+견적 엔진용 유사건 검색은 `cases.find_similar_cases(index, query, cutoff_date)` — cutoff_date **이전**(당일 제외) 자료만 본다
+(백테스트 정답 누출 방지, cutoff 없으면 오류).

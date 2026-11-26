@@ -21,15 +21,17 @@ import re
 import sqlite3
 import unicodedata
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+
+from cases import DbLine, LineIndex, load_job_lines
 
 ROOT = Path(__file__).parent
 OUT_DIR = ROOT / "data" / "backtest"
 
-DATE_WINDOW = 10      # 일
-DIA_TOL = 0.5         # mm
+DATE_WINDOW = 15      # 일
+DIA_TOL = 1.0         # mm — 구경 허용폭은 max(DIA_TOL, 구경 × DIA_TOL_PCT)
+DIA_TOL_PCT = 0.01
 LEN_TOL = 0.10        # 비율
 
 # 2행 헤더 → 필드 (공백 무시 비교). 앞쪽 후보 우선.
@@ -267,12 +269,31 @@ def tab_month(title: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def collect_rows(tabs: list[tuple[str, list[list[str]]]], year: int, master, data_start_row: int = 3):
-    """[(탭 제목, get_all_values)] → (품목 행 list, 탭별 행 수, 중복 제거 수). 탭은 달 순서로."""
+def tab_label(title: str, tab_year: int, year: int) -> str:
+    """주 연도 탭은 '3월', 다른 해 탭은 '12월(2025)'."""
+    return title if tab_year == year else f"{title}({tab_year})"
+
+
+def tab_years(titles: list[str], year: int, today: date | None = None) -> dict[str, int]:
+    """월 탭 제목 → 연도. 올해면 이번 달 이하 = 올해, 그 뒤 달(12월 등) = 작년 탭. 지난해 이전이면 모두 그 해."""
+    today = today or date.today()
+    out = {}
+    for t in titles:
+        m = tab_month(t)
+        if m:
+            out[t] = year - 1 if year == today.year and m > today.month else year
+    return out
+
+
+def collect_rows(tabs: list[tuple], year: int, master, data_start_row: int = 3):
+    """[(탭 제목, 탭 연도, get_all_values)] → (품목 행 list, 탭별 행 수, 중복 제거 수). 탭은 (연도, 달) 순서로.
+    (옛 형식 [(탭 제목, values)]이면 모두 year)"""
     rows, per_tab, dup = [], Counter(), 0
     seen = set()
-    for title, values in sorted(tabs, key=lambda t: tab_month(t[0]) or 0):
+    tabs = [t if len(t) == 3 else (t[0], year, t[1]) for t in tabs]
+    for title, tyear, values in sorted(tabs, key=lambda t: (t[1], tab_month(t[0]) or 0)):
         tm = tab_month(title)
+        label = tab_label(title, tyear, year)
         if not values or len(values) < 2:
             continue
         hm = header_map(values[1])
@@ -289,7 +310,7 @@ def collect_rows(tabs: list[tuple[str, list[list[str]]]], year: int, master, dat
             if cell("date"):
                 ctext = cell("client")
                 res = master.resolve_full(ctext) if ctext else None
-                block = {"date_text": cell("date"), "date": parse_sheet_date(cell("date"), year, tm),
+                block = {"date_text": cell("date"), "date": parse_sheet_date(cell("date"), tyear, tm),
                          "client_text": ctext, "res": res, "rownum": idx + 1}
             elif block is None:
                 continue
@@ -305,7 +326,7 @@ def collect_rows(tabs: list[tuple[str, list[list[str]]]], year: int, master, dat
             # 보류-동명(번호 없음)·동명확인(기본 쪽 번호)도 이름은 있음 → 이름으로 짝 찾기
             resolved = bool(res and res.name and res.hold != "보류-미등록" and not res.manual)
             rec = {
-                "tab": title, "row": idx + 1, "block_row": block["rownum"],
+                "tab": label, "row": idx + 1, "block_row": block["rownum"],
                 "date": block["date"].isoformat() if block["date"] else "",
                 "date_text": block["date_text"], "client_text": block["client_text"],
                 "client": res.name if res and resolved else "",
@@ -315,75 +336,17 @@ def collect_rows(tabs: list[tuple[str, list[list[str]]]], year: int, master, dat
             }
             rec.update(parse_row(raw))
             rows.append(rec)
-            per_tab[title] += 1
+            per_tab[label] += 1
     return rows, per_tab, dup
 
 
 # ---------------------------------------------------------------- DB 짝 찾기
-@dataclass
-class DbLine:
-    id: int
-    date: date
-    client: str
-    reg_no: str
-    item: str
-    spec: str
-    qty: float | None
-    unit_price: int | None
-    supply: int | None
-    dia: float | None
-    length: float | None
-    statement_id: str = ""
-
-
-@dataclass
-class LineIndex:
-    by_reg: dict = field(default_factory=lambda: defaultdict(list))
-    by_name: dict = field(default_factory=lambda: defaultdict(list))
-
-    def client_lines(self, reg_no: str, name: str) -> list[DbLine]:
-        from watcher import compact_name
-
-        out = list(self.by_reg.get(reg_no, [])) if reg_no else []
-        ids = {ln.id for ln in out}
-        key = compact_name(name or "")[0]
-        out += [ln for ln in self.by_name.get(key, []) if ln.id not in ids] if key else []
-        return out
-
-
-def load_lines(con: sqlite3.Connection, start: str, end: str) -> LineIndex:
-    """lines(kind='job') + 같은 날·같은 거래처 명세표 → 사업자번호·statement_id."""
-    from watcher import compact_name
-
-    stm = defaultdict(list)
-    for sid, d, client, reg, item, spec in con.execute(
-            "SELECT id, date, client, reg_no, item, spec FROM statements WHERE date BETWEEN ? AND ?", (start, end)):
-        stm[(d, client)].append((sid, reg or "", item, spec))
-    name_reg = defaultdict(set)
-    for name, reg in con.execute("SELECT name, reg_no FROM clients WHERE reg_no IS NOT NULL AND reg_no<>''"):
-        name_reg[name].add(reg)
-    idx = LineIndex()
-    for lid, d, client, item, spec, qty, up, sup, dia, length, reg in con.execute(
-            "SELECT id, date, client, item, spec, qty, unit_price, supply, dia, length, reg_no FROM lines"
-            " WHERE kind='job' AND date BETWEEN ? AND ?", (start, end)):
-        cands = stm.get((d, client), [])
-        pick = [c for c in cands if c[2] == item and (c[3] or "") == (spec or "")] or cands
-        sid = "|".join(str(c[0]) for c in pick) if len(pick) > 1 and len(cands) > 1 else (
-            str(pick[0][0]) if pick else "")
-        regs = {c[1] for c in pick if c[1]} or name_reg.get(client, set())
-        reg = reg if reg and not str(reg).startswith("동명:") else (next(iter(regs)) if len(regs) == 1 else "")
-        ln = DbLine(lid, date.fromisoformat(d), client or "", reg, item or "", spec or "", qty, up, sup, dia,
-                    length, sid)
-        if reg:
-            idx.by_reg[reg].append(ln)
-        key = compact_name(client or "")[0]
-        if key:
-            idx.by_name[key].append(ln)
-    return idx
+def dia_width(d: float) -> float:
+    return max(DIA_TOL, d * DIA_TOL_PCT)
 
 
 def _dia_ok(dias: list[float], ln: DbLine) -> bool:
-    return ln.dia is not None and any(abs(d - ln.dia) <= DIA_TOL for d in dias)
+    return ln.dia is not None and any(abs(d - ln.dia) <= dia_width(d) for d in dias)
 
 
 def _len_ok(length, ln: DbLine) -> bool:
@@ -452,7 +415,8 @@ def summarize(rows: list[dict], per_tab: Counter, dup: int) -> list[str]:
     out = [f"품목 행 {n} (탭 이월 중복 제거 {dup})"]
     months = Counter(r["date"][:7] if r["date"] else "(날짜없음)" for r in rows)
     out.append("월별(행 날짜): " + "  ".join(f"{k}:{v}" for k, v in sorted(months.items())))
-    out.append("탭별: " + "  ".join(f"{k}:{per_tab[k]}" for k in sorted(per_tab, key=lambda t: tab_month(t) or 0)))
+    out.append("탭별: " + "  ".join(f"{k}:{v}" for k, v in per_tab.items()))  # collect_rows가 (연도, 달) 순
+    out.append(f"짝 기준: 날짜 ±{DATE_WINDOW}일, 구경 ±max({DIA_TOL:g}mm, {DIA_TOL_PCT:.0%}), 기장 ±{LEN_TOL:.0%}")
     m = Counter(r["match"] for r in rows)
     out.append("match: " + "  ".join(f"{k} {_pct(m[k], n)}" for k in ("exact", "nearest", "none")))
     out.append("파싱 성공: " + "  ".join(
@@ -498,21 +462,25 @@ def write_outputs(rows: list[dict], year: int) -> tuple[Path, Path]:
     return csv, xlsx
 
 
-def fetch_tabs(cfg: dict, year: int) -> list[tuple[str, list[list[str]]]]:
-    """임가공 시트의 그 해 월 탭 전부 (읽기 전용 get_all_values). 올해면 이번 달 뒤 탭(=작년 것)은 뺌."""
+def fetch_tabs(cfg: dict, year: int) -> list[tuple[str, int, list[list[str]]]]:
+    """임가공 시트 월 탭 전부 (읽기 전용 get_all_values) → [(제목, 탭 연도, values)].
+    year 탭 전부 + 그 앞 해 탭(올해 기준 이번 달보다 뒤 달 = 작년 12월 등)도 포함."""
     import gspread
 
     scfg = cfg["sheets"]["imgagong"]
     gc = gspread.service_account(filename=cfg["common"]["credentials_file"])
     sh = gc.open_by_key(scfg["spreadsheet_id"])
-    today = date.today()
-    last = today.month if year == today.year else 12
-    tabs = []
-    for ws in sh.worksheets():
-        m = tab_month(ws.title)
-        if m and m <= last:
-            tabs.append((ws.title.strip(), ws.get_all_values()))
-    return tabs
+    wss = [ws for ws in sh.worksheets() if tab_month(ws.title)]
+    years = tab_years([ws.title.strip() for ws in wss], year)
+    return [(ws.title.strip(), years[ws.title.strip()], ws.get_all_values()) for ws in wss]
+
+
+def unresolved_lines(con, rows: list[dict]) -> list[str]:
+    """미해석 거래처 표기 → aliases suggest 형식 줄 (행 많은 순, 끝 주석에 행 수)."""
+    import clients_cli
+
+    cnt = Counter(r["client_text"] for r in rows if not r["client"] and r["client_text"])
+    return [f"{clients_cli.suggestion_line(con, t)}  ({n}행)" for t, n in cnt.most_common()]
 
 
 def build(year: int, samples: int = 30, none_samples: int = 20, seed: int = 0) -> None:
@@ -526,14 +494,20 @@ def build(year: int, samples: int = 30, none_samples: int = 20, seed: int = 0) -
                                         rules=watcher.load_client_rules(watcher.ALIASES_YAML))
     tabs = fetch_tabs(cfg, year)
     rows, per_tab, dup = collect_rows(tabs, year, master, cfg["sheets"]["imgagong"]["data_start_row"])
-    idx = load_lines(con, f"{year - 1}-11-01", f"{year + 1}-01-31")
+    idx = LineIndex.build(load_job_lines(con, f"{year - 2}-10-01", f"{year + 1}-01-31"))
     for r in rows:
         r.update(match_row(r, idx))
     csv, xlsx = write_outputs(rows, year)
+    sug = unresolved_lines(con, rows)
+    unres_path = OUT_DIR / "unresolved_clients.txt"
+    header = ["# 임가공 백테스트 미해석 거래처 → config/client_aliases.yaml aliases: 에 옮길 후보",
+              "# 형식은 agent.py aliases suggest 와 같음. 끝 (N행)은 시트 행 수"]
+    unres_path.write_text("\n".join(header + sug) + "\n", encoding="utf-8")
 
     print(f"== 백테스트 정답지 {year} → {csv.relative_to(ROOT)} / {xlsx.name}")
     for line in summarize(rows, per_tab, dup):
         print("  " + line)
+    print(f"  미해석 거래처 후보 {len(sug)}개 표기 → {unres_path.relative_to(ROOT)}")
 
     rng = random.Random(seed)
     print(f"\n== 시트 원문 샘플 {samples}행 (거래처 다양하게, seed={seed}; 열 글자는 11월 탭 기준)")

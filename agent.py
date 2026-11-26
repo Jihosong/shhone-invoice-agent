@@ -12,6 +12,7 @@
     python agent.py clients find <검색어>  # 마스터 이름 부분일치: 정식명/사업자번호/최근거래/올해 건수
     python agent.py clients add "<정식명>" <사업자번호>  # 경리나라 import에 없는 거래처 수동 등록
     python agent.py backtest build [--year 2026]  # 임가공 월 탭 전부(읽기만) + DB 실제 단가 → data/backtest/ 정답지
+    python agent.py backtest inflation  # DB 같은 거래처·같은 품목 연도별 단가 변화율 → data/backtest/inflation.csv
     python agent.py calibrate   # 화면 좌표/비전 보정
 """
 import argparse
@@ -187,6 +188,18 @@ def cmd_backtest_build(args: argparse.Namespace) -> None:
     backtest.build(args.year, samples=args.samples, none_samples=args.none_samples, seed=args.seed)
 
 
+def cmd_backtest_inflation(args: argparse.Namespace) -> None:
+    import sqlite3
+    from pathlib import Path
+
+    import inflation
+    from config.settings import settings
+
+    db = Path(settings.DB_PATH)
+    db = db if db.is_absolute() else Path(__file__).parent / db
+    inflation.run(sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True))  # DB 읽기 전용
+
+
 def cmd_calibrate(args: argparse.Namespace) -> None:
     print("calibrate: TODO")
 
@@ -230,6 +243,8 @@ def main() -> None:
     p_btb.add_argument("--none-samples", type=int, default=20, help="콘솔에 보일 match=none 샘플 수")
     p_btb.add_argument("--seed", type=int, default=0)
     p_btb.set_defaults(func=cmd_backtest_build)
+    p_bt.add_parser("inflation", help="DB 같은 거래처·같은 품목 연도별 단가 변화율 → data/backtest/inflation.csv"
+                    ).set_defaults(func=cmd_backtest_inflation)
     sub.add_parser("calibrate", help="화면 좌표/비전 보정").set_defaults(func=cmd_calibrate)
     args = parser.parse_args()
     args.func(args)
