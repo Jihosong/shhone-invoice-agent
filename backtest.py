@@ -88,7 +88,10 @@ def header_map(header: list[str]) -> dict[str, int]:
     return out
 
 
-def tab_month(title: str) -> int | None:
+def tab_month(title: str, today: date | None = None) -> int | None:
+    """'N월' → N, '당월' → 오늘 달 (운영 감시 탭과 같은 규칙), 그 밖 None."""
+    if title.strip() == "당월":
+        return (today or date.today()).month
     m = re.fullmatch(r"(\d{1,2})월", title.strip())
     return int(m.group(1)) if m else None
 
@@ -103,7 +106,7 @@ def tab_years(titles: list[str], year: int, today: date | None = None) -> dict[s
     today = today or date.today()
     out = {}
     for t in titles:
-        m = tab_month(t)
+        m = tab_month(t, today)
         if m:
             out[t] = year - 1 if year == today.year and m > today.month else year
     return out
@@ -287,7 +290,7 @@ def write_outputs(rows: list[dict], year: int) -> tuple[Path, Path]:
 
 
 def fetch_tabs(cfg: dict, year: int) -> list[tuple[str, int, list[list[str]]]]:
-    """임가공 시트 월 탭 전부 (읽기 전용 get_all_values) → [(제목, 탭 연도, values)].
+    """임가공 시트 월 탭 전부 ('N월' + '당월'=오늘 달, 읽기 전용 get_all_values) → [(제목, 탭 연도, values)].
     year 탭 전부 + 그 앞 해 탭(올해 기준 이번 달보다 뒤 달 = 작년 12월 등)도 포함."""
     import gspread
 

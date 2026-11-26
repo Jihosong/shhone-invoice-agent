@@ -59,8 +59,10 @@ import yaml
 from gspread.utils import rowcol_to_a1
 from loguru import logger
 
+import notifier
 from config.settings import settings
 from feedback import norm_text
+from issuer.excel_upload import LineError, block_date
 from job_parse import norm as norm_job_text, parse_chidae, parse_dias
 
 SHEETS_YAML = Path(__file__).parent / "config" / "sheets.yaml"
@@ -118,7 +120,8 @@ FILE_BLOCK_EXTRA = {"human_flag_at": "TEXT", "human_ack_at": "TEXT"}
 # 기존 DB에는 없을 수 있는 열 → 없으면 ALTER
 EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT",
                  "legacy": "INTEGER", "block_id": "TEXT", "client_resolved": "TEXT", "client_note": "TEXT",
-                 "deleted_at": "TEXT", "client_reg_no": "TEXT", "item_fp": "TEXT", "watch_vals": "TEXT"}
+                 "deleted_at": "TEXT", "client_reg_no": "TEXT", "item_fp": "TEXT", "watch_vals": "TEXT",
+                 "tab_gid": "TEXT"}
 
 # ---------------------------------------------------------------- 견적완료 이후 변경 (임가공)
 # 어느 칸이 바뀌었는지 알려고 행마다 이 칸들의 마지막 값을 rows.watch_vals(JSON)에 둔다.
@@ -265,16 +268,61 @@ def fingerprint(values: list[str]) -> str:
     return hashlib.sha1("|".join(values).encode("utf-8")).hexdigest()
 
 
-def pick_active_tab(worksheets, pattern: str, ignore: list[str]):
-    """월 패턴에 맞는 탭 중 가장 왼쪽(인덱스 최소) 하나."""
+CURRENT_TAB = "당월"  # 이 이름의 탭이 있으면 위치·달과 무관하게 그것을 감시
+
+
+@dataclass
+class TabPick:
+    """감시할 탭 선택 결과. error가 있으면 그 시트 처리 중단, warning은 처리하되 경고."""
+    ws: object = None
+    error: str = ""
+    warning: str = ""
+
+
+def prev_month(month: int) -> int:
+    return 12 if month == 1 else month - 1
+
+
+def pick_active_tab(worksheets, pattern: str, ignore: list[str], today: date | None = None) -> TabPick:
+    """① '당월' 탭(위치 무관) ② 오늘 달의 'N월' 탭 ③ 직전 달 'N월' 탭 + 경고 (1월이면 12월).
+    같은 단계에서 맞는 탭이 둘 이상이면(' 당월'·'당월', '12월'·' 12월') 오류 → 처리 중단."""
+    today = today or date.today()
     rx = re.compile(pattern)
-    for ws in sorted(worksheets, key=lambda w: w.index):
-        title = ws.title.strip()
-        if title in ignore:
-            continue
-        if rx.match(title):
-            return ws
-    return None
+    tabs = [ws for ws in sorted(worksheets, key=lambda w: w.index) if ws.title.strip() not in ignore]
+
+    def one(hit, what):
+        if len(hit) > 1:
+            names = ", ".join(repr(ws.title) for ws in hit)
+            return TabPick(error=f"{what} 탭이 {len(hit)}개 ({names}) → 이 시트 처리 중단 (하나만 남기세요)")
+        return TabPick(hit[0]) if hit else None
+
+    def month_of(title):
+        t = title.strip()
+        m = re.match(r"(\d{1,2})", t) if rx.match(t) else None
+        return int(m.group(1)) if m else None
+
+    pick = one([ws for ws in tabs if ws.title.strip() == CURRENT_TAB], f"'{CURRENT_TAB}'")
+    if pick:
+        return pick
+    pick = one([ws for ws in tabs if month_of(ws.title) == today.month], f"당월({today.month}월)")
+    if pick:
+        return pick
+    pm = prev_month(today.month)
+    pick = one([ws for ws in tabs if month_of(ws.title) == pm], f"직전 달({pm}월)")
+    if pick and pick.ws is not None:
+        pick.warning = (f"'{CURRENT_TAB}'·'{today.month}월' 탭 없음 → 직전 달 탭 '{pick.ws.title}' 감시 "
+                        f"(새 달 탭을 만들거나 '{CURRENT_TAB}'으로 이름을 바꾸세요)")
+    return pick or TabPick()
+
+
+def date_cell_month(text: str, today: date) -> int | None:
+    """날짜 칸 → 달 (해석 못 하면 None). 연도 보정은 block_date와 같이 오늘 기준."""
+    if not (text or "").strip():
+        return None
+    try:
+        return block_date(text, "", today).month
+    except LineError:
+        return None
 
 
 _CORP_RE = re.compile(r"\(주\)|주식회사|^주\)")
@@ -830,12 +878,27 @@ class Watcher:
         except Exception:
             books.pop(key, None)
             raise
-        ws = pick_active_tab(tabs, self.common["month_tab_pattern"], scfg.get("ignore_tabs") or [])
-        if ws is None:
-            logger.warning("sheet={} 활성 월 탭 없음", label)
+        today = getattr(self, "today_fn", date.today)()
+        pick = pick_active_tab(tabs, self.common["month_tab_pattern"], scfg.get("ignore_tabs") or [], today)
+        if pick.error:
+            self._log_on_change((key, "tab"), "ERROR", "sheet={} {}", label, pick.error)
+            self.notify((key, "tab"), f"[{label}] {pick.error}")
             return
+        if pick.ws is None:
+            self._log_on_change((key, "tab"), "WARNING", "sheet={} 활성 월 탭 없음 ('{}' 또는 'N월')", label,
+                                CURRENT_TAB)
+            return
+        ws = pick.ws
+        if pick.warning:
+            self._log_on_change((key, "tab"), "WARNING", "sheet={} {}", label, pick.warning)
+            self.notify((key, "tab"), f"[{label}] {pick.warning}")
+        else:
+            self._log_on_change((key, "tab"), "INFO", "sheet={} 감시 탭 '{}'", label, ws.title)
+            self.notify((key, "tab"), None)
 
         values = ws.get_all_values()
+        gid = None if getattr(ws, "id", None) is None else str(ws.id)  # 탭 정체성 (이름이 같아도 다른 탭 구분)
+        self.month_start_check(key, label, ws.title, values, scfg, today)
         width = max(cols.values())
         master = load_client_master(self.con, self.common.get("skip_clients") or [],
                                     rules=load_client_rules(getattr(self, "alias_path", None)))
@@ -1225,10 +1288,10 @@ class Watcher:
                 f: (watch_prev.get(f, ""), v) for f, v in watch_now.items() if watch_prev.get(f, "") != v}
             self.con.execute(
                 "UPDATE rows SET work_end_state=?, shipped_state=?, work_end_flipped_at=?, legacy=?,"
-                " block_id=?, client_resolved=?, client_reg_no=?, client_note=?, item_fp=?, watch_vals=?"
-                " WHERE row_id=?",
+                " block_id=?, client_resolved=?, client_reg_no=?, client_note=?, item_fp=?, watch_vals=?,"
+                " tab_gid=? WHERE row_id=?",
                 (work_end, shipped, flipped_at, int(legacy), block["id"], client, block["reg_no"], client_note,
-                 item_fp, json.dumps(watch_now, ensure_ascii=False) if watch_fields else None, row_id))
+                 item_fp, json.dumps(watch_now, ensure_ascii=False) if watch_fields else None, gid, row_id))
 
             # 상태는 묶음이 끝날 때 함께 결정 (finish_block)
             block["entries"].append({
@@ -1239,7 +1302,7 @@ class Watcher:
                 "flipped_at": flipped_at, "client_log": client_log, "client_note": client_note,
                 "watch_diff": watch_diff})
         finish_block(block)
-        self.mark_deleted(key, label, ws.title, values, cols, scfg["data_start_row"], seen_ids)
+        self.mark_deleted(key, label, ws.title, values, cols, scfg["data_start_row"], seen_ids, gid)
 
         deferred = getattr(self, "defer_flush", False)
         written = 0 if deferred else writer.flush(ws, self.dry_run)
@@ -1255,6 +1318,28 @@ class Watcher:
             else f" 쓰기 대기={len(writer)} (pricer와 함께 씀)" if deferred
             else f" 쓰기={written}" + (f" (보류 {len(writer) - written})" if written != len(writer) else ""),
         )
+
+    def month_start_check(self, key, label, title, values, scfg, today: date) -> None:
+        """월초 점검: 감시 탭에 오늘 달 날짜 행이 없고 지난달 행만 있으면 매 폴링 WARNING (알림은 상태가 바뀔 때)."""
+        col = scfg["columns"]["date"] - 1
+        months = {m for row in values[scfg["data_start_row"] - 1:]
+                  if col < len(row) and (m := date_cell_month(row[col], today))}
+        ident = (key, "month_start")
+        if today.month not in months and prev_month(today.month) in months:
+            msg = f"당월 탭 갱신 필요(탭 '{title}'에 {today.month}월 행 없음)"
+            logger.warning("sheet={} {}", label, msg)
+            self.notify(ident, f"[{label}] {msg}")
+        else:
+            self.notify(ident, None)
+
+    def notify(self, ident: tuple, msg: str | None) -> None:
+        """알림은 같은 내용을 반복하지 않음 — ident의 문구가 바뀔 때만 notifier로 (None = 해소, 기억만)."""
+        sent = self.__dict__.setdefault("_notified", {})
+        if sent.get(ident) == msg:
+            return
+        sent[ident] = msg
+        if msg:
+            notifier.notify(msg)
 
     def flush_writes(self) -> int:
         """defer_flush 모드: 이번 바퀴 watcher+pricer 쓰기를 시트당 batch_update 한 번으로. 쓴 칸 수 반환."""
@@ -1296,9 +1381,10 @@ class Watcher:
             return "다른 줄 작업완료 대기"
         return None
 
-    def mark_deleted(self, key, label, tab, values, cols, data_start_row, seen_ids) -> None:
+    def mark_deleted(self, key, label, tab, values, cols, data_start_row, seen_ids, gid=None) -> None:
         """이 탭에서 row_id가 더 이상 보이지 않는 행 → DB status '삭제됨' (이후 처리 안 함).
-        메모 행으로 바뀌었어도 V열에 row_id가 남아 있으면 삭제가 아님. 다시 나타나면 process_sheet가 복원."""
+        메모 행으로 바뀌었어도 V열에 row_id가 남아 있으면 삭제가 아님. 다시 나타나면 process_sheet가 복원.
+        같은 이름의 다른 탭('당월'을 '12월'로 바꾸고 새 '당월'을 만든 경우)의 행은 건드리지 않음 — 탭 gid로 구분."""
         id_col = cols["row_id"] - 1
         present = set(seen_ids)
         for row in values[data_start_row - 1:]:
@@ -1306,8 +1392,9 @@ class Watcher:
             if ROW_ID_RE.match(rid):
                 present.add(rid)
         gone = [rid for (rid,) in self.con.execute(
-            "SELECT row_id FROM rows WHERE sheet=? AND tab=? AND COALESCE(status, '') != ?",
-            (key, tab, ST_DELETED)) if rid not in present]
+            "SELECT row_id FROM rows WHERE sheet=? AND tab=? AND COALESCE(status, '') != ?"
+            " AND (tab_gid IS NULL OR tab_gid = ?)",
+            (key, tab, ST_DELETED, gid)) if rid not in present]
         if not gone:
             return
         self.con.executemany("UPDATE rows SET status=?, deleted_at=? WHERE row_id=?",

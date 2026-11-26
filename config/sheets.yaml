@@ -6,7 +6,11 @@ common:
   credentials_file: C:/dev/secrets/gcp-service-account.json
   poll_interval_sec: 15           # Sheets API 할당량 계산은 README '폴링 주기와 API 할당량'
   quote_settle_min: 5            # 마지막 수정 후 N분 무변화 → 가견적
-  active_tab_rule: leftmost_month   # 가장 왼쪽의 "N월" 탭 하나만 감시
+  # 감시 탭 (watcher.pick_active_tab, 위치 무관): ① '당월' 이름 탭 ② 오늘 달 'N월' 탭 ③ 직전 달 'N월' 탭 + WARNING
+  #   (1월이면 12월). 같은 단계에 맞는 탭이 둘 이상이면 ERROR + 그 시트 처리 중단.
+  #   월초 점검: 감시 탭에 오늘 달 날짜 행이 없고 지난달 행만 있으면 매 폴링 WARNING '당월 탭 갱신 필요'.
+  #   날짜 칸 연도는 탭 이름이 아니라 오늘 기준 (12월 탭의 1/2 → 새해 등)
+  active_tab_rule: current_month
   month_tab_pattern: '^\d{1,2}월$'
   author_ai_value: AI            # 작성자 칸에 에이전트가 쓰는 값
   skip_clients:                  # 월말 일괄 처리 거래처 → 에이전트 제외 (상태: 제외-월말일괄)

@@ -92,8 +92,8 @@ def tab_month(title: str) -> int | None:
 def block_date(text: str, tab_title: str, today: date | None = None) -> date:
     """블록 날짜 칸('11/26', '11.26', '11월 26일', '2026-11-26') → date.
 
-    연도는 월 탭 기준: 탭 월이 오늘 월보다 크면 작년 탭(1월에 보는 12월 탭). 날짜 월이 탭 월과 6개월
-    넘게 떨어지면 해를 넘긴 것(12월 탭에 적힌 1/2 → 다음 해, 1월 탭에 적힌 12/30 → 전 해)."""
+    연도는 탭 이름이 아니라 오늘 기준: 올해로 보되 날짜 월이 오늘 월보다 6개월 넘게 뒤면 작년
+    (1월에 보는 12/30), 6개월 넘게 앞이면 내년(12/31에 적힌 1/2). tab_title은 예전 호출 호환용(안 씀)."""
     today = today or date.today()
     s = str(text or "").strip()
     try:
@@ -104,11 +104,10 @@ def block_date(text: str, tab_title: str, today: date | None = None) -> date:
             m = rx.match(s)
             if m:
                 mo, d = (int(g) for g in m.groups())
-                tm = tab_month(tab_title) or today.month
-                y = today.year - 1 if tm > today.month else today.year
-                if mo - tm > 6:
+                y = today.year
+                if mo - today.month > 6:
                     y -= 1
-                elif tm - mo > 6:
+                elif today.month - mo > 6:
                     y += 1
                 return date(y, mo, d)
     except ValueError:

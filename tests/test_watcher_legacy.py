@@ -1,5 +1,6 @@
 """기존건 규칙 + 작성자 우선순위 (watcher.process_sheet를 가짜 시트·메모리 DB로 구동)."""
 import sqlite3
+from datetime import date
 
 import pytest
 
@@ -58,6 +59,7 @@ def make_watcher(rows, skip_clients=(), clients=("가", "나", "다"), scfg=SCFG
                       [(c + (None,))[:4] if isinstance(c, tuple) else (c, "", 1, None) for c in clients])
     w.snapshots = {}
     w.post_quote = post_quote_states(STATUS_VALUES)
+    w.today_fn = lambda: date(2026, 11, 26)  # 감시 탭 선택(오늘 달 'N월')이 실제 날짜에 흔들리지 않게 — FakeWS 탭은 '11월'
     return w
 
 

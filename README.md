@@ -36,6 +36,13 @@ cp .env.example .env      # 값 채우기
 python agent.py run
 ```
 
+### 감시 탭 (시트마다 하나)
+1. `당월` 이름의 탭(위치 무관) → 2. 없으면 오늘 달 `N월` 탭 → 3. 없으면 직전 달 `N월` 탭 + WARNING(1월이면 12월).
+같은 단계에 맞는 탭이 둘 이상이면 ERROR, 그 시트는 처리하지 않음. 월초 점검: 감시 탭에 이번 달 날짜 행이 없고
+지난달 행만 있으면 매 폴링 WARNING `당월 탭 갱신 필요(탭 '당월'에 12월 행 없음)` (알림은 상태가 바뀔 때 한 번 — notifier).
+날짜 칸의 연도는 탭 이름이 아니라 오늘 기준(12/31에 적힌 `1/2` → 새해, 1월에 보는 `12/30` → 작년).
+`당월`을 `12월`로 이름을 바꾸고 새 `당월`을 만들어도 지난 탭 행은 삭제됨으로 처리하지 않음(탭 gid로 구분).
+
 ### 폴링 주기와 API 할당량
 
 `common.poll_interval_sec` 15초, `issue.bundle_interval_min` 3분. Google Sheets API 한도는 읽기·쓰기 각각
@@ -101,7 +108,7 @@ python agent.py outbox            # 파일별 포함 묶음·상태
 ## 임가공 백테스트 정답지
 
 ```bash
-python agent.py backtest build            # 2026년 월 탭 전부 + 남은 2025년 탭(12월) (시트·DB 읽기만)
+python agent.py backtest build            # 2026년 월 탭 전부('당월' = 이번 달 포함) + 남은 2025년 탭(12월) (시트·DB 읽기만)
 python agent.py backtest build --seed 3   # 콘솔 샘플만 다르게
 python agent.py backtest inflation        # DB 같은 거래처·같은 품목 연도별 단가 변화율
 ```
