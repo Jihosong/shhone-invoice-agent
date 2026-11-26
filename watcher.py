@@ -129,9 +129,37 @@ WATCH_FIELDS = (*WATCH_SPEC, WATCH_STOCK, *WATCH_NOTES)
 # 사람 단가를 유지한 채 재확인을 요청한 표시 (산출근거 맨 앞, 묶음 표시 뒤). 사람이 '확인'/비우면 pricer가
 # 견적완료(사람확인), 단가를 고치면 견적완료(사람수정) — 가견적 표시 '[가견적-…]'과 같은 대접
 RECHECK_RE = re.compile(r"^\[([^\[\]]*) — 단가 재확인\](?: 사람 단가 [\d,/]+ 유지)?(?: \| |\s*$)")
-CHIDAE_DEFAULTS = {"post_quote_chidae_ratio": 0.004,   # |치대| ÷ 구경 이 이상이면 재확인
+CHIDAE_DEFAULTS = {"post_quote_recheck": False,         # True면 사람 단가 행의 사양·큰 치대 변경 → 견적확인필요 (기본 꺼짐)
+                   "post_quote_chidae_ratio": 0.004,   # |치대| ÷ 구경 이 이상이면 재확인
                    "post_quote_chidae_mm": 1.0,         # 또는 |치대| 이 이상(mm)이면 재확인
                    "post_quote_chidae_nodia_mm": 0.2}   # 구경을 모르면 |치대| 이 이상(mm)이면 재확인
+# 산출근거 끝의 변경 표시 "[변경 11/27 14:05: H -0.3 추가]" — 한 행에 최근 CHANGE_TAG_KEEP개까지 누적
+CHANGE_TAG_RE = re.compile(r"\[변경 [^\[\]]*\]")
+CHANGE_TAIL_RE = re.compile(r"(?:\s*\[변경 [^\[\]]*\])+\s*$")
+CHANGE_TAG_KEEP = 3
+
+
+def _short(v: str, n: int = 20) -> str:
+    v = " ".join((v or "").split()).replace("[", "(").replace("]", ")")
+    return v[:n] + "…" if len(v) > n else v
+
+
+def change_desc(letter: str, old: str, new: str) -> str:
+    """'H -0.3 추가' / 'H -0.3 삭제' / 'E Ø50 …→Ø50 …'."""
+    old, new = _short(old), _short(new)
+    if not old:
+        return f"{letter} {new} 추가"
+    if not new:
+        return f"{letter} {old} 삭제"
+    return f"{letter} {old}→{new}"
+
+
+def append_change_tag(body: str, tag: str, keep: int = CHANGE_TAG_KEEP) -> str:
+    """산출근거 끝 변경 표시들에 tag를 더하고 최근 keep개만 남김."""
+    m = CHANGE_TAIL_RE.search(body)
+    tags = CHANGE_TAG_RE.findall(m.group(0)) if m else []
+    base = body[:m.start()] if m else body
+    return " ".join(x for x in [base.rstrip()] + (tags + [tag])[-keep:] if x)
 
 
 def _fmt_price(cell_text: str) -> str:
@@ -835,6 +863,7 @@ class Watcher:
             human_map[bid] = (hf, ha)  # 사람처리-명세표중복확인 표시한 때 / 사람이 확인(상태 칸 비움)한 때
 
         writer = SheetWriter(cols, scfg["data_start_row"], scfg["hash_columns"], label)
+        stamp = f"{now.month}/{now.day} {now:%H:%M}"  # 변경 표시 '[변경 11/27 14:05: …]'
         known = known_states(self.common["status_values"])
         counts = Counter()
         seen_ids: set[str] = set()
@@ -896,21 +925,23 @@ class Watcher:
                         e["author"] = human
                         self.con.execute("UPDATE rows SET author=? WHERE row_id=?", (human, e["row_id"]))
             block_last = max(e["last_change"] for e in entries)
-            # 견적완료 이후 변경: 사람 단가 행의 D·E·F·H 변경, S·T·U 변경은 재견적 없이 그 행에서 처리
+            # 견적완료 이후 변경 (임가공): 견적완료·명세표발행대기·발행완료 행의 D·E·F·H·S·T·U 변경은 재견적 없이
+            # 산출근거 끝에 '[변경 …]'만. 그 행의 변경은 그 행으로 끝 — 묶음 재견적 안 함
             for e in entries:
                 e["pq"] = None
-                if watch_fields and not e["unknown_status"]:
-                    e["pq"] = self.post_quote_change(e, cols, cell(e["row"], "basis") if "basis" in cols else "",
-                                                     cell(e["row"], "unit_price") if "unit_price" in cols else "",
-                                                     pq_rules)
+                e["final"] = watch_fields and self.post_quote_final(
+                    e["status"], cell(e["row"], "basis") if "basis" in cols else "", pq_rules)
+                if e["final"] and not e["unknown_status"]:
+                    e["pq"] = self.post_quote_change(e, cols, cell(e["row"], "unit_price") if "unit_price" in cols
+                                                     else "", pq_rules, stamp)
                 if e["pq"]:
-                    logger.info("sheet={} row={} client={} 견적 이후 변경 {} → {}", label, e["rownum"],
-                                e["client_log"], " / ".join(e["pq"]["reasons"] + e["pq"]["notes"]),
-                                "견적확인필요 (사람 단가 유지)" if e["pq"]["recheck"] else "상태 유지, 산출근거에 덧붙임")
+                    logger.info("sheet={} row={} client={} 견적 이후 변경 ({}) {} → {}", label, e["rownum"],
+                                e["client_log"], e["status"], ", ".join(e["pq"]["changes"]),
+                                "견적확인필요 (사람 단가 유지: " + ", ".join(e["pq"]["reasons"]) + ")"
+                                if e["pq"]["recheck"] else "단가·상태 유지, 산출근거에 표시")
                     if e["pq"]["recheck"]:
                         self.sync_quote_fp(e["row_id"], e["fp"])
             # 묶음 안 한 행이라도 바뀌었거나, 알던 묶음에 새 행이 붙으면 묶음 전체가 '변경'
-            # (위에서 처리한 행의 변경은 그 행으로 끝 — 묶음 재견적 안 함)
             news = [e["is_new"] for e in entries]
             block_changed = any(e["changed"] and not e["pq"] for e in entries) or (any(news) and not all(news))
             # 보류-화면이상이던 행의 상태 칸을 사람이 비웠으면 → 묶음 안 보류-화면이상 모두 풀고 재평가
@@ -933,10 +964,14 @@ class Watcher:
                     e["new_status"] = None  # 사람처리
                     continue
                 status = "" if screen_cleared and e["status"] == ST_SCREEN else e["status"]
-                row_changed = block_changed and not client_fix
-                if row_changed and watch_fields and (e["pq"] or not e["changed"]) \
-                        and self.human_priced(e["status"], cell(e["row"], "basis") if "basis" in cols else ""):
-                    row_changed = False  # 사람 단가 행은 같은 묶음의 다른 행이 바뀌어도 재견적하지 않음
+                row_changed = block_changed
+                if e["final"]:
+                    if status in (ST_PENDING_EDITED, *ISSUED_STATES) or (status == ST_PENDING and filed):
+                        # 파일에 담긴 명세표발행대기·발행완료: 예전 '-수정됨'/'발행후수정' 규칙 그대로
+                        row_changed = block_changed or e["changed"]
+                    else:  # 견적완료(·파일 전 명세표발행대기): 다른 행이 바뀌어도, 자기 칸이 바뀌어도 그대로
+                        row_changed = e["changed"] and not e["pq"]
+                row_changed = row_changed and not client_fix
                 new_status = self.decide_status(
                     label, e["rownum"], e["client_log"], e["author"], status, row_changed,
                     settle if client_fix else now - block_last, settle, ai, skip_clients, legacy=e["legacy"],
@@ -1023,7 +1058,7 @@ class Watcher:
                 if "basis" in cols and (e["new_status"] not in (None, ST_SKIP) or blk["manual"]):
                     basis = cell(row, "basis")
                     rest = strip_block_tag(basis)
-                    if e["pq"] and e["new_status"] in (*QUOTED_STATES, ST_CHECK):
+                    if e["pq"]:
                         rest = e["pq"]["body"](rest)
                     new_basis = with_block_tag(tag, rest)
                     if new_basis != basis:  # 태그 n/m 갱신은 '변경'이 아님 — 지문(hash_columns)에 없는 칸
@@ -1286,62 +1321,61 @@ class Watcher:
         return status in (ST_QUOTED_EDIT, ST_QUOTED_OK) or (
             status == ST_CHECK and bool(RECHECK_RE.match(strip_block_tag(basis))))
 
-    def post_quote_change(self, e: dict, cols: dict, basis: str, price: str, rules: dict) -> dict | None:
-        """견적완료 이후(견적완료·사람수정·사람확인·견적확인필요) 행의 변경 처리 (임가공, 명세표발행대기 전까지).
-        None = 해당 없음(변경 없음, 또는 자동 견적 행의 D·E·F·H 변경 → 예전처럼 묶음 재견적).
-        dict: recheck(견적확인필요로), reasons(재확인 사유), notes(덧붙일 말), body(산출근거 본문 → 새 본문).
-        - 사람 단가 행 D·E·F 변경 → '[사양 변경 — 단가 재확인] 사람 단가 N 유지' + 견적확인필요
-        - 사람 단가 행 H 변경 → |치대|÷구경 ≥ ratio 또는 ≥ mm(구경 모르면 nodia_mm)이면 재확인, 미만이면 덧붙임만
-        - S·T·U 변경 → 덧붙임만 (재견적 없음)
-        - 예전 DB(watch_vals 없음)라 어느 칸인지 모르는 사람 단가 행 변경 → '[내용 변경 — 단가 재확인]'"""
-        status = e["status"]
-        if status not in (*QUOTED_STATES, ST_CHECK):
-            return None
-        human = self.human_priced(status, basis)
+    def post_quote_final(self, status: str, basis: str, rules: dict) -> bool:
+        """재견적하지 않고 변경 표시만 하는 행: 견적완료(자동·사람확인·사람수정)·명세표발행대기(-수정됨)·발행완료.
+        post_quote_recheck가 켜져 있으면 사람 단가 유지 + 재확인 중인 견적확인필요도."""
+        return status in (*QUOTED_STATES, ST_PENDING, ST_PENDING_EDITED, *ISSUED_STATES) or (
+            bool(rules.get("post_quote_recheck")) and self.human_priced(status, basis))
+
+    def post_quote_change(self, e: dict, cols: dict, price: str, rules: dict, stamp: str) -> dict | None:
+        """견적완료 이후 행(post_quote_final)의 D·E·F·H·S·T·U 변경 → 산출근거 끝에 '[변경 11/27 14:05: H -0.3 추가]'.
+        None = 해당 없음 (변경 없음, 또는 지문 변경이 이 칸들이 아님 — 거래처 칸 등 → 예전 규칙).
+        dict: changes(바뀐 칸 설명), recheck(견적확인필요로), reasons(재확인 사유), body(산출근거 본문 → 새 본문).
+        post_quote_recheck(기본 꺼짐)가 켜져 있으면 사람 단가 행만 예전 재확인 규칙도:
+        - D·E·F 변경 → '[사양 변경 — 단가 재확인] 사람 단가 N 유지' + 견적확인필요
+        - H 변경 → |치대|÷구경 ≥ ratio 또는 ≥ mm(구경 모르면 nodia_mm)이면 재확인
+        - 예전 DB(watch_vals 없음)라 어느 칸인지 모름 → '[내용 변경 — 단가 재확인]'"""
         diff = e["watch_diff"]
-        reasons, notes = [], []
-        if diff is None:
-            if not (human and e["changed"] and e["items_changed"]):
+        basis = e["row"][cols["basis"] - 1] if "basis" in cols else ""
+        human = bool(rules.get("post_quote_recheck")) and self.human_priced(e["status"], basis)
+        reasons = []
+        if diff is None:  # 예전 DB: 어느 칸인지 모름
+            if not (e["changed"] and e["items_changed"]):
                 return None
-            reasons.append("내용 변경")
+            changes = ["내용(칸 모름)"]
+            if human:
+                reasons.append("내용 변경")
         else:
             spec = [f for f in WATCH_SPEC if f in diff]
             stock = WATCH_STOCK in diff
-            if not human and (spec or stock) and e["changed"]:
-                return None  # 자동 견적 행: 재견적 (S·T·U 덧붙임은 새 산출근거로 대체)
-            if e["changed"] and not (spec or stock):
+            if not diff or (e["changed"] and not (spec or stock)):
                 return None  # 지문은 바뀌었는데 사양·연마량 칸이 아님 (거래처 칸 등) → 예전 규칙
+            changes = [change_desc(re.sub(r"\d", "", rowcol_to_a1(1, cols[f])), *diff[f])
+                       for f in WATCH_FIELDS if f in diff]
             if human and spec:
                 reasons.append("사양 변경")
             if human and stock:
-                old, new = diff[WATCH_STOCK]
-
                 def get(name):
                     i = cols.get(name)
                     return e["row"][i - 1] if i and i - 1 < len(e["row"]) else ""
 
                 spec_text = get("spec_qty") if parse_dias(get("spec_qty")) else get("main_msg")
-                desc, need = stock_change(old, new, spec_text, rules)
-                (reasons if need else notes).append(desc)
-            for f in WATCH_NOTES:
-                if f in diff:
-                    v = " ".join(diff[f][1].split())
-                    notes.append(f"{WATCH_NOTES[f]} 변경 '{v[:30]}{'…' if len(v) > 30 else ''}'" if v
-                                 else f"{WATCH_NOTES[f]} 지움")
-            if not (reasons or notes):
-                return None
+                desc, need = stock_change(*diff[WATCH_STOCK], spec_text, rules)
+                if need:
+                    reasons.append(desc)
         recheck = bool(reasons)
         keep = f" 사람 단가 {_fmt_price(price)} 유지" if price else ""
+        tag = f"[변경 {stamp}: {', '.join(changes)}]"
 
         def body(rest: str) -> str:
             m = RECHECK_RE.match(rest)
-            rest = rest[m.end():] if m else rest
-            if recheck or m:  # 재확인 중인 행에 또 사유가 생기면 사유를 이어 붙임
+            if recheck:  # 재확인 중인 행에 또 사유가 생기면 사유를 이어 붙임
+                tail = rest[m.end():] if m else rest
                 why = ", ".join(([m.group(1)] if m else []) + reasons)
-                rest = f"[{why} — 단가 재확인]{keep}" + (f" | {rest}" if rest else "")
-            return " | ".join([rest] + notes) if rest else " | ".join(notes)
+                rest = f"[{why} — 단가 재확인]{keep}" + (f" | {tail}" if tail else "")
+            return append_change_tag(rest, tag)
 
-        return {"recheck": recheck, "reasons": reasons, "notes": notes, "body": body}
+        return {"recheck": recheck, "reasons": reasons, "changes": changes, "body": body}
 
     def sync_quote_fp(self, row_id: str, fp: str) -> None:
         """재확인 표시한 행: pricer job_quotes 지문을 지금 내용으로 → 사람이 '확인'/비우면 적힌 단가로 사람확인."""

@@ -1,4 +1,12 @@
-"""견적완료 이후 변경 처리 (임가공): H 연마량 임계값, D·E 사양 변경, S·T·U 덧붙임, 자동 견적 행 재견적."""
+"""견적완료 이후 변경 처리 (임가공).
+
+기본(post_quote_recheck: false): 견적완료(자동·사람확인·사람수정)·명세표발행대기·발행완료 행은 D·E·F·H·S·T·U가
+바뀌어도 재견적 없이 단가·상태 유지 + 산출근거 끝 '[변경 11/27 14:05: H -0.3 추가]'(최근 3개).
+견적 전(입력중·확정·견적확인필요) 행은 재견적. 파일에 담긴 명세표발행대기는 '-수정됨' 그대로.
+post_quote_recheck: true면 사람 단가 행의 사양·큰 치대 변경 → 견적확인필요(단가 유지).
+"""
+import re
+
 import pytest
 from gspread.utils import a1_to_rowcol
 
@@ -11,7 +19,8 @@ from tests.test_issuer_job import REG
 from tests.test_status_rename_cycle import RecWS
 from tests.test_watcher_legacy import make_watcher
 from tests.test_watcher_settle import age_all
-from watcher import CHIDAE_DEFAULTS, ST_CHECK, ST_QUOTED, ST_QUOTED_EDIT, ST_QUOTED_OK, ST_TYPING, load_config, stock_change
+from watcher import (CHIDAE_DEFAULTS, ST_CHECK, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_QUOTED, ST_QUOTED_EDIT,
+                     ST_QUOTED_OK, ST_TYPING, append_change_tag, load_config, stock_change)
 
 COLS = {"date": 1, "client": 2, "main_msg": 4, "spec_qty": 5, "difficulty": 6, "stock_removal": 8, "work_end": 10,
         "author": 15, "pre_note": 19, "post_size": 20, "post_note": 21, "status": 24, "unit_price": 25, "basis": 26,
@@ -19,15 +28,24 @@ COLS = {"date": 1, "client": 2, "main_msg": 4, "spec_qty": 5, "difficulty": 6, "
 SCFG = {"spreadsheet_id": "x", "label": "임가공", "kind": "job", "data_start_row": 3, "columns": COLS,
         "hash_columns": ["client", "main_msg", "spec_qty", "difficulty", "stock_removal"],
         "item_columns": ["spec_qty", "main_msg"]}
-S, P, B = COLS["status"] - 1, COLS["unit_price"] - 1, COLS["basis"] - 1
+S, P, B, ID = COLS["status"] - 1, COLS["unit_price"] - 1, COLS["basis"] - 1, COLS["row_id"] - 1
 D, E, H, PRE = COLS["main_msg"] - 1, COLS["spec_qty"] - 1, COLS["stock_removal"] - 1, COLS["pre_note"] - 1
 E50 = "Ø50 +0.0~+0.03 / 300 / 2개"
+E50B = "Ø50 +0.0~+0.03 / 300 / 3개"
 E300 = "Ø300 +0.0~+0.05 / 500 / 1개"
+STAMP = r"\d{1,2}/\d{1,2} \d{2}:\d{2}"
+
+
+def tag_re(text):
+    return re.compile(rf"\[변경 {STAMP}: {re.escape(text)}\]$")
 
 
 class HighAi(StubAi):
+    """Ø50 → 30000 high (견적완료), 그 밖 → 20000 low (견적확인필요)."""
     def quote(self, inp, index, cutoff, hint="", tag="", max_conf=None):
-        return Quote("AI-유사품", 30000, "high", "자동")
+        if "Ø50" in inp.raw.get("spec_qty", ""):
+            return Quote("AI-유사품", 30000, "high", "자동")
+        return super().quote(inp, index, cutoff)
 
 
 class Rig:
@@ -67,76 +85,202 @@ class Rig:
         self.cycle()
         return self
 
-    def human_edit(self, price="5000"):
-        """가견적(견적확인필요 20000) → 사람이 단가 수정 → 견적완료(사람수정)."""
-        self.quoted()
-        assert self.row()[S] == ST_CHECK
-        self.row()[P] = price
-        self.cycle()
-        assert self.row()[S] == ST_QUOTED_EDIT
-        return self
+
+def auto():
+    rig = Rig(E50, ai=HighAi()).quoted()
+    assert (rig.row()[S], rig.row()[P]) == (ST_QUOTED, "30000")
+    return rig
 
 
-def human(spec=E50):
-    return Rig(spec).human_edit()
+def human_ok():
+    rig = Rig(E50).quoted()
+    assert rig.row()[S] == ST_CHECK
+    rig.row()[S] = "확인"
+    rig.cycle()
+    assert (rig.row()[S], rig.row()[P]) == (ST_QUOTED_OK, "20000")
+    return rig
 
 
-# ---------------------------------------------------------------- H 연마량/치대
-def test_h_small_on_d50_keeps_status_and_notes():
-    rig = human()
-    rig.row()[H] = "-0.1"  # 0.1 / 50 = 0.2% < 0.4%
+def human_edit(spec=E50):
+    rig = Rig(spec).quoted()
+    rig.row()[P] = "5000"
+    rig.cycle()
+    assert (rig.row()[S], rig.row()[P]) == (ST_QUOTED_EDIT, "5000")
+    return rig
+
+
+def recheck_on(monkeypatch):
+    monkeypatch.setattr(watcher, "load_config", lambda: {"pricing": {"post_quote_recheck": True}})
+
+
+# ---------------------------------------------------------------- 기본: 견적완료 이후 = 유지 + 변경 표시
+@pytest.mark.parametrize("make", [auto, human_ok, human_edit], ids=["자동", "사람확인", "사람수정"])
+@pytest.mark.parametrize("col, value, desc", [
+    (D, "급함", "D 급함 추가"),
+    (E, E50B, f"E {E50[:20]}…→{E50B[:20]}…"),
+    (H, "-0.3", "H -0.3 추가"),
+    (PRE, "입구 찍힘", "S 입구 찍힘 추가"),
+])
+def test_quoted_row_change_keeps_price_and_status(make, col, value, desc):
+    rig = make()
+    status, price = rig.row()[S], rig.row()[P]
+    rig.row()[col] = value
+    assert rig.cycle() == []  # 상태 칸 쓰기 없음 (입력중으로 안 돌아감)
+    assert (rig.row()[S], rig.row()[P]) == (status, price)
+    assert tag_re(desc).search(rig.row()[B]), rig.row()[B]
+    assert rig.row()[B].startswith("[가사 11/26 1/1] ")
+    basis = rig.row()[B]
+    assert rig.cycle() == [] and rig.row()[B] == basis  # 다음 바퀴 그대로 (같은 표시 다시 안 붙음)
+
+
+def test_change_tags_accumulate_up_to_three():
+    rig = human_edit()
+    for v in ("-0.1", "-0.2", "-0.3", "-0.4"):
+        rig.row()[H] = v
+        rig.cycle()
+    tags = re.findall(r"\[변경 [^\]]*\]", rig.row()[B])
+    assert [t.split(": ", 1)[1] for t in tags] == ["H -0.1→-0.2]", "H -0.2→-0.3]", "H -0.3→-0.4]"]
+    assert "사람 수정 5000" in rig.row()[B] and rig.row()[S] == ST_QUOTED_EDIT
+
+
+def test_several_columns_in_one_tag_and_delete():
+    rig = auto()
+    rig.row()[H], rig.row()[PRE] = "-0.2", "메모"
+    rig.cycle()
+    assert tag_re("H -0.2 추가, S 메모 추가").search(rig.row()[B])
+    rig.row()[H] = ""
+    rig.cycle()
+    assert tag_re("H -0.2 삭제").search(rig.row()[B])
+
+
+def test_append_change_tag_keeps_last_three():
+    body = "AI-유사품 [변경 1/1 00:00: a] [변경 1/1 00:01: b] [변경 1/1 00:02: c]"
+    assert append_change_tag(body, "[변경 1/1 00:03: d]") == \
+        "AI-유사품 [변경 1/1 00:01: b] [변경 1/1 00:02: c] [변경 1/1 00:03: d]"
+    assert append_change_tag("", "[변경 1/1 00:03: d]") == "[변경 1/1 00:03: d]"
+
+
+# ---------------------------------------------------------------- 견적 전 행은 재견적
+def test_check_needed_row_e_change_requotes():
+    rig = Rig(E50).quoted()
+    assert rig.row()[S] == ST_CHECK
+    rig.row()[E] = E50B
+    assert rig.cycle() == [ST_TYPING]
+    age_all(rig.w)
+    assert rig.cycle() == [ST_CHECK]
+    assert "[변경" not in rig.row()[B]
+
+
+# ---------------------------------------------------------------- 같은 묶음 다른 행
+def test_sibling_change_keeps_auto_quoted_row():
+    rig = Rig(E50, "Ø40 +0.0~+0.03 / 200 / 1개", ai=HighAi()).quoted()
+    assert (rig.row(0)[S], rig.row(1)[S]) == (ST_QUOTED, ST_CHECK)
+    rig.row(1)[E] = "Ø40 +0.0~+0.03 / 200 / 2개"  # 견적 전 행 수정 → 그 행만 재견적
+    assert rig.cycle() == [ST_TYPING]
+    assert (rig.row(0)[S], rig.row(0)[P], rig.row(1)[S]) == (ST_QUOTED, "30000", ST_TYPING)
+    age_all(rig.w)
+    rig.cycle()
+    assert (rig.row(0)[S], rig.row(1)[S]) == (ST_QUOTED, ST_CHECK)
+
+
+def test_sibling_change_keeps_human_row():
+    rig = Rig(E50, "Ø40 +0.0~+0.03 / 200 / 1개").quoted()
+    rig.row(0)[P] = "5000"
+    rig.cycle()
+    rig.row(1)[E] = "Ø40 +0.0~+0.03 / 200 / 2개"
+    rig.cycle()
+    assert (rig.row(0)[S], rig.row(0)[P], rig.row(1)[S]) == (ST_QUOTED_EDIT, "5000", ST_TYPING)
+
+
+# ---------------------------------------------------------------- 명세표발행대기 이후
+def pending(rig, filed):
+    rig.row()[S] = ST_PENDING
+    rig.cycle()
+    assert rig.row()[S] == ST_PENDING
+    if filed:
+        rig.w.con.execute("INSERT INTO issue_file_blocks(block_id, file_name, sheet) VALUES(?,?,?)",
+                          (rig.row()[ID], "20261127_1400.xls", "imgagong"))
+        rig.w.con.commit()
+        rig.cycle()
+    return rig
+
+
+def test_unfiled_pending_change_keeps_and_tags():
+    rig = pending(auto(), filed=False)
+    rig.row()[H] = "-0.3"
     assert rig.cycle() == []
-    assert rig.row()[S] == ST_QUOTED_EDIT and rig.row()[P] == "5000"
-    assert rig.row()[B].endswith(" | 연마량 -0.1 추가(구경 대비 0.2%)")
-    assert rig.row()[B].startswith("[가사 11/26 1/1] 사람 수정 5000")
-    assert rig.cycle() == [] and rig.row()[B].count("연마량") == 1  # 다음 바퀴 그대로
+    assert (rig.row()[S], rig.row()[P]) == (ST_PENDING, "30000")
+    assert tag_re("H -0.3 추가").search(rig.row()[B])
 
 
-def test_h_large_on_d50_rechecks_keeping_human_price():
-    rig = human()
+def test_filed_pending_change_is_edited_rule():
+    rig = pending(auto(), filed=True)
+    rig.row()[E] = E50B
+    assert rig.cycle() == [ST_PENDING_EDITED]  # 예전 '-수정됨' 규칙 그대로
+    assert rig.row()[P] == "30000" and "[변경" in rig.row()[B]
+    assert rig.w.con.execute("SELECT removed_at IS NOT NULL FROM issue_file_blocks").fetchone() == (1,)
+
+
+def test_issued_change_keeps_and_tags():
+    rig = auto()
+    rig.row()[S], rig.row()[COLS["author"] - 1] = ST_ISSUED, "AI"
+    rig.cycle()
+    rig.row()[E] = E50B
+    assert rig.cycle() == []
+    assert rig.row()[S] == ST_ISSUED and "[변경" in rig.row()[B]
+
+
+# ---------------------------------------------------------------- post_quote_recheck: true (기본 꺼짐)
+def test_recheck_off_by_default():
+    assert CHIDAE_DEFAULTS["post_quote_recheck"] is False
+    assert load_config()["pricing"]["post_quote_recheck"] is False
+
+
+def test_recheck_h_small_keeps(monkeypatch):
+    rig = human_edit()
+    recheck_on(monkeypatch)
+    rig.row()[H] = "-0.1"  # 0.2% < 0.4%
+    assert rig.cycle() == []
+    assert rig.row()[S] == ST_QUOTED_EDIT and tag_re("H -0.1 추가").search(rig.row()[B])
+
+
+def test_recheck_h_large_then_ok(monkeypatch):
+    rig = human_edit()
+    recheck_on(monkeypatch)
     rig.row()[H] = "-0.3"  # 0.6%
     assert rig.cycle() == [ST_CHECK]
     assert rig.row()[P] == "5000"
     assert rig.row()[B].startswith(
         "[가사 11/26 1/1] [연마량 -0.3 추가(구경 대비 0.6%) — 단가 재확인] 사람 단가 5,000 유지 | 사람 수정 5000")
-    assert rig.cycle() == []  # 다음 바퀴 견적확인필요 그대로, 재견적 없음
-    assert rig.row()[P] == "5000"
-
-
-def test_recheck_then_ok_is_human_ok_with_same_price():
-    rig = human()
-    rig.row()[H] = "-0.3"
-    rig.cycle()
+    assert rig.cycle() == [] and rig.row()[P] == "5000"
     rig.row()[S] = "확인"
     age_all(rig.w)
     assert rig.cycle() == [ST_QUOTED_OK]
-    assert rig.row()[P] == "5000"
-    assert "사람 확인 | 연마량 -0.3 추가(구경 대비 0.6%) | 사람 수정 5000" in rig.row()[B]
-    assert "단가 재확인" not in rig.row()[B]
+    assert rig.row()[P] == "5000" and "사람 확인 | 연마량 -0.3 추가(구경 대비 0.6%) | 사람 수정 5000" in rig.row()[B]
 
 
-def test_recheck_then_price_edit_is_human_edit():
-    rig = human()
-    rig.row()[H] = "-0.3"
-    rig.cycle()
-    rig.row()[P] = "6000"
-    assert rig.cycle() == [ST_QUOTED_EDIT]
-    assert "사람 수정 6000 (에이전트 5000) | 연마량 -0.3 추가" in rig.row()[B]
+def test_recheck_h_on_d300_keeps(monkeypatch):
+    rig = human_edit(E300)
+    recheck_on(monkeypatch)
+    rig.row()[H] = "-0.5"  # 0.17%
+    assert rig.cycle() == [] and rig.row()[S] == ST_QUOTED_EDIT
 
 
-def test_h_on_d300_keeps():
-    rig = human(E300)
-    rig.row()[H] = "-0.5"  # 0.5 / 300 = 0.17%
-    assert rig.cycle() == []
-    assert rig.row()[S] == ST_QUOTED_EDIT
-    assert rig.row()[B].endswith("| 연마량 -0.5 추가(구경 대비 0.2%)")
-
-
-def test_h_1mm_rechecks_even_on_large_bore():
-    rig = human("Ø500 +0.0~+0.05 / 500 / 1개")
-    rig.row()[H] = "-1.0"  # 0.2% 이지만 1mm 이상
+def test_recheck_e_edit_rechecks_s_edit_keeps(monkeypatch):
+    rig = human_edit()
+    recheck_on(monkeypatch)
+    rig.row()[PRE] = "메모"
+    assert rig.cycle() == [] and rig.row()[S] == ST_QUOTED_EDIT
+    rig.row()[E] = E50B
     assert rig.cycle() == [ST_CHECK]
-    assert "[연마량 -1.0 추가(구경 대비 0.2%) — 단가 재확인]" in rig.row()[B]
+    assert "[사양 변경 — 단가 재확인] 사람 단가 5,000 유지 | 사람 수정 5000" in rig.row()[B]
+
+
+def test_recheck_auto_row_not_rechecked(monkeypatch):
+    rig = auto()
+    recheck_on(monkeypatch)
+    rig.row()[E] = E50B
+    assert rig.cycle() == [] and rig.row()[S] == ST_QUOTED  # 재확인 규칙은 사람 단가 행만
 
 
 def test_stock_change_rules():
@@ -144,78 +288,7 @@ def test_stock_change_rules():
     assert stock_change("", "-0.2", "Ø50 / 2개", r) == ("연마량 -0.2 추가(구경 대비 0.4%)", True)  # 경계 0.4% 포함
     assert stock_change("-0.1", "-0.3", "Ø50", r) == ("연마량 -0.1→-0.3(구경 대비 0.6%)", True)
     assert stock_change("-0.3", "", "Ø50", r) == ("연마량 -0.3 삭제", False)
-    assert stock_change("", "-0.1", "피스톤 2개", r) == ("연마량 -0.1 추가(구경 모름)", False)  # 구경 모름: 0.2mm 기준
+    assert stock_change("", "-1.0", "Ø500", r) == ("연마량 -1.0 추가(구경 대비 0.2%)", True)  # 1mm 이상
+    assert stock_change("", "-0.1", "피스톤 2개", r) == ("연마량 -0.1 추가(구경 모름)", False)  # 구경 모름: 0.2mm
     assert stock_change("", "-0.2", "피스톤 2개", r) == ("연마량 -0.2 추가(구경 모름)", True)
     assert stock_change("", "많이", "Ø50", r) == ("연마량 많이 추가(값 해석 못함)", True)
-    assert stock_change("", "-0.1", "Ø100 + Ø20 / 2개", r)[1]  # 가장 작은 구경 기준 (0.5%)
-
-
-def test_chidae_threshold_from_config(monkeypatch):
-    rig = human()
-    monkeypatch.setattr(watcher, "load_config", lambda: {"pricing": {"post_quote_chidae_ratio": 0.001}})
-    rig.row()[H] = "-0.1"  # 0.2% ≥ 0.1%
-    assert rig.cycle() == [ST_CHECK]
-
-
-# ---------------------------------------------------------------- D·E·F / S·T·U
-def test_e_edit_on_human_row_rechecks():
-    rig = human()
-    rig.row()[E] = "Ø50 +0.0~+0.03 / 300 / 3개"
-    assert rig.cycle() == [ST_CHECK]
-    assert rig.row()[P] == "5000"
-    assert "[사양 변경 — 단가 재확인] 사람 단가 5,000 유지 | 사람 수정 5000" in rig.row()[B]
-
-
-def test_d_edit_on_human_row_rechecks():
-    rig = human()
-    rig.row()[D] = "급함"
-    assert rig.cycle() == [ST_CHECK]
-    assert "[사양 변경 — 단가 재확인]" in rig.row()[B]
-
-
-def test_second_reason_while_rechecking_is_joined():
-    rig = human()
-    rig.row()[E] = "Ø50 +0.0~+0.03 / 300 / 3개"
-    rig.cycle()
-    rig.row()[H] = "-0.3"
-    assert rig.cycle() == []  # 이미 견적확인필요
-    assert "[사양 변경, 연마량 -0.3 추가(구경 대비 0.6%) — 단가 재확인] 사람 단가 5,000 유지 | 사람 수정" in rig.row()[B]
-    assert rig.row()[P] == "5000"
-
-
-def test_s_edit_on_human_row_keeps_and_notes():
-    rig = human()
-    rig.row()[PRE] = "입구 찍힘 있음"
-    assert rig.cycle() == []
-    assert rig.row()[S] == ST_QUOTED_EDIT and rig.row()[P] == "5000"
-    assert rig.row()[B].endswith(" | 호닝 전 노트 변경 '입구 찍힘 있음'")
-
-
-def test_s_edit_on_auto_row_keeps_and_notes():
-    rig = Rig(E50, ai=HighAi()).quoted()
-    assert rig.row()[S] == ST_QUOTED
-    rig.row()[PRE] = "메모"
-    assert rig.cycle() == []
-    assert rig.row()[S] == ST_QUOTED and rig.row()[B].endswith("| 호닝 전 노트 변경 '메모'")
-
-
-@pytest.mark.parametrize("col, value", [(H, "-0.5"), (E, "Ø50 +0.0~+0.03 / 300 / 3개")])
-def test_auto_row_h_or_e_change_requotes(col, value):
-    rig = Rig(E50, ai=HighAi()).quoted()
-    assert rig.row()[S] == ST_QUOTED
-    rig.row()[col] = value
-    assert rig.cycle() == [ST_TYPING]  # 예전처럼 묶음 재견적
-    age_all(rig.w)
-    assert rig.cycle() == [ST_QUOTED]
-
-
-def test_human_row_untouched_when_sibling_changes():
-    rig = Rig(E50, "Ø40 +0.0~+0.03 / 200 / 1개").quoted()
-    assert (rig.row(0)[S], rig.row(1)[S]) == (ST_CHECK, ST_CHECK)
-    rig.row(0)[P] = "5000"
-    rig.cycle()
-    assert rig.row(0)[S] == ST_QUOTED_EDIT
-    rig.row(1)[E] = "Ø40 +0.0~+0.03 / 200 / 2개"  # 다른 행(자동 가견적) 수정 → 그 행만 재견적
-    rig.cycle()
-    assert (rig.row(0)[S], rig.row(1)[S]) == (ST_QUOTED_EDIT, ST_TYPING)
-    assert rig.row(0)[P] == "5000"
