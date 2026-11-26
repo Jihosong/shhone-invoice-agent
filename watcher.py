@@ -70,10 +70,12 @@ ST_HOMONYM = "보류-동명"
 ST_SCREEN = "보류-화면이상"
 ST_HCHECK = "동명확인"  # homonyms 이름인데 법인/개인 표시 없음 → 기본 쪽으로 가견적만, 발행 안 함
 ST_DELETED = "삭제됨"  # DB 전용 (시트에 쓰지 않음): 시트에서 row_id가 사라진 행
+ST_PENDING = "발행대기"  # 발행 조건 충족 → data/outbox 파일에 담김(또는 담길 예정), 사람이 업로드
+ST_PENDING_EDITED = "발행대기-수정됨"  # 파일에 담긴 뒤 행이 수정됨 → 올린 파일과 어긋남, 사람이 봐야 함
 HOLD_PREFIX = "보류-"
 # 산출근거 칸 맨 앞 묶음 표시 "[거래처(비고) 날짜 n/총줄수] "
-# 뒤에 붙는 안내 "[동명확인: …]" / "[수동처리: …]"도 에이전트 표시로 함께 뗀다
-BLOCK_TAG_RE = re.compile(r"^(?:\[(?:[^\[\]]* \d+/\d+|(?:동명확인|수동처리):[^\[\]]*)\] ?)+")
+# 뒤에 붙는 안내 "[동명확인: …]" / "[수동처리: …]" / 발행 파일 "[→ 20261126_1430.xls]"도 에이전트 표시로 함께 뗀다
+BLOCK_TAG_RE = re.compile(r"^(?:\[(?:[^\[\]]* \d+/\d+|(?:동명확인|수동처리):[^\[\]]*|→ [^\[\]]*)\] ?)+")
 ROW_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 SCHEMA = """
@@ -81,6 +83,14 @@ CREATE TABLE IF NOT EXISTS rows(
   row_id TEXT PRIMARY KEY, sheet TEXT, tab TEXT, row_number INTEGER,
   fingerprint TEXT, first_seen TEXT, last_change TEXT,
   status TEXT, author TEXT, issued_at TEXT);
+-- 발행기 1단계(반자동): data/outbox/에 만든 엑셀일괄등록 파일과 거기 담긴 묶음
+CREATE TABLE IF NOT EXISTS issue_files(
+  file_name TEXT PRIMARY KEY, created_at TEXT, path TEXT, n_blocks INTEGER, n_lines INTEGER, total INTEGER);
+-- block_id PRIMARY KEY → 같은 묶음이 두 파일에 들어갈 수 없음 (DB가 막음)
+CREATE TABLE IF NOT EXISTS issue_file_blocks(
+  block_id TEXT PRIMARY KEY, file_name TEXT NOT NULL, sheet TEXT, tab TEXT, client TEXT, reg_no TEXT,
+  block_date TEXT, n_lines INTEGER, supply INTEGER, tax INTEGER, row_ids TEXT,
+  removed_at TEXT, issued_at TEXT);
 """
 # 기존 DB에는 없을 수 있는 열 → 없으면 ALTER
 EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT",
@@ -518,6 +528,9 @@ class Watcher:
         ai = self.common["author_ai_value"]
         skip_clients = [norm_text(c) for c in self.common.get("skip_clients") or []]
         now = datetime.now()
+        # 발행 파일에 담긴 묶음: block_id → (파일명, removed_at) — 산출근거 '[→ 파일]' 표시·발행대기-수정됨 판정
+        filed_map = {bid: (fn, rm) for bid, fn, rm in self.con.execute(
+            "SELECT block_id, file_name, removed_at FROM issue_file_blocks WHERE sheet=?", (key,))}
 
         writer = SheetWriter(cols, scfg["data_start_row"], scfg["hash_columns"], label)
         counts = Counter()
@@ -574,6 +587,7 @@ class Watcher:
             if client_fix:
                 logger.info("sheet={} row={} 거래처 수정 {!r} → {} {} (동명확인 해제)",
                             label, blk["rownum"], blk["client_text"], blk["client"], blk["reg_no"])
+            filed = filed_map.get(blk["id"])  # (파일명, removed_at) | None
             for e in entries:
                 if blk["manual"]:
                     e["new_status"] = None  # 사람처리
@@ -582,17 +596,36 @@ class Watcher:
                 new_status = self.decide_status(
                     label, e["rownum"], e["client_log"], e["author"], status, block_changed and not client_fix,
                     settle if client_fix else now - block_last, settle, ai, skip_clients, legacy=e["legacy"],
-                    unregistered=blk["client"] is None or blk["hold"] == ST_UNREG, homonym=homonym)
-                if hcheck and new_status and new_status not in (ST_TYPING, ST_SKIP, ST_ISSUED, ST_LEGACY) \
+                    unregistered=blk["client"] is None or blk["hold"] == ST_UNREG, homonym=homonym,
+                    filed=filed is not None)
+                if hcheck and new_status and new_status not in (ST_TYPING, ST_SKIP, ST_ISSUED, ST_LEGACY,
+                                                                ST_PENDING, ST_PENDING_EDITED) \
                         and not new_status.startswith(HOLD_PREFIX):
                     new_status = ST_HCHECK
                 e["new_status"] = new_status
+            # 파일에 담긴 발행대기 묶음은 보류로 덮지 않음 (올린 파일과의 관계가 우선)
+            keep = {None, ST_SKIP, ST_ISSUED, ST_PENDING_EDITED} | ({ST_PENDING} if filed else set())
             holds = [e["new_status"] for e in entries if (e["new_status"] or "").startswith(HOLD_PREFIX)]
             if holds:
                 hold = next((h for h in (ST_UNREG, ST_HOMONYM, ST_SCREEN) if h in holds), holds[0])
                 for e in entries:
-                    if e["new_status"] not in (None, ST_SKIP, ST_ISSUED):
+                    if e["new_status"] not in keep:
                         e["new_status"] = hold
+            # 파일에 담긴 뒤 묶음이 수정됨 → 묶음 전체 발행대기-수정됨 (새로 붙은 행 포함), 파일에서 뺀 것으로 기록
+            if filed and any(e["new_status"] == ST_PENDING_EDITED for e in entries):
+                for e in entries:
+                    if e["new_status"] not in (None, ST_SKIP, ST_ISSUED):
+                        e["new_status"] = ST_PENDING_EDITED
+                if not filed[1]:
+                    logger.warning("sheet={} row={} client={} 발행대기 중 수정 → 발행대기-수정됨 ({}에서 뺌 — "
+                                   "이미 올렸다면 경리나라 명세표와 어긋남, 확인 필요)",
+                                   label, blk["rownum"], entries[0]["client_log"], filed[0])
+                    self.con.execute("UPDATE issue_file_blocks SET removed_at=? WHERE block_id=?",
+                                     (now_iso(), blk["id"]))
+                    filed = filed_map[blk["id"]] = (filed[0], now_iso())
+            file_mark = ""
+            if filed:
+                file_mark = f" [→ {filed[0]}" + (" 뺌(수정됨)]" if filed[1] else "]")
 
             tag_client = blk["client"] or blk["client_text"] or "?"
             note = blk["client_note"]
@@ -607,6 +640,7 @@ class Watcher:
                     tag = f"[{tag_client}{extra} {blk['date']} {pos}/{len(entries)}]"
                     if hcheck:
                         tag += f" [{blk['notice']}]"
+                    tag += file_mark
                 # 묶음 표시는 에이전트가 처리하는 행에만 — 사람처리·제외-월말일괄 행의 산출근거는 안 건드림
                 # (manual_clients 묶음은 사람처리지만 사유를 적음)
                 if "basis" in cols and (e["new_status"] not in (None, ST_SKIP) or blk["manual"]):
@@ -787,11 +821,15 @@ class Watcher:
                     ", ".join(gone[:10]) + (" …" if len(gone) > 10 else ""))
 
     def decide_status(self, label, rownum, client, author, status, changed, age, settle, ai, skip_clients,
-                      legacy=False, unregistered=False, homonym=False):
+                      legacy=False, unregistered=False, homonym=False, filed=False):
         """None = 사람이 처리(상태 비움).
 
         client는 묶음 첫 행에서 해석한 거래처명(미등록이면 원문). 우선순위:
-        제외-월말일괄 > 사람처리 > 보류-미등록 > 보류-동명 > 기존건-확인필요 > 일반 규칙.
+        제외-월말일괄 > 사람처리 > 발행대기(파일에 담김) > 보류-미등록 > 보류-동명 > 기존건-확인필요 > 일반 규칙.
+
+        발행대기-수정됨은 사람이 볼 때까지 유지 (작성자 AI → AI발행, 사람 이름 → 사람처리).
+        발행대기 + 파일에 담김(filed) + 묶음 수정 → 발행대기-수정됨 (올린 파일과 어긋남).
+        아직 파일에 안 담긴 발행대기가 수정되면 일반 규칙(입력중 → 재견적)으로 — 아무도 올릴 수 없었으므로.
 
         월말 일괄 거래처(skip_clients)는 작성자·기존건·완료/출고 여부와 무관하게 항상 '제외-월말일괄'.
         그 외: 작성자가 사람 값이면 기존건이어도 사람처리가 우선. '기존건-확인필요'는 작성자 빈칸인 기존건에만.
@@ -803,6 +841,10 @@ class Watcher:
             return ST_SKIP
         if author and author != ai:
             return None
+        if status == ST_PENDING_EDITED:
+            return status
+        if status == ST_PENDING and filed:
+            return ST_PENDING_EDITED if changed else status
         if unregistered:
             return ST_UNREG
         if homonym:

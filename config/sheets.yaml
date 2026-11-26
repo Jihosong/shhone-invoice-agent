@@ -21,7 +21,8 @@ common:
     - 동명확인                  # homonyms 거래처에 법인/개인 표시 없음 → 기본 쪽으로 단가만, 발행 안 함
     - 견적완료
     - 견적확인필요
-    - 발행대기
+    - 발행대기                  # 발행 조건 충족 → data/outbox 파일에 담김, 사람이 업로드 후 작성자 AI → AI발행
+    - 발행대기-수정됨            # 파일에 담긴 뒤 행 수정 → 올린 파일과 어긋남, 사람이 확인 (작성자 AI/사람 이름으로 정리)
     - 진행중
     - AI발행
     - 보류-동명
@@ -30,6 +31,16 @@ common:
     - 제외-월말일괄
     - 기존건-확인필요            # 최초 발견 시 이미 작업완료/출고완료 → 견적·발행 대상 아님
   # (DB 전용 '삭제됨': 시트에서 row_id가 사라진 행 — 시트에는 쓰지 않으므로 위 목록에 넣지 않음)
+
+# 발행기 1단계 '반자동' (issuer/outbox.py) — 파일은 에이전트가, 업로드는 사람이
+#   발행 조건(묶음 단위): 모든 품목 행 견적완료(또는 견적확인필요 + 사람 단가) + 작성자 빈칸 + 기존건 아님
+#   + 모든 행 작업완료 TRUE + 그중 하나 이상 FALSE→TRUE를 에이전트가 봄 → 묶음 전체 '발행대기'.
+#   bundle_interval_min마다(또는 agent.py issue) 아직 파일에 없는 발행대기 묶음 → outbox_dir/YYYYMMDD_HHMM.xls.
+#   업로드 후 작성자를 AI로 → 묶음 전체 AI발행. 파일에 담긴 뒤 수정 → 발행대기-수정됨(WARNING).
+issue:
+  outbox_dir: data/outbox
+  bundle_interval_min: 10
+  memo_block_id: true            # 공통메모에 'AI <block_id>' (명세표에 인쇄되면 false로)
 
 # 묶음(block) 규칙 — 두 시트 공통 (watcher.py)
 #   날짜 칸이 있는 행 = 묶음 첫 행. 거래처는 이 행의 거래처 칸에서만 해석(별칭표 config/client_aliases.yaml

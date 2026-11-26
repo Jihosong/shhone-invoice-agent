@@ -47,3 +47,25 @@ python agent.py aliases suggest         # 두 시트의 미해석 거래처 → 
 python agent.py aliases check           # 별칭표 검사 (없는 등록명·번호 형식·약칭 중복, homonyms 번호)
 python agent.py clients add "QMESYS(큐머시스)" 108-12-95838   # import에 없는 거래처 수동 등록
 ```
+
+## 발행 (1단계 반자동)
+
+작업완료가 체크된 묶음을 경리나라 **엑셀일괄등록** 파일로 `data/outbox/`에 만든다. 업로드는 사람이 한다.
+
+1. 묶음의 모든 품목 행이 견적완료(또는 견적확인필요 + 사람 단가), 작성자 빈칸, 모든 행 작업완료 TRUE
+   (그중 하나 이상은 에이전트가 체크 순간을 봄) → 묶음 전체 `발행대기`.
+2. `run` 루프가 `issue.bundle_interval_min`(기본 10분)마다, 또는 `python agent.py issue`가 아직 파일에 없는
+   발행대기 묶음을 `data/outbox/YYYYMMDD_HHMM.xls` 한 파일로 묶는다 (묶음 하나 = 명세표 한 장).
+   산출근거에 `[→ 20261126_1430.xls]`.
+3. 경리나라에 올린 뒤 그 묶음 아무 행의 작성자를 `AI`로 → 묶음 전체 `AI발행`, 작성자 `AI`로 통일.
+4. 파일에 담긴 뒤 행을 고치면 `발행대기-수정됨` (산출근거 `뺌(수정됨)`, 로그 WARNING) — 올린 파일과
+   어긋나므로 사람이 확인하고 작성자를 `AI`(이미 맞게 처리함) 또는 사람 이름(직접 처리)으로 정리.
+   같은 묶음은 두 번 파일에 담기지 않는다.
+
+```bash
+python agent.py issue --dry-run   # 파일만 임시 폴더에 (시트·DB 안 건드림)
+python agent.py issue             # 한 바퀴 돌고 outbox 파일 생성
+python agent.py outbox            # 파일별 포함 묶음·상태
+```
+
+공통메모의 `AI <block_id>`는 `config/sheets.yaml`의 `issue.memo_block_id: false`로 끈다.

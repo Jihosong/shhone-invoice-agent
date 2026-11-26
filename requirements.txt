@@ -4,6 +4,7 @@ anthropic
 pandas
 openpyxl
 xlrd
+xlwt
 pyyaml
 pydantic-settings
 python-dotenv

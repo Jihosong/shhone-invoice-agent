@@ -4,6 +4,9 @@
     python agent.py run         # 시트 감시 → 단가 산출 → 거래명세표 발행 루프
     python agent.py import <거래명세표목록.xls> <품목별판매현황.xls>  # 경리나라 내려받기 → DB 적재
     python agent.py blocks      # 현재 월 탭의 묶음 목록 출력 (dry-run, 시트 수정 없음)
+    python agent.py issue       # 한 바퀴 돌고 발행대기 묶음을 data/outbox/YYYYMMDD_HHMM.xls 한 파일로
+    python agent.py issue --dry-run  # 파일만 임시 폴더에 (시트·DB 안 건드림)
+    python agent.py outbox      # outbox 파일별 포함 묶음·상태
     python agent.py aliases check     # config/client_aliases.yaml 검사 (틀린 줄 표시)
     python agent.py aliases suggest   # 시트의 미해석 거래처 → 마스터 후보 (yaml 주석 형식)
     python agent.py clients find <검색어>  # 마스터 이름 부분일치: 정식명/사업자번호/최근거래/올해 건수
@@ -13,12 +16,7 @@
 import argparse
 
 
-def cmd_run(args: argparse.Namespace) -> None:
-    import time
-
-    import pricer
-    import watcher
-
+def _file_log() -> None:
     from pathlib import Path
 
     from loguru import logger
@@ -28,17 +26,57 @@ def cmd_run(args: argparse.Namespace) -> None:
     log_dir.mkdir(exist_ok=True)
     logger.add(log_dir / "agent.log", rotation="10 MB", retention=14, encoding="utf-8", enqueue=True)
 
+
+def _pipeline(dry_run: bool):
+    import pricer
+    import watcher
+    from issuer.outbox import Issuer
+
     cfg = watcher.load_config()
-    w = watcher.Watcher(cfg, dry_run=args.dry_run)
-    p = pricer.Pricer(cfg, w.con, dry_run=args.dry_run)
+    w = watcher.Watcher(cfg, dry_run=dry_run)
+    return cfg, w, pricer.Pricer(cfg, w.con, dry_run=dry_run), Issuer(cfg, w.con, dry_run=dry_run)
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    import time
+
+    _file_log()
+    cfg, w, p, iss = _pipeline(args.dry_run)
     interval = int(cfg["common"].get("poll_interval_sec", 30))
+    bundle_every = float((cfg.get("issue") or {}).get("bundle_interval_min", 10)) * 60
+    last_bundle = None
     while True:
         started = time.monotonic()
         w.run_once()             # 시트 감시 → 상태(입력중/확정/기존건 …)
         p.run_once(w.snapshots)  # 확정 행 단가 산출
+        # 발행대기 표시·AI발행 마감, 주기마다 outbox 파일 묶음 (dry-run이면 파일 안 만듦 → agent.py issue --dry-run)
+        due = not args.dry_run and (last_bundle is None or started - last_bundle >= bundle_every)
+        iss.run_once(w.snapshots, bundle=due)
+        if due:
+            last_bundle = started
         if args.once:
             return
         time.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+
+def cmd_issue(args: argparse.Namespace) -> None:
+    if not args.dry_run:
+        _file_log()
+    _, w, p, iss = _pipeline(args.dry_run)
+    w.run_once()
+    p.run_once(w.snapshots)
+    path = iss.run_once(w.snapshots, bundle=True)
+    print(path if path else "새로 담을 발행대기 묶음 없음")
+
+
+def cmd_outbox(args: argparse.Namespace) -> None:
+    import watcher
+    from issuer.outbox import format_outbox
+
+    con = _db()
+    watcher.ensure_columns(con)
+    for line in format_outbox(con):
+        print(line)
 
 
 def cmd_import(args: argparse.Namespace) -> None:
@@ -150,6 +188,10 @@ def main() -> None:
     p_imp.add_argument("lines", help="품목별판매현황 (.xls)")
     p_imp.set_defaults(func=cmd_import)
     sub.add_parser("blocks", help="현재 월 탭 묶음 목록 출력 (dry-run)").set_defaults(func=cmd_blocks)
+    p_iss = sub.add_parser("issue", help="발행대기 묶음 → data/outbox/YYYYMMDD_HHMM.xls (경리나라 엑셀일괄등록)")
+    p_iss.add_argument("--dry-run", action="store_true", help="파일만 임시 폴더에 만들고 시트·DB 안 건드림")
+    p_iss.set_defaults(func=cmd_issue)
+    sub.add_parser("outbox", help="outbox 파일별 포함 묶음·상태").set_defaults(func=cmd_outbox)
     p_al = sub.add_parser("aliases", help="거래처 별칭표").add_subparsers(dest="aliases_cmd", required=True)
     p_chk = p_al.add_parser("check", help="client_aliases.yaml 검사")
     p_chk.add_argument("--file", help="검사할 yaml (기본 config/client_aliases.yaml)")
