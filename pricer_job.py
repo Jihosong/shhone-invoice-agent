@@ -27,7 +27,8 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from cases import DbLine, LineIndex
-from job_parse import RAW_FIELDS, is_stock_removal, norm, parse_chidae, parse_dias, parse_row, parse_specials
+from job_parse import (RAW_FIELDS, is_stock_removal, item_texts, norm, parse_chidae, parse_dias, parse_row,
+                       parse_specials)
 
 M_PRESET = "사전단가"
 M_SAME = "동일품"
@@ -248,6 +249,36 @@ def quote_same_item(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_
     if len(cands) > 1:
         parts.append(f"동일품 {len(cands)}건 중 최근")
     return Quote(M_SAME, int(ln.unit_price), conf, " / ".join(parts), ln.id)
+
+
+# ---------------------------------------------------------------- 다품목 (한 행에 품목 여럿)
+def _item_src_field(raw: dict) -> str:
+    """품목 구간을 나눌 칸: E에 구경이 있으면 E, 아니면 D (parse_row·발행 줄과 같은 기준)."""
+    return "spec_qty" if parse_dias(raw.get("spec_qty", "")) else "main_msg"
+
+
+def item_count(raw: dict) -> int:
+    """행의 품목 수 (발행 줄 수와 같음). 구경 없는 행은 1."""
+    return len(item_texts(raw.get(_item_src_field(raw), ""))) or 1
+
+
+def split_items(inp: JobInput) -> list[JobInput]:
+    """다품목 행 → 품목 구간마다 JobInput (구간 글에 공통 머리 상속, 다른 칸 원문은 그대로).
+    D가 '6/5.5/5'처럼 구간 수와 같은 개수의 숫자면 구간마다 제 몫의 D. 품목이 하나면 [inp]."""
+    field_ = _item_src_field(inp.raw)
+    texts = item_texts(inp.raw.get(field_, ""))
+    if len(texts) <= 1:
+        return [inp]
+    d = inp.raw.get("main_msg", "")
+    tokens = [t.strip() for t in norm(d).split("/")]
+    per_d = tokens if preset_prices(d) and len(tokens) == len(texts) else None
+    out = []
+    for i, t in enumerate(texts):
+        raw = dict(inp.raw, **{field_: t})
+        if per_d:
+            raw["main_msg"] = per_d[i]
+        out.append(JobInput.from_raw(raw, inp.client, inp.reg_no, inp.on_date))
+    return out
 
 
 # ---------------------------------------------------------------- 사다리

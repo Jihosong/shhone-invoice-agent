@@ -228,3 +228,110 @@ def row_chidae(raw: dict) -> float | None:
         v = parse_chidae(d)
     return v if v is not None else parse_chidae(
         h, " ".join(raw.get(k, "") for k in ("main_msg", "spec_qty", "pre_note")))
+
+
+# ---------------------------------------------------------------- 품목 구간 (한 행에 품목 여럿)
+_QTY_TAIL_RE = re.compile(r"\s*[/×xX*]?\s*\d+\s*" + _QTY_UNIT + r"(?![a-z]).*$", re.I | re.S)
+# 품목 구분 '+' 뒤가 이런 모양이면 공차의 '+' ('+0.02', '+0~', '+-0.05')
+_TOL_AFTER_PLUS_RE = re.compile(r"\s*[-+]?\s*(?:\d*\.\d|0(?![\d.]*\s*" + _QTY_UNIT + r")(?!\d))", re.I)
+# 공통 머리(구경·공차·조도)가 끝나는 곳: '/', 기장('432L'·'L300'·'기장'), 수량
+_HEAD_END_RE = re.compile(r"/|(?<![A-Za-z0-9])L\s*\d|\d+(?:\.\d+)?\s*L(?![a-z])|기장|길이|\d+\s*" + _QTY_UNIT,
+                          re.I)
+
+
+_NOTE_RE = re.compile(r"\([^()]*\)|\d+\s*[월일시]")   # 괄호 메모·날짜 ('(11월26일도착)')
+
+
+def _plus_parts(s: str) -> list[str]:
+    """수량 표기 뒤의 '+'에서 나눔 (공차 '+'는 안 나눔). 수량만 있는 꼬리('6개긴급 +8개')는 앞 구간에 붙임."""
+    parts, start = [], 0
+    for m in re.finditer(r"\+", s):
+        if _QTY_RE.search(s[start:m.start()]) and not _TOL_AFTER_PLUS_RE.match(s, m.end()):
+            parts.append(s[start:m.start()])
+            start = m.end()
+    parts.append(s[start:])
+    out: list[str] = []
+    for p in (x.strip(" ,/+") for x in parts):
+        if not p:
+            continue
+        if out and not re.search(r"\d", _NOTE_RE.sub(" ", _QTY_RE.sub("", p))):  # 수량·메모만 → 같은 품목 추가 수량
+            out[-1] = f"{out[-1]} + {p}"
+        else:
+            out.append(p)
+    return out
+
+
+def _dia_segments(s: str) -> list[str]:
+    """구경(Ø)마다 한 구간. '~Ø'로 이어진 범위는 한 구간, 수량 없는 앞 구간은 다음에 붙임. 구간은 Ø부터."""
+    spans = [st for _, st, _ in _dia_spans(s)]
+    starts = [st for i, st in enumerate(spans) if i == 0 or not s[max(0, st - 2):st].strip().endswith("~")]
+    if not starts:
+        return []
+    segs = [s[a:b].strip(" +,") for a, b in zip(starts, starts[1:] + [len(s)])]
+    out: list[str] = []
+    carry = ""
+    for i, seg in enumerate(segs):
+        seg = f"{carry} {seg}".strip() if carry else seg
+        if i < len(segs) - 1 and not _QTY_TAIL_RE.search(seg):
+            carry = seg
+            continue
+        carry = ""
+        out.append(seg)
+    return out
+
+
+def _head_core(seg: str) -> str:
+    """구간(Ø부터)의 공통 머리: 구경·공차·조도 ('Ø63.5 +0~+0.02 / 432L / 2개' → 'Ø63.5 +0~+0.02')."""
+    spans = _dia_spans(seg)
+    pos = spans[0][2] if spans else 0
+    m = _HEAD_END_RE.search(seg, pos)
+    return (seg[:m.start()] if m else seg).strip(" /+,")
+
+
+def item_segments(text) -> list[tuple[str, str]]:
+    """품목 구간들 [(머리말, 구간)]. 구간은 Ø부터 (명세표 규격용), 머리말은 그 앞 글(재질·조도 등).
+    1) 수량 뒤 '+'로 나눔  2) 각 부분을 구경마다 나눔  3) 구경 없는 부분은 첫 품목의 공통 머리
+    (재질·구경·공차·조도)를 물려받음: 'SUS316 Ø63.5 +0~+0.02 / 432L / 2개 + 534L / 1개'
+    → [('SUS316', 'Ø63.5 +0~+0.02 / 432L / 2개'), ('SUS316', 'Ø63.5 +0~+0.02 / 534L / 1개')].
+    구경 표기가 없는 글은 [] (모델명·품번 행 — 한 품목으로 본다)."""
+    s = norm(text)
+    if not _dia_spans(s):
+        return []
+    parts = _plus_parts(s)
+    if not _dia_spans(parts[0]):  # 첫 부분에 구경이 없으면 나누지 않음 (구경 기준만)
+        parts = [s]
+    out: list[tuple[str, str]] = []
+    head_prefix = head_core = ""
+    for i, p in enumerate(parts):
+        segs = _dia_segments(p)
+        if segs:
+            prefix = p[:_dia_spans(p)[0][1]].strip(" ,/+")
+            if i == 0:
+                head_prefix, head_core = prefix, _head_core(segs[0])
+                out.append((prefix, segs[0]))
+            else:
+                out.append((_with_head(prefix, head_prefix), segs[0]))
+            out += [(_with_head("", head_prefix), seg) for seg in segs[1:]]
+        else:
+            out.append((_with_head("", head_prefix), f"{head_core} / {p}"))
+    return out
+
+
+_RA_TXT_RE = re.compile(r"Ra\s*" + _N + r"(?:\s*~\s*" + _N + r")?", re.I)
+
+
+def _with_head(own: str, head: str) -> str:
+    """뒤 구간 머리말: 제 머리말 + 첫 품목 머리말 중 재질·조도(제 것에 없을 때만).
+    막힘·hole·모델명 같은 나머지는 물려주지 않는다 ('막힘 Ø63.5 … + Ø46 …'의 Ø46은 막힘 아님)."""
+    add = []
+    if not parse_materials(own):
+        add += [t for t in head.split() if parse_materials(t)]
+    if not _RA_TXT_RE.search(own):
+        add += [m.group(0) for m in _RA_TXT_RE.finditer(head)]
+    return " ".join(add + ([own] if own else []))
+
+
+def item_texts(text) -> list[str]:
+    """품목 구간마다 견적용 글 (머리말 + 구간). 구간이 하나 이하면 []."""
+    segs = item_segments(text)
+    return [f"{pre} {seg}".strip() for pre, seg in segs] if len(segs) > 1 else []

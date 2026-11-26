@@ -165,25 +165,10 @@ def job_name(text: str) -> str:
 
 
 def job_segments(text: str) -> list[str]:
-    """E(구경 없으면 D) 글 → 품목 구간들. 구경(Ø)마다 한 구간, '~Ø'로 이어진 범위·수량 없는 앞 구간은 다음에 붙임."""
-    from job_parse import _dia_spans, norm
+    """E(구경 없으면 D) 글 → 품목 구간들 (job_parse.item_segments: 수량 뒤 '+'·구경마다, 공통 머리 상속)."""
+    from job_parse import item_segments
 
-    s = norm(text)
-    spans = [st for _, st, _ in _dia_spans(s)]
-    starts = [st for i, st in enumerate(spans) if i == 0 or not s[max(0, st - 2):st].strip().endswith("~")]
-    if not starts:
-        return []
-    segs = [s[a:b].strip(" +,") for a, b in zip(starts, starts[1:] + [len(s)])]
-    out: list[str] = []
-    carry = ""
-    for i, seg in enumerate(segs):
-        seg = f"{carry} {seg}".strip() if carry else seg
-        if i < len(segs) - 1 and not _QTY_TAIL_RE.search(seg):
-            carry = seg
-            continue
-        carry = ""
-        out.append(seg)
-    return out
+    return [seg for _, seg in item_segments(text)]
 
 
 def job_spec(seg: str, prefix: str = "") -> str:
@@ -241,11 +226,12 @@ def job_lines(get, ctx: LineCtx) -> list[Line]:
     수량이 없으면 1 (경고 로그) — 사람이 파일을 보고 거른다. 보류는 단가 개수 ≠ 품목 개수일 때만."""
     from loguru import logger
 
-    from job_parse import _dia_spans, norm, parse_dias, parse_qty
+    from job_parse import item_segments, norm, parse_dias, parse_qty
 
     d, e = norm(get("main_msg")), norm(get("spec_qty"))
     src = e if parse_dias(e) else d
-    segs = job_segments(src)
+    items = item_segments(src)   # [(머리말, 구간)] — 견적(pricer)과 같은 나눔
+    segs = [seg for _, seg in items]
     n_items = len(segs) or 1
     tokens = [t for t in re.sub(r"\s+", "", str(get("unit_price") or "")).split("/") if t]
     prices = [parse_price(t) for t in tokens] or [parse_price("")]
@@ -264,13 +250,11 @@ def job_lines(get, ctx: LineCtx) -> list[Line]:
         text = strip_qty(e or d)
         name, spec = _history_by_text(text, ctx) or (text, "")
         return [Line(name or (e or d), spec, qtys[0], prices[0])]
-    spans = _dia_spans(src)
-    prefix = src[:spans[0][1]] if spans else ""   # 첫 구경 앞 글 (Ra 표기 등)
     name0 = job_name(f"{d} {e}")
     out = []
-    for i, (seg, qty, price) in enumerate(zip(segs, qtys, prices)):
+    for (prefix, seg), qty, price in zip(items, qtys, prices):
         hist = _history_label(seg if len(segs) > 1 else src, d, ctx)
-        spec = job_spec(seg, prefix if i == 0 else "")
+        spec = job_spec(seg, prefix)   # 머리말의 Ra 표기는 규격 앞에 (뒤 구간은 상속분)
         name = name0
         if hist:
             name, spec = hist[0], hist[1] or spec

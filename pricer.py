@@ -33,6 +33,16 @@ GAGYEON_RE = re.compile(r"^\[가견적-(mid|low)\]\s*")  # 임가공 가견적 �
 _PRICE_CELL_RE = re.compile(r"\d[\d,]*(?:/\d[\d,]*)*")
 
 
+CONF_RANK = {"low": 0, "mid": 1, "high": 2}
+MULTI_MAX_CONF = "mid"   # 다품목 한 행 (E에 '+'로 품목 여럿) confidence 상한 → 항상 견적확인필요
+_MISMATCH_RE = re.compile(r"^단가 개수 불일치 \([^)]*\) \| ")
+
+
+def _job_body(body: str) -> str:
+    """산출근거에서 에이전트 표시('[가견적-…]', '단가 개수 불일치 …')를 뗀 본문."""
+    return _MISMATCH_RE.sub("", GAGYEON_RE.sub("", body))
+
+
 def gagyeon_tag(conf: str) -> str:
     return f"[가견적-{conf}]"
 
@@ -297,8 +307,11 @@ class Pricer:
         """JobInput → (단가 칸, 산출근거, 상태, method, confidence). 사다리 → 미결이면 Claude.
         confidence high만 견적완료, mid/low는 '[가견적-mid/low]' + 견적확인필요, 실패는 단가 없이 견적확인필요."""
         from pricer_ai import AiError
-        from pricer_job import M_PENDING, quote_ladder
+        from pricer_job import M_PENDING, quote_ladder, split_items
 
+        segs = split_items(inp)
+        if len(segs) > 1:
+            return self.quote_job_multi(inp, segs, index, cutoff)
         q = quote_ladder(inp, index, cutoff)
         if q.method == M_PENDING:
             if self.dry_run:  # 시트에 안 쓰면 다음 바퀴에 또 미결 → 매 바퀴 API 비용. dry-run은 호출 안 함
@@ -315,13 +328,48 @@ class Pricer:
             return price, q.label(), ST_QUOTED, q.method, q.confidence
         return price, f"{gagyeon_tag(q.confidence)} {q.label()}", ST_CHECK, q.method, q.confidence or ""
 
+    def quote_job_multi(self, inp, segs, index, cutoff) -> tuple[str, str, str, str, str]:
+        """다품목 한 행 (E에 '+'로 품목 여럿): 구간마다 사다리, 미결 구간은 Claude 한 번 호출로 함께.
+        단가 칸 '60000/55000/50000', 산출근거는 구간별 '; ', confidence는 구간 중 최저이되 최대 mid
+        → 항상 '[가견적-…]' + 견적확인필요. 한 구간이라도 단가를 못 내면 단가 비우고 견적확인필요."""
+        from pricer_ai import AiError
+        from pricer_job import M_PENDING, quote_ladder
+
+        n = len(segs)
+        qs = [quote_ladder(s, index, cutoff) for s in segs]
+        pending = [i for i, q in enumerate(qs) if q.method == M_PENDING]
+
+        def joined(quotes):
+            return "; ".join(f"구간{i + 1} {q.label()}" for i, q in enumerate(quotes))
+
+        if pending:
+            why = None
+            if self.dry_run:  # 매 바퀴 API 비용 방지 (단품과 같음)
+                why = "dry-run AI 생략"
+            elif (ai := self.ai()) is None:
+                why = "AI 없음"
+            else:
+                try:
+                    for i, q in zip(pending, ai.quote_multi(inp, segs, qs, index, cutoff, tag=inp.client)):
+                        qs[i] = q
+                except AiError as e:
+                    why = str(e)
+            if why:
+                return "", f"미결 | 다품목 {n}구간: {joined(qs)} | {why}", ST_CHECK, M_PENDING, ""
+        conf = min((q.confidence or "low" for q in qs), key=lambda c: CONF_RANK[c])
+        if CONF_RANK[conf] > CONF_RANK[MULTI_MAX_CONF]:
+            conf = MULTI_MAX_CONF
+        price = "/".join(str(q.unit_price) for q in qs)
+        basis = f"{gagyeon_tag(conf)} 다품목 {n}구간 (최대 {MULTI_MAX_CONF}): {joined(qs)}"
+        return price, basis, ST_CHECK, "다품목", conf
+
     def process_job(self, key: str, scfg: dict, snap: dict) -> None:
         """임가공 시트. 확정 행 → 사다리/Claude 견적. 견적확인필요 행 → 사람이 단가를 고쳤으면 그 값으로 견적완료.
         확정으로 돌아온 가견적 행(사람이 상태 칸을 비움, 내용 지문 그대로) → 적힌 단가로 견적완료.
         임가공은 아직 발행기 미연결."""
         from datetime import date, timedelta
 
-        from pricer_job import JobInput
+        from pricer_job import JobInput, item_count
 
         cols = dict(scfg["columns"])
         cols.setdefault("pre_size", cols.get("stock_removal"))  # 시트 H 연마량/치대 = 정답지 pre_size
@@ -354,12 +402,25 @@ class Pricer:
 
             prev = self.job_quote_get(r["row_id"]) if status in (ST_CONFIRMED, ST_CHECK) else None
             human_price = norm_price_cell(price_cell)
-            if status == ST_CHECK:
+            human_edit = human_price and prev is not None and (
+                (status == ST_CHECK and human_price != (prev[0] or ""))
+                or (status == ST_CONFIRMED and prev[1] == (r.get("fp") or "") and GAGYEON_RE.match(body)))
+            n_items = item_count(JobInput.from_sheet_row(row, cols, "", "").raw) if human_edit else 1
+            if human_edit and len(human_price.split("/")) != n_items:
+                # 단가 개수 ≠ 품목 수 → 견적확인필요 유지 + 산출근거에 표시 (같은 표시가 이미 있으면 그대로)
+                g = GAGYEON_RE.match(body)
+                note = f"단가 개수 불일치 (단가 {len(human_price.split('/'))}개 ≠ 품목 {n_items}개)"
+                new_body = f"{g.group(0) if g else ''}{note} | {_job_body(body)}"
+                if new_body == body and status == ST_CHECK:
+                    continue
+                set_basis(new_body)
+                new_status, msg = ST_CHECK, f"사람 단가 {price_cell} — {note}"
+            elif status == ST_CHECK:
                 # 견적확인필요 + 사람이 단가를 고침(빈칸이던 것을 채운 것 포함) → 그 값으로 견적완료
                 if prev is None or not human_price or human_price == (prev[0] or ""):
                     continue
                 new_status = ST_QUOTED
-                basis = f"사람 수정 {price_cell} (에이전트 {prev[0] or '없음'}) | {GAGYEON_RE.sub('', body)}"
+                basis = f"사람 수정 {price_cell} (에이전트 {prev[0] or '없음'}) | {_job_body(body)}"
                 set_basis(basis)
                 self.job_quote_put(r["row_id"], human_price, r.get("fp"), "사람수정", "", basis)
                 msg = f"사람 단가 {price_cell} → 견적완료"
@@ -368,7 +429,7 @@ class Pricer:
                 # 가견적 행인데 내용 그대로 확정으로 돌아옴 = 사람이 상태 칸을 비움 → 적힌 단가로 견적완료
                 new_status = ST_QUOTED
                 who = "사람 확인" if human_price == prev[0] else f"사람 수정 {price_cell} (에이전트 {prev[0]})"
-                basis = f"{who} | {GAGYEON_RE.sub('', body)}"
+                basis = f"{who} | {_job_body(body)}"
                 set_basis(basis)
                 self.job_quote_put(r["row_id"], human_price, r.get("fp"), "사람확인", "", basis)
                 msg = f"{who} (상태 칸 비움) → 견적완료"
