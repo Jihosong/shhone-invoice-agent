@@ -106,6 +106,8 @@ class Issuer:
         filed = self.filed(key)
         counts = Counter()
         for block_id, rows in group_blocks(snap["rows"]):
+            if any(r.get("protected") for r in rows):
+                continue  # 재시작 첫 바퀴 보호 (지문 그대로) — 상태 전환은 다음 바퀴에
             statuses = {r["status"] for r in rows}
             authors = [self._cell(scfg, r, "author") for r in rows]
             if self.human_author(scfg, rows):

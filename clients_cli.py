@@ -303,6 +303,7 @@ def unresolved_from_sheets() -> list[str]:
     """두 시트 활성 탭에서 거래처를 못 찾은 묶음의 거래처 칸 원문 (dry-run 한 바퀴, 시트 쓰기 없음)."""
     import watcher
     w = watcher.Watcher(watcher.load_config(), dry_run=True)
+    w._first_done.update(w.cfg["sheets"])  # 읽기만 — 재시작 보호 바퀴·대량 재견적 판정 없이
     w.run_once()
     out: list[str] = []
     for snap in w.snapshots.values():

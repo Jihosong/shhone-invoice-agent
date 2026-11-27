@@ -6,6 +6,11 @@ common:
   credentials_file: C:/dev/secrets/gcp-service-account.json
   poll_interval_sec: 15           # Sheets API 할당량 계산은 README '폴링 주기와 API 할당량'
   quote_settle_min: 5            # 마지막 수정 후 N분 무변화 → 가견적
+  # 재시작 첫 바퀴 보호 (watcher): 켠 뒤 시트마다 첫 바퀴는 지문(hash_columns)이 DB와 같은 행의 상태·단가·산출근거를
+  #   바꾸지 않음 (시트 상태 칸이 DB와 다르면 WARNING만, 다음 바퀴부터 평소대로). 그 첫 바퀴에 견적 가진 행 중
+  #   다시 견적 단계(입력중/확정)로 갈 행이 이 비율을 넘고 3행 이상이면 ERROR '재시작 후 대량 재견적 감지' + 중단
+  #   (DB 되돌림·시트 쓰기·AI 없음). 일부러 많이 바꾼 경우에만 잠시 올리거나 0(끔)으로.
+  restart_requote_guard: 0.2
   # 감시 탭 (watcher.pick_active_tab, 위치 무관): ① '당월' 이름 탭 ② 오늘 달 'N월' 탭 ③ 직전 달 'N월' 탭 + WARNING
   #   (1월이면 12월). 같은 단계에 맞는 탭이 둘 이상이면 ERROR + 그 시트 처리 중단.
   #   월초 점검: 감시 탭에 오늘 달 날짜 행이 없고 지난달 행만 있으면 매 폴링 WARNING '당월 탭 갱신 필요'.

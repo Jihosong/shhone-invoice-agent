@@ -44,12 +44,24 @@ def _pipeline(dry_run: bool):
 
 
 def _quote_cycle(w, p) -> None:
-    """시트 감시 → 상태(입력중/확정/기존건 …) → 확정 행 단가 산출 → 둘의 시트 쓰기를 시트당 한 번에."""
+    """시트 감시 → 상태(입력중/확정/기존건 …) → 확정 행 단가 산출 → 둘의 시트 쓰기를 시트당 한 번에.
+    켠 뒤 첫 바퀴는 watcher 보호 모드 (지문 그대로인 행은 상태·쓰기 없음). 첫 바퀴에 대량 재견적이 감지되면
+    watcher가 RestartGuardError (DB 되돌림·쓰기 버림) → _guarded가 ERROR로 끝냄."""
     try:
         w.run_once()
         p.run_once(w.snapshots)
     finally:
         w.flush_writes()
+
+
+def _guarded(fn):
+    """재시작 후 대량 재견적 감지(watcher.RestartGuardError) → 종료 코드 2 (시트·DB 그대로)."""
+    import watcher
+
+    try:
+        return fn()
+    except watcher.RestartGuardError as e:
+        raise SystemExit(f"중단: {e}") from None
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -60,16 +72,18 @@ def cmd_run(args: argparse.Namespace) -> None:
     interval = int(cfg["common"].get("poll_interval_sec", 15))
     bundle_every = float((cfg.get("issue") or {}).get("bundle_interval_min", 3)) * 60
     last_bundle = None
+    cycles = 0
     while True:
         started = time.monotonic()
-        _quote_cycle(w, p)
+        _guarded(lambda: _quote_cycle(w, p))
+        cycles += 1
         # 명세표발행대기 표시·명세표발행완료(AI) 마감, 주기마다 outbox 파일 묶음 (dry-run이면 파일 안 만듦 → agent.py issue --dry-run)
         due = not args.dry_run and (last_bundle is None or started - last_bundle >= bundle_every)
         iss.run_once(w.snapshots, bundle=due)
         if due:
             last_bundle = started
         w.api.report()  # 1분마다 Sheets API 호출 수 (한도 사용자당 60/분)
-        if args.once:
+        if args.once and cycles >= 2:  # 첫 바퀴는 보호 모드라 --once는 보호 바퀴 + 평소 한 바퀴
             return
         time.sleep(max(0.0, interval - (time.monotonic() - started)))
 
@@ -78,7 +92,8 @@ def cmd_issue(args: argparse.Namespace) -> None:
     if not args.dry_run:
         _file_log()
     _, w, p, iss = _pipeline(args.dry_run)
-    _quote_cycle(w, p)
+    for _ in range(2):  # 첫 바퀴는 보호 모드 (지문 그대로인 행은 손대지 않음) → 평소 한 바퀴 더
+        _guarded(lambda: _quote_cycle(w, p))
     path = iss.run_once(w.snapshots, bundle=True)
     print(path if path else "새로 담을 명세표발행대기 묶음 없음")
 
@@ -131,6 +146,7 @@ def cmd_blocks(args: argparse.Namespace) -> None:
     import watcher
 
     w = watcher.Watcher(watcher.load_config(), dry_run=True)
+    w._first_done.update(w.cfg["sheets"])  # 목록만 (dry-run) — 재시작 보호 바퀴 없이 평소 판정으로 보여 줌
     w.run_once()  # dry-run: 시트 쓰기 없음, DB 롤백
     for key, snap in w.snapshots.items():
         print(f"== {snap['label']} / {snap['ws'].title} ({len({r['block_id'] for r in snap['rows']})}묶음)")

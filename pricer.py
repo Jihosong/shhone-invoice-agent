@@ -45,6 +45,9 @@ UNREG_MAX_CONF = "mid"
 _PRICE_CELL_RE = re.compile(r"\d[\d,]*(?:/\d[\d,]*)*")
 
 
+HUMAN_KEEP_DAYS = 90  # 이 기간 안의 사람 단가는 재견적 대신 복원 (사양이 같을 때)
+HUMAN_METHODS = ("사람수정", "사람확인")
+
 CONF_RANK = {"low": 0, "mid": 1, "high": 2}
 MULTI_MAX_CONF = "mid"   # 다품목 한 행 (E에 '+'로 품목 여럿) confidence 상한 → 항상 견적확인필요
 _MISMATCH_RE = re.compile(r"^단가 개수 불일치 \([^)]*\) \| ")
@@ -88,6 +91,28 @@ def requote_result(rq: dict, price: str, basis: str, status: str) -> tuple[str, 
 
 def gagyeon_tag(conf: str) -> str:
     return f"[가견적-{conf}]"
+
+
+def spec_sig(kind: str, row: list, cols: dict) -> str | None:
+    """사람 단가 복원 판정용 사양 서명 (JSON). 임가공: 품목 구간마다 [구경, 공차 하한, 상한, 기장, 수량].
+    호닝파이프: [규격, 길이, 수량, 구분]. 난이도·메모·거래처 칸은 안 봄. 사양을 하나도 못 읽으면 None (→ 지문 비교)."""
+    def cell(name):
+        i = cols.get(name)
+        return str(row[i - 1]).strip() if i and i - 1 < len(row) else ""
+
+    if kind == "pipe":
+        key = size_key(cell("size"))
+        if key is None:
+            return None
+        return json.dumps([key, re.sub(r"\s+", "", cell("length")).lower(), re.sub(r"\s+", "", cell("qty")),
+                           re.sub(r"[\s.]", "", cell("pipe_type")).upper()], ensure_ascii=False)
+    from pricer_job import JobInput, split_items
+
+    items = split_items(JobInput.from_sheet_row(row, cols, "", ""))
+    sig = [[i.dia, i.tol_lo, i.tol_hi, i.length, i.qty] for i in items]
+    if not any(s[0] is not None or (s[3] and s[4]) for s in sig):
+        return None
+    return json.dumps(sig)
 
 
 def norm_price_cell(text) -> str:
@@ -283,7 +308,8 @@ class Pricer:
             hcheck = r["status"] == ST_HCHECK and r.get("needs_quote")
             # 보류-미등록 (안정화 뒤): 단가표로 단가·산출근거만, 상태는 보류-미등록 그대로 (발행 차단)
             unreg = r["status"] == ST_UNREG and r.get("unreg_quote")
-            if (r["status"] != ST_CONFIRMED and not hcheck and not unreg) or r["author"] or r.get("legacy"):
+            if ((r["status"] != ST_CONFIRMED and not hcheck and not unreg) or r["author"] or r.get("legacy")
+                    or r.get("protected")):  # protected: 재시작 첫 바퀴 보호 행
                 continue
             row, rownum = r["row"], r["rownum"]
 
@@ -321,11 +347,22 @@ class Pricer:
                 new_status, msg = ST_QUOTED_EDIT, f"보류-미등록 해제, 사람 단가 {price_cell} 유지"
                 basis = f"사람 수정 {price_cell} (에이전트 {prev[0] or '없음'}) | {body[len(UNREG_TAG):].lstrip()}"
                 set_basis(basis)
-                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis)
+                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis,
+                                     spec_sig("pipe", row, cols))
             # 산출근거의 묶음 표시는 watcher가 붙인 것 — 그것만 있으면 근거 없는 것으로 봄
             elif price_cell and not body:
                 # 사람이 적은 가격 → 건드리지 않음
                 new_status, msg = ST_QUOTED, "사람 입력 가격 유지"
+            elif restored := self.human_restore(r["row_id"], r.get("fp"), spec_sig("pipe", row, cols)):
+                # 다시 계산하려는데 90일 이내 사람 단가 + 사양 같음 → 그 단가로 견적완료(사람수정)
+                hp, day, old_basis = restored
+                new_status = ST_QUOTED_EDIT
+                basis = self.restored_basis(hp, day, old_basis)
+                if norm_price_cell(price_cell) != hp:
+                    set_cell(rownum, "unit_price", int(hp) if hp.isdigit() else hp)
+                set_basis(basis)
+                self.job_quote_human(r["row_id"], hp, r.get("fp"), "사람수정", basis, spec_sig("pipe", row, cols))
+                msg = f"사람 단가 {hp} 복원 ({day} 사람 확정, 사양 같음 — 다시 계산 안 함)"
             else:
                 try:
                     price, basis = quote_pipe(table, cell(row, "size"), cell(row, "length"),
@@ -380,8 +417,9 @@ class Pricer:
     # 에이전트가 적은 임가공 단가·그때 지문 — 사람이 상태를 비웠는지/단가를 고쳤는지 판정용.
     # price·fp는 마지막으로 확인된 단가(사람 확정 뒤엔 사람 단가) — 판정용.
     # agent_*는 에이전트 견적 그대로 남기고 human_*는 사람 확정 단가 → "에이전트 vs 사람" 교정 세션 재료.
+    # human_spec·human_fp: 사람 확정 때의 사양 서명(spec_sig)·지문 — 재견적 대신 사람 단가 복원 판정 (human_restore)
     JOB_QUOTES_EXTRA = {"agent_price": "TEXT", "agent_method": "TEXT", "agent_conf": "TEXT",
-                        "human_price": "TEXT", "human_at": "TEXT"}
+                        "human_price": "TEXT", "human_at": "TEXT", "human_spec": "TEXT", "human_fp": "TEXT"}
 
     def _job_quotes_table(self) -> None:
         if getattr(self, "_jq_ready", False):
@@ -392,7 +430,7 @@ class Pricer:
         new = [c for c in self.JOB_QUOTES_EXTRA if c not in have]
         for c in new:
             self.con.execute(f"ALTER TABLE job_quotes ADD COLUMN {c} {self.JOB_QUOTES_EXTRA[c]}")
-        if new:  # 옛 행 채우기: 에이전트 견적 행은 그대로, 사람 행은 산출근거 '(에이전트 X)'에서
+        if set(new) & {"agent_price", "human_price"}:  # 옛 행 채우기: 에이전트 견적 행은 그대로, 사람 행은 산출근거 '(에이전트 X)'에서
             self.con.execute("UPDATE job_quotes SET agent_price=price, agent_method=method, agent_conf=confidence"
                              " WHERE agent_price IS NULL AND method NOT IN ('사람수정', '사람확인')")
             for rid, basis, price in self.con.execute(
@@ -422,8 +460,9 @@ class Pricer:
                          (row_id, p, fp or "", method, conf or "", basis, datetime.now().isoformat(timespec="seconds"),
                           p, method, conf or ""))
 
-    def job_quote_human(self, row_id, price, fp, method, basis) -> None:
-        """사람 확정 기록: price·fp·method·basis는 사람 것으로, agent_*는 그대로 두고 human_price·human_at 기록."""
+    def job_quote_human(self, row_id, price, fp, method, basis, spec=None) -> None:
+        """사람 확정 기록: price·fp·method·basis는 사람 것으로, agent_*는 그대로 두고 human_price·human_at 기록.
+        spec(spec_sig)·fp는 human_spec·human_fp로도 남김 → 나중에 재견적이 일어나도 사양이 같으면 이 단가로 복원."""
         if self.dry_run:
             return
         from datetime import datetime
@@ -431,7 +470,60 @@ class Pricer:
         self._job_quotes_table()
         p, ts = norm_price_cell(price), datetime.now().isoformat(timespec="seconds")
         self.con.execute("UPDATE job_quotes SET price=?, fp=?, method=?, confidence='', basis=?, quoted_at=?,"
-                         " human_price=?, human_at=? WHERE row_id=?", (p, fp or "", method, basis, ts, p, ts, row_id))
+                         " human_price=?, human_at=?, human_spec=?, human_fp=? WHERE row_id=?",
+                         (p, fp or "", method, basis, ts, p, ts, spec, fp or "", row_id))
+
+    def human_restore(self, row_id, fp, spec) -> tuple[str, str, str] | None:
+        """재견적하려는 행에 HUMAN_KEEP_DAYS 이내 사람 단가가 있고 사양이 같으면 (사람 단가, 확정일, 그때 산출근거).
+        사양 비교: 둘 다 spec_sig가 있으면 서명 비교 (난이도·메모·거래처 칸 변경은 무관), 아니면 지문 비교
+        (human_fp, 예전 기록은 사람 확정 행의 fp)."""
+        from datetime import datetime, timedelta
+
+        self._job_quotes_table()
+        got = self.con.execute("SELECT human_price, human_at, human_spec, human_fp, fp, method, basis FROM job_quotes"
+                               " WHERE row_id=?", (row_id,)).fetchone()
+        if not got or not got[0] or not got[1]:
+            return None
+        hp, at, hspec, hfp, qfp, method, basis = got
+        if at < (datetime.now() - timedelta(days=HUMAN_KEEP_DAYS)).isoformat(timespec="seconds"):
+            return None
+        if hspec and spec:
+            same = hspec == spec
+        else:
+            same = (hfp or (qfp if method in HUMAN_METHODS else "")) == (fp or "") and bool(fp)
+        return (hp, at[:10], basis or "") if same else None
+
+    def agent_reuse(self, row_id, fp, status) -> tuple[str, str, str] | None:
+        """확정 행인데 지난 에이전트 견적의 지문이 지금과 같음 (재견적 메모 없음) → (단가, 산출근거, 상태) 그대로.
+        내용이 안 바뀌었으면 같은 견적 — AI를 다시 부르지 않음 (재시작·상태 칸 지워짐 등). 단가를 못 낸 기록은 다시 견적."""
+        if status != ST_CONFIRMED or not fp or self.requote_get(row_id):
+            return None
+        self._job_quotes_table()
+        got = self.con.execute("SELECT price, fp, method, confidence, basis FROM job_quotes WHERE row_id=?",
+                               (row_id,)).fetchone()
+        if not got:
+            return None
+        price, qfp, method, conf, basis = got
+        basis = basis or ""
+        if qfp != fp or not price or method in HUMAN_METHODS or basis.startswith(UNREG_TAG):
+            return None
+        return price, basis, ST_QUOTED if conf == "high" and not GAGYEON_RE.match(basis) else ST_CHECK
+
+    def requote_clear(self, row_id) -> None:
+        if self.dry_run:
+            return
+        try:
+            self.con.execute("UPDATE rows SET requote=NULL WHERE row_id=? AND requote IS NOT NULL", (row_id,))
+        except sqlite3.OperationalError:  # rows 표가 없는 DB (pricer 단독 테스트)
+            pass
+
+    @staticmethod
+    def restored_basis(hp: str, day: str, old_basis: str) -> str:
+        """복원 산출근거: '사람 수정 60000/50000 (복원: 2026-11-26 사람 단가, 사양 같음 — AI 호출 없음) | 그때 근거'."""
+        tail = old_basis.split(" | ", 1)[1] if HUMAN_BASIS_RE.match(old_basis) and " | " in old_basis else old_basis
+        tail = re.sub(r"^(?:사람 (?:수정|확인)[^|]*\| ?)+", "", _job_body(tail)).strip()
+        head = f"사람 수정 {hp} (복원: {day} 사람 단가, 사양 같음 — AI 호출 없음)"
+        return f"{head} | {tail}" if tail else head
 
     def learn_sheet_row(self, r: dict, row: list, cols: dict, title: str) -> None:
         """사람이 확정한 임가공 행 → lines(source='sheet') 즉시 추가 (sheet_lines). 줄을 못 만들면 로그만."""
@@ -571,7 +663,7 @@ class Pricer:
             return row[i - 1].strip() if i and i - 1 < len(row) else ""
 
         for r in snap["rows"]:
-            if r["author"] or r.get("legacy"):
+            if r["author"] or r.get("legacy") or r.get("protected"):  # protected: 재시작 첫 바퀴 보호 행
                 continue
             status = r["status"]
             hcheck = status == ST_HCHECK and r.get("needs_quote")
@@ -630,7 +722,8 @@ class Pricer:
                 if human_price != prev[0]:  # 보류 중에 사람이 단가를 고침 → 그 값으로
                     new_status = ST_QUOTED_EDIT
                     basis = f"사람 수정 {price_cell} (에이전트 {prev[0]}) | {rest}"
-                    self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis)
+                    self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis,
+                                         spec_sig("job", row, cols))
                     learn = True
                 else:
                     index = index or self.job_index()
@@ -660,7 +753,8 @@ class Pricer:
                 new_status = ST_QUOTED_EDIT
                 basis = f"사람 수정 {price_cell} (에이전트 {prev[0] or '없음'}) | {_job_body(body)}"
                 set_basis(basis)
-                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis)
+                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis,
+                                     spec_sig("job", row, cols))
                 learn = True
                 msg = f"사람 단가 {price_cell} → {new_status}"
             elif (status == ST_CONFIRMED and prev is not None and prev[1] == (r.get("fp") or "")
@@ -672,11 +766,30 @@ class Pricer:
                 who = "사람 확인" if same else f"사람 수정 {price_cell} (에이전트 {prev[0]})"
                 basis = f"{who} | {_job_body(body)}"
                 set_basis(basis)
-                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람확인" if same else "사람수정", basis)
+                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람확인" if same else "사람수정", basis,
+                                     spec_sig("job", row, cols))
                 learn = True
                 msg = f"{who} (상태 칸 비움) → {new_status}"
             elif price_cell and not body:
                 new_status, msg = ST_QUOTED, "사람 입력 가격 유지"
+            elif restored := self.human_restore(r["row_id"], r.get("fp"), spec_sig("job", row, cols)):
+                # 재견적하려는데 90일 이내 사람 단가 + 사양 같음 → 그 단가로 견적완료(사람수정), AI 호출 없음
+                hp, day, old_basis = restored
+                new_status = ST_QUOTED_EDIT
+                basis = self.restored_basis(hp, day, old_basis)
+                if norm_price_cell(price_cell) != hp:
+                    set_cell(rownum, "unit_price", int(hp) if hp.isdigit() else hp)
+                set_basis(basis)
+                self.job_quote_human(r["row_id"], hp, r.get("fp"), "사람수정", basis, spec_sig("job", row, cols))
+                self.requote_clear(r["row_id"])
+                msg = f"사람 단가 {hp} 복원 ({day} 사람 확정, 사양 같음 — 재견적·AI 호출 안 함)"
+            elif (reuse := self.agent_reuse(r["row_id"], r.get("fp"), status)) is not None:
+                # 내용(지문) 그대로 다시 확정으로 옴 (상태 칸이 지워짐 등) → 지난 에이전트 견적 그대로, AI 호출 없음
+                price, basis, new_status = reuse
+                if norm_price_cell(price_cell) != price:
+                    set_cell(rownum, "unit_price", int(price) if price.isdigit() else price)
+                set_basis(basis)
+                msg = f"{price} 지난 견적 복원 (내용 그대로 — AI 호출 안 함)"
             else:
                 index = index or self.job_index()
                 inp = JobInput.from_sheet_row(row, cols, r.get("client_resolved") or "",

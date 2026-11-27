@@ -93,6 +93,8 @@ ST_PENDING = "명세표발행대기"  # 발행 조건 충족 → data/outbox 파
 ST_PENDING_EDITED = "명세표발행대기-수정됨"  # 파일에 담긴 뒤 행이 수정됨 → 올린 파일과 어긋남, 사람이 봐야 함
 # 파일에 담긴 뒤 사람 작성자가 붙음 → 사람처리지만 경리나라 중복 발행 확인 필요. 사람이 상태 칸을 비우면 보통 사람처리
 ST_HUMAN_CHECK = "사람처리-명세표중복확인"
+# 단가(에이전트 또는 사람)를 가진 상태 — 재시작 첫 바퀴 대량 재견적 판정의 분모
+QUOTE_HELD = frozenset({*QUOTED_STATES, ST_CHECK, ST_PENDING, ST_PENDING_EDITED, ST_HCHECK})
 # 옛 상태 이름 → 새 이름. 시트에 옛 이름이 남아 있으면 새 이름으로 보고 다음 쓰기에 바꿔 씀 (DB는 ensure_columns가 이전)
 LEGACY_STATUS_NAMES = {"발행대기": ST_PENDING, "발행대기-수정됨": ST_PENDING_EDITED, "AI발행": ST_ISSUED,
                        "AI발행-인쇄됨": ST_PRINTED, "사람처리-발행확인": ST_HUMAN_CHECK}
@@ -145,6 +147,18 @@ HUMAN_BASIS_RE = re.compile(r"^사람 (?:수정|확인)")  # 사람 확정 행�
 CHANGE_TAG_RE = re.compile(r"\[변경 [^\[\]]*\]")
 CHANGE_TAIL_RE = re.compile(r"(?:\s*\[변경 [^\[\]]*\])+\s*$")
 CHANGE_TAG_KEEP = 3
+
+# ---------------------------------------------------------------- 재시작 첫 바퀴 보호
+# 프로세스를 켠 뒤 시트마다 첫 바퀴는 '보호 모드': 지문(hash_columns)이 DB와 같은 행은 상태·단가·산출근거를
+# 어떤 경우에도 바꾸지 않고(시트 쓰기·DB 상태·pricer·issuer 모두 건너뜀) 다음 바퀴부터 평소대로.
+# 첫 바퀴에 '견적을 가진 행'(QUOTE_HELD) 중 다시 견적 단계(입력중/확정)로 갈 행이 RESTART_GUARD 비율을 넘고
+# RESTART_GUARD_MIN행 이상이면 ERROR '재시작 후 대량 재견적 감지' + 중단 (DB 되돌림, 시트 쓰기·AI 없음).
+RESTART_GUARD = 0.2       # sheets.yaml common.restart_requote_guard 로 조정 (0 이면 끔)
+RESTART_GUARD_MIN = 3
+
+
+class RestartGuardError(RuntimeError):
+    """재시작 첫 바퀴에 대량 재견적 감지 → 에이전트 중단."""
 
 
 def _short(v: str, n: int = 20) -> str:
@@ -845,6 +859,7 @@ class Watcher:
         self.alias_path: Path | None = ALIASES_YAML  # 매 바퀴 다시 읽음 (고치면 재시작 없이 반영)
         self.post_quote = post_quote_states(self.common["status_values"])
         self._log_state: dict[tuple, tuple | None] = {}
+        self._first_done: set[str] = set()  # 재시작 첫 바퀴(보호 모드)를 마친 시트
 
     def _log_on_change(self, ident: tuple, level: str | None, msg: str = "", *args) -> None:
         """같은 판정이면 매 바퀴 반복하지 않음 — ident(시트·묶음·종류)의 판정 문구가 바뀔 때만 로그.
@@ -862,6 +877,12 @@ class Watcher:
         for key, scfg in self.cfg["sheets"].items():
             try:
                 self.process_sheet(key, scfg)
+            except RestartGuardError:
+                # 이번 바퀴 것은 아무것도 남기지 않음: DB 되돌림, 모든 시트의 쓰기 버림 → 위로 올려 중단
+                self.con.rollback()
+                for snap in self.snapshots.values():
+                    snap.pop("writer", None)
+                raise
             except Exception:
                 logger.exception("sheet={} 처리 실패", key)
         if self.dry_run:
@@ -910,6 +931,8 @@ class Watcher:
             self.notify((key, "tab"), None)
 
         values = ws.get_all_values()
+        # 재시작 첫 바퀴(보호 모드): 지문이 DB와 같은 행은 상태·쓰기 없음 (RESTART_GUARD 설명)
+        first = key not in self.__dict__.setdefault("_first_done", set())
         gid = None if getattr(ws, "id", None) is None else str(ws.id)  # 탭 정체성 (이름이 같아도 다른 탭 구분)
         self.month_start_check(key, label, ws.title, values, scfg, today)
         width = max(cols.values())
@@ -944,6 +967,7 @@ class Watcher:
         counts = Counter()
         seen_ids: set[str] = set()
         snap_rows: list[dict] = []
+        guard_rows: list[dict] = []  # 재시작 첫 바퀴: 판정이 끝난 행 (대량 재견적 판정)
         self.snapshots[key] = {"ws": ws, "values": values, "rows": snap_rows, "label": label}
         if getattr(self, "defer_flush", False):
             self.snapshots[key]["writer"] = writer  # pricer가 같은 writer에 더함 → flush_writes()
@@ -980,6 +1004,7 @@ class Watcher:
                 return
             entries = blk["entries"]
             where = f"sheet={label} row={blk['rownum']}"
+            all_protected = all(e["protect"] for e in entries)  # 재시작 첫 바퀴 + 묶음 전체 지문 그대로
             if blk["client_log"]:
                 self._log_on_change((key, blk["id"], "client"), "INFO", where + " " + blk["client_log"][0],
                                     *blk["client_log"][1:])
@@ -1007,7 +1032,7 @@ class Watcher:
                 e["pq"] = None
                 e["final"] = watch_fields and self.post_quote_final(
                     e["status"], cell(e["row"], "basis") if "basis" in cols else "", pq_rules)
-                if e["final"] and not e["unknown_status"]:
+                if e["final"] and not e["unknown_status"] and not e["protect"]:
                     e["pq"] = self.post_quote_change(e, cols, cell(e["row"], "unit_price") if "unit_price" in cols
                                                      else "", pq_rules, stamp)
                 if e["pq"]:
@@ -1075,7 +1100,7 @@ class Watcher:
                     if e["new_status"] not in keep:
                         e["new_status"] = hold
             # 파일에 담긴 뒤 묶음이 수정됨 → 묶음 전체 명세표발행대기-수정됨 (새로 붙은 행 포함), 파일에서 뺀 것으로 기록
-            if filed and any(e["new_status"] == ST_PENDING_EDITED for e in entries):
+            if filed and not all_protected and any(e["new_status"] == ST_PENDING_EDITED for e in entries):
                 for e in entries:
                     if e["new_status"] not in (None, ST_SKIP, *ISSUED_STATES):
                         e["new_status"] = ST_PENDING_EDITED
@@ -1096,7 +1121,7 @@ class Watcher:
             # 사람이 묶음 안 아무 행의 상태 칸을 비우면 확인한 것으로 보고 보통 사람처리 (다시 표시 안 함).
             caution = ""
             human_acked = False
-            if filed and human and not blk["manual"]:
+            if filed and human and not blk["manual"] and not all_protected:
                 flag_at, ack_at = human_map.get(blk["id"], (None, None))
                 if not ack_at and flag_at and any(e["db_status"] == ST_HUMAN_CHECK and not e["status"]
                                                   for e in entries):
@@ -1127,6 +1152,21 @@ class Watcher:
                 tag_client += note if note.startswith("(") and note.endswith(")") else f"({note})"
             for pos, e in enumerate(entries, 1):
                 rownum, row_id, row = e["rownum"], e["row_id"], e["row"]
+                if first:
+                    guard_rows.append(e)
+                if e["protect"]:
+                    # 재시작 첫 바퀴 + 지문 그대로: 판정만 기록(e['would'] — 대량 재견적 판정용), 시트·DB 상태는 그대로.
+                    # pricer·issuer도 이 행은 건너뜀 → 다음 바퀴에 평소대로
+                    e["would"] = e["new_status"]
+                    counts["재시작보호"] += 1
+                    snap_rows.append({"rownum": rownum, "row_id": row_id, "row": row, "fp": e["fp"],
+                                      "status": e["status"], "author": e["author"], "legacy": e["legacy"],
+                                      "work_end_flipped_at": e["flipped_at"], "block_id": blk["id"],
+                                      "client_resolved": blk["client"], "client_reg_no": blk["reg_no"],
+                                      "client_note": e["client_note"], "block_date": blk["date"],
+                                      "block_label": tag_client, "needs_quote": False, "unreg_quote": False,
+                                      "block_tag": "", "protected": True})
+                    continue
                 extra = f" {blk['basis']}" if blk["basis"] else ""  # '동명→최근거래 번호'
                 if blk["manual"]:
                     tag = f"[수동처리: {blk['manual']}]"
@@ -1310,14 +1350,19 @@ class Watcher:
                 watch_prev = json.loads(db_watch) if rec is not None and db_watch else None
             except ValueError:
                 watch_prev = None
+            # 지난 값에 없는 칸(새로 감시하게 된 칸)은 '변경'이 아님 — 칸을 늘려도 재시작 때 거짓 변경이 안 생김
             watch_diff = None if watch_prev is None else {
-                f: (watch_prev.get(f, ""), v) for f, v in watch_now.items() if watch_prev.get(f, "") != v}
+                f: (watch_prev[f], v) for f, v in watch_now.items() if f in watch_prev and watch_prev[f] != v}
+            # 재시작 첫 바퀴 + 지문 그대로 → 보호 (상태·쓰기 없음). 감시 칸 기억도 다음 바퀴까지 그대로 둠
+            protect = first and rec is not None and not changed
+            watch_store = (db_watch if protect and db_watch else
+                           json.dumps(watch_now, ensure_ascii=False) if watch_fields else None)
             self.con.execute(
                 "UPDATE rows SET work_end_state=?, shipped_state=?, work_end_flipped_at=?, legacy=?,"
                 " block_id=?, client_resolved=?, client_reg_no=?, client_note=?, item_fp=?, watch_vals=?,"
                 " tab_gid=? WHERE row_id=?",
                 (work_end, shipped, flipped_at, int(legacy), block["id"], client, block["reg_no"], client_note,
-                 item_fp, json.dumps(watch_now, ensure_ascii=False) if watch_fields else None, gid, row_id))
+                 item_fp, watch_store, gid, row_id))
 
             # 상태는 묶음이 끝날 때 함께 결정 (finish_block)
             block["entries"].append({
@@ -1326,10 +1371,13 @@ class Watcher:
                 "work_end": work_end, "just_flipped": just_flipped,
                 "fp": fp, "changed": changed, "items_changed": items_changed, "is_new": rec is None, "db_status": db_status if rec else None, "last_change": last_change, "legacy": legacy,
                 "flipped_at": flipped_at, "client_log": client_log, "client_note": client_note,
-                "watch_diff": watch_diff})
+                "watch_diff": watch_diff, "protect": protect})
         finish_block(block)
+        if first:
+            self.restart_check(key, label, guard_rows)
         self.mark_deleted(key, label, ws.title, values, cols, scfg["data_start_row"], seen_ids, gid)
 
+        self._first_done.add(key)
         deferred = getattr(self, "defer_flush", False)
         written = 0 if deferred else writer.flush(ws, self.dry_run)
 
@@ -1344,6 +1392,37 @@ class Watcher:
             else f" 쓰기 대기={len(writer)} (pricer와 함께 씀)" if deferred
             else f" 쓰기={written}" + (f" (보류 {len(writer) - written})" if written != len(writer) else ""),
         )
+
+    def restart_check(self, key, label, entries: list[dict]) -> None:
+        """재시작 첫 바퀴 판정. 지문이 그대로인데 시트 상태 칸이 DB와 다른 행은 WARNING (이번 바퀴는 그대로 둠).
+        견적을 가진 행(DB 상태 QUOTE_HELD) 중 다시 견적 단계(입력중/확정 — 다음 바퀴부터 재견적·AI 재호출 대상)로 갈
+        행이 restart_requote_guard 비율(기본 20%)을 넘고 RESTART_GUARD_MIN행 이상이면 ERROR + RestartGuardError."""
+        held = [e for e in entries if not e["is_new"] and e["db_status"] in QUOTE_HELD]
+        back = []
+        for e in held:
+            st = e.get("would") if e["protect"] else e["new_status"]
+            if st in (ST_TYPING, ST_CONFIRMED):
+                why = "지문 변경" if e["changed"] else f"상태 칸 {e['status_raw'] or '빈칸'!r} (DB {e['db_status']})"
+                back.append(f"{e['rownum']}행 {why}")
+        mism = [e for e in entries if e["protect"] and not e["unknown_status"]
+                and (e["status"] or "") != (e["db_status"] or "")]
+        if mism:
+            logger.warning("sheet={} 재시작 첫 바퀴: 지문 그대로인데 상태 칸이 DB와 다른 행 {}개 — 이번 바퀴는 손대지 않음 ({})",
+                           label, len(mism), ", ".join(f"{e['rownum']}행 DB {e['db_status'] or '사람처리'}→시트 "
+                                                       f"{e['status_raw'] or '빈칸'}" for e in mism[:15])
+                           + (" …" if len(mism) > 15 else ""))
+        n, total = len(back), len(held)
+        logger.info("sheet={} 재시작 첫 바퀴 보호: 지문 그대로 {}행은 상태·쓰기 없음, 견적 가진 행 {}개 중 다시 견적 단계 {}개",
+                    label, sum(1 for e in entries if e["protect"]), total, n)
+        guard = self.common.get("restart_requote_guard", RESTART_GUARD)
+        if guard and total and n >= RESTART_GUARD_MIN and n / total > float(guard):
+            msg = (f"재시작 후 대량 재견적 감지: sheet={label} 견적 가진 행 {total}개 중 {n}개({n / total:.0%})가 다시 견적 "
+                   f"단계로 감 (기준 {float(guard):.0%}) → 중단 (시트 쓰기·AI 호출 없음, DB 되돌림). "
+                   f"원인(열 설정·시트 되돌리기·상태 칸 일괄 수정 등) 확인 후 다시 시작. 의도한 변경이면 sheets.yaml "
+                   f"common.restart_requote_guard 조정. 행: " + ", ".join(back[:20]) + (" …" if n > 20 else ""))
+            logger.error(msg)
+            notifier.notify(f"[{label}] " + msg)
+            raise RestartGuardError(msg)
 
     def month_start_check(self, key, label, title, values, scfg, today: date) -> None:
         """월초 점검: 감시 탭에 오늘 달 날짜 행이 없고 지난달 행만 있으면 매 폴링 WARNING (알림은 상태가 바뀔 때)."""
@@ -1466,10 +1545,16 @@ class Watcher:
         else:
             spec = [f for f in WATCH_SPEC if f in diff]
             stock = WATCH_STOCK in diff
-            if not diff or (e["changed"] and not (spec or stock)):
-                return None  # 지문은 바뀌었는데 사양·연마량 칸이 아님 (거래처 칸 등) → 예전 규칙
+            other = e["changed"] and not (spec or stock)  # 지문은 바뀌었는데 사양·연마량 칸이 아님 (거래처 칸 등)
+            if not human and (not diff or other):
+                return None  # 자동 견적 행 → 예전 규칙 (재견적)
+            if not diff and not other:
+                return None
             changes = [change_desc(re.sub(r"\d", "", rowcol_to_a1(1, cols[f])), *diff[f])
                        for f in WATCH_FIELDS if f in diff]
+            if other:  # 사람 단가 행은 어떤 내용 변경에도 AI 재견적으로 돌리지 않음 → 단가 유지 + 재확인
+                changes.append("사양 칸 밖(거래처 등) 변경")
+                reasons.append("내용 변경")
             if human and spec:
                 reasons.append("사양 변경")
             if auto and spec:
