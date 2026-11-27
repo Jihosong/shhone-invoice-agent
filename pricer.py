@@ -14,7 +14,9 @@ watcher가 한 바퀴 돈 뒤 그 결과(snapshot)를 받아 처리한다.
 """
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
@@ -53,6 +55,29 @@ def _job_body(body: str) -> str:
 def awaiting_human(body: str) -> bool:
     """단가는 적혀 있고 사람 확인을 기다리는 행: 가견적, 또는 사람 단가 유지 + 재확인 (watcher 견적 이후 변경)."""
     return bool(GAGYEON_RE.match(body) or RECHECK_RE.match(body))
+
+
+def _fmt_won(price: str) -> str:
+    """'25000' → '25,000', '6000/5000' → '6,000/5,000'."""
+    return "/".join(f"{int(p):,}" if p.isdigit() else p for p in re.sub(r"[\s,]", "", price or "").split("/"))
+
+
+def requote_result(rq: dict, price: str, basis: str, status: str) -> tuple[str, str, str]:
+    """견적완료 후 큰 변경 재견적 결과 → (단가, 산출근거, 상태).
+    high(견적완료) → '연마량 반영 재견적 25,000→32,000 | …'. mid/low → '[가견적-mid] 연마량 반영 재견적 … | …'
+    + 견적확인필요. 단가를 못 냄(미결·AI 실패) → 이전 단가 유지 + '[가견적-low] … 실패 — 이전 단가 유지' + 견적확인필요
+    (사람이 '확인'/비우면 적힌 이전 단가로 사람확인)."""
+    old, kind = rq.get("old_price") or "", rq.get("kind") or "재견적"
+    price = "" if price in (None, "") else str(price)
+    if not price:
+        if not old:
+            return price, f"{kind} 실패 | {basis}", ST_CHECK
+        return old, f"{gagyeon_tag('low')} {kind} 실패 — 이전 단가 {_fmt_won(old)} 유지 | {basis}", ST_CHECK
+    head = f"{kind} {_fmt_won(old) or '없음'}→{_fmt_won(price)}"
+    g = GAGYEON_RE.match(basis)
+    if g:
+        return price, f"{g.group(0)}{head} | {basis[g.end():]}", status
+    return price, f"{head} | {basis}", status
 
 
 def gagyeon_tag(conf: str) -> str:
@@ -447,6 +472,17 @@ class Pricer:
         basis = f"{gagyeon_tag(conf)} 다품목 {n}구간 (최대 {MULTI_MAX_CONF}): {joined(qs)}"
         return price, basis, ST_CHECK, "다품목", conf
 
+    def requote_get(self, row_id) -> dict | None:
+        """watcher가 남긴 재견적 메모 (견적완료 후 큰 변경). 없으면 None."""
+        try:
+            got = self.con.execute("SELECT requote FROM rows WHERE row_id=?", (row_id,)).fetchone()
+        except sqlite3.OperationalError:  # rows 표·열이 없는 DB (pricer 단독 테스트 등)
+            return None
+        try:
+            return json.loads(got[0]) if got and got[0] else None
+        except ValueError:
+            return None
+
     def process_job(self, key: str, scfg: dict, snap: dict) -> None:
         """임가공 시트. 확정 행 → 사다리/Claude 견적. 견적확인필요 행 → 사람이 단가를 고쳤으면 그 값으로 견적완료.
         확정으로 돌아온 가견적 행(사람이 상태 칸을 비움, 내용 지문 그대로) → 적힌 단가로 견적완료.
@@ -543,7 +579,15 @@ class Pricer:
                 index = index or self.job_index()
                 inp = JobInput.from_sheet_row(row, cols, r.get("client_resolved") or "",
                                               r.get("client_reg_no") or "", date.today())
+                rq = self.requote_get(r["row_id"]) if status == ST_CONFIRMED else None
+                if rq:
+                    old = rq.get("old_price") or ""
+                    inp.change_note = rq["note"] + (f" (변경 전 견적 {_fmt_won(old)}원)" if old else "")
                 price, basis, new_status, method, conf = self.quote_job_row(inp, index, cutoff)
+                if rq:
+                    price, basis, new_status = requote_result(rq, price, basis, new_status)
+                    if not self.dry_run:
+                        self.con.execute("UPDATE rows SET requote=NULL WHERE row_id=?", (r["row_id"],))
                 set_cell(rownum, "unit_price", price)
                 set_basis(basis)
                 self.job_quote_put(r["row_id"], price, r.get("fp"), method, conf, basis)

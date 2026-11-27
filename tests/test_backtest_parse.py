@@ -130,6 +130,12 @@ def test_header_map_differs_per_tab():
     assert "post_size" not in header_map(old) and "post_note" not in header_map(new)  # T·U 삭제: 읽지 않음
 
 
+@pytest.mark.parametrize("name", ["호닝 전 매니저 노트", "물품 세부 정보", "Informasi Bagian"])
+def test_header_map_s_column_aliases(name):
+    h = ["날짜", "거래처", "물품사진", "주요 메시지", "공차x갯수, 조도"] + [""] * 13 + [name]
+    assert header_map(h)["pre_note"] == 18
+
+
 def test_collect_rows_reads_old_and_new_tabs():
     """옛 탭(S·T·U 호닝 후 칸 있음)과 T·U 삭제 후 새 탭(상태·단가가 V·W)을 헤더 이름으로 둘 다 읽는다."""
     from backtest import collect_rows

@@ -77,6 +77,7 @@ class JobInput:
     material: list = field(default_factory=list)
     specials: list = field(default_factory=list)
     chidae: float | None = None   # 치대(연마량) mm, 절댓값
+    change_note: str = ""         # 견적완료 후 큰 변경으로 재견적할 때 (watcher requote) — AI 프롬프트에 명시
 
     @classmethod
     def from_raw(cls, raw: dict, client: str = "", reg_no: str = "", on_date: date | None = None) -> "JobInput":

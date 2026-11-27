@@ -136,6 +136,8 @@ def build_user_message(inp: JobInput, index: LineIndex, cutoff: date, exclude_id
              f"- 접수일: {inp.on_date.isoformat() if inp.on_date else '-'}",
              f"- 거래처: {inp.client or '(미해석)'}"]
     parts += [f"- {FIELD_LABELS[k]}: {v}" for k, v in inp.raw.items() if v]
+    if inp.change_note:
+        parts.append(f"- ※ 견적완료 후 변경: {inp.change_note}. 위 원문은 바뀐 뒤 내용이다 — 변경을 반영해 다시 견적하라.")
     if is_stock_removal(inp.raw.get("main_msg", "")):
         parts.append(f"  (D열 '{inp.raw['main_msg']}'은 부호·mm가 붙은 연마량(치대) 표기다. 단가가 아니다.)")
     parsed = [f"구경 {', '.join(f'Ø{d:g}' for d in inp.dia_all)}" if inp.dia_all else "구경 없음",
@@ -189,6 +191,8 @@ def build_multi_message(inp: JobInput, segs: list[JobInput], quotes: list[Quote]
              f"- 접수일: {inp.on_date.isoformat() if inp.on_date else '-'}",
              f"- 거래처: {inp.client or '(미해석)'}"]
     parts += [f"- {FIELD_LABELS[k]}: {v}" for k, v in inp.raw.items() if v]
+    if inp.change_note:
+        parts.append(f"- ※ 견적완료 후 변경: {inp.change_note}. 위 원문은 바뀐 뒤 내용이다 — 변경을 반영해 다시 견적하라.")
     if is_stock_removal(inp.raw.get("main_msg", "")):
         parts.append(f"  (D열 '{inp.raw['main_msg']}'은 부호·mm가 붙은 연마량(치대) 표기다. 단가가 아니다.)")
     parts.append(f"\n# 품목 구간 ({len(segs)}개 — 뒤 구간은 앞 구간의 재질·구경·공차·조도를 물려받은 글)")

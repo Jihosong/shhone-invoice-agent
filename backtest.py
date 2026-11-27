@@ -45,7 +45,7 @@ HEADER_FIELDS = {
     "spec_qty": ("공차x갯수,조도", "공차x갯수"),
     "difficulty": ("난이도",),
     "pre_size": ("호닝전치수", "연마량/치대"),
-    "pre_note": ("호닝전매니저노트",),
+    "pre_note": ("호닝전매니저노트", "물품세부정보", "InformasiBagian"),  # S열 (탭마다 이름이 다름)
 }
 RAW_LETTERS = {"main_msg": "D", "spec_qty": "E", "difficulty": "F", "pre_size": "H", "pre_note": "S"}  # 콘솔 표시용 (11월 탭 기준 글자)
 
