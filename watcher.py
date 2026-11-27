@@ -33,7 +33,7 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   '트리거 칸(임가공 작업시작·파이프 작업완료) 체크 → 발행 후보'는 묶음이 발행 조건(작성자 없음·기존건/보류/제외 아님·전 행 체크)을 만족할 때만.
   첫 묶음보다 위의 날짜 없는 행은 건너뜀. block_id = 묶음 첫 행의 row_id.
   확정 판정도 묶음 단위: 묶음 last_change = 묶음 안 품목 행 last_change 중 최신.
-  quote_settle_min이 안 지났으면 묶음 전체 '입력중', 지났으면 묶음 전체 함께 '확정'.
+  확정 대기(common.quote_settle_sec, 옛 설정 quote_settle_min)가 안 지났으면 묶음 전체 '입력중', 지났으면 묶음 전체 함께 '확정'.
   한 행이라도 바뀌면(알던 묶음에 행이 추가돼도) 견적 이후 단계 행까지 묶음 전체가 다시 입력중.
   보류-* 행이 하나라도 있으면 제외·사람처리·명세표발행완료(AI) 행을 뺀 묶음 전체를 같은 보류로.
   보류-미등록·보류-동명(같은 이름에 사업자번호 둘 이상)은 매 바퀴 재검사 → 풀리면 자동 해제.
@@ -314,7 +314,21 @@ CURRENT_TAB = "당월"  # 이 이름의 탭이 있으면 위치·달과 무관�
 # (사다리·지시문·사람 확인·즉시 학습 동일, 작업완료·발행·명세표 처리 없음). 스냅샷 키는 '<시트>#견적'.
 QUOTE_TAB = "견적"
 QUOTE_SUFFIX = "#견적"
-QUOTE_TAB_SETTLE_MIN = 1      # common.quote_tab_settle_min 기본값 (분)
+QUOTE_TAB_SETTLE_SEC = 15     # common.quote_tab_settle_sec 기본값 (초)
+QUOTE_SETTLE_SEC = 15         # common.quote_settle_sec 기본값 (초)
+# 레이덱스 본인 거래처(sheets.yaml raydex_filter.client) → 묶음 전체 사람처리, 산출근거 '[수동처리: 레이덱스 — 거래 단절]'
+RAYDEX_CUT_REASON = "레이덱스 — 거래 단절"
+
+
+def settle_seconds(common: dict, quote: bool = False) -> float:
+    """확정 대기(초). quote_settle_sec / quote_tab_settle_sec 우선, 없으면 옛 분 단위 설정 × 60, 그것도 없으면 기본값."""
+    sec, mins, default = (("quote_tab_settle_sec", "quote_tab_settle_min", QUOTE_TAB_SETTLE_SEC) if quote
+                          else ("quote_settle_sec", "quote_settle_min", QUOTE_SETTLE_SEC))
+    if common.get(sec) is not None:
+        return float(common[sec])
+    if common.get(mins) is not None:
+        return float(common[mins]) * 60
+    return float(default)
 QUOTE_FREEZE_DAYS = 30        # 행 날짜(없으면 처음 본 날)가 이만큼 지나면 '[견적만]' 붙이고 더는 안 건드림
 QUOTE_ONLY_TAG = "[견적만]"
 
@@ -969,7 +983,7 @@ class Watcher:
     def process_tab(self, key: str, scfg: dict, ws, label: str, today: date, quote: bool = False,
                     reserved_ids: set[str] = frozenset()) -> set[str]:
         """탭 하나 처리 → 이 탭의 행ID 집합. quote=True면 '견적' 탭 (견적만):
-        스냅샷 키 '<시트>#견적'(pricer는 견적·즉시 학습, 발행기는 안 봄), 확정 대기 common.quote_tab_settle_min(기본 1분),
+        스냅샷 키 '<시트>#견적'(pricer는 견적·즉시 학습, 발행기는 안 봄), 확정 대기 common.quote_tab_settle_sec(기본 15초),
         작업시작·작업완료·출고완료 칸 무시(기존건·발행 후보 없음), 월초 점검 없음. 행 날짜(없으면 처음 본 날)가
         QUOTE_FREEZE_DAYS(30일) 지난 행은 산출근거 앞에 '[견적만]'을 붙이고 더는 건드리지 않음.
         reserved_ids: 다른 탭(견적 탭)이 쓰는 행ID — 이 탭에 같은 ID가 있으면(복사) 새 ID 부여."""
@@ -1002,8 +1016,10 @@ class Watcher:
             except Exception:
                 pricing = self.cfg.get("pricing") or {}
             pq_rules.update({k: v for k, v in pricing.items() if k in CHIDAE_DEFAULTS})
-        settle = timedelta(minutes=float(self.common.get("quote_tab_settle_min", QUOTE_TAB_SETTLE_MIN) if quote
-                                         else self.common["quote_settle_min"]))
+        settle = timedelta(seconds=settle_seconds(self.common, quote))
+        # 레이덱스 본인 거래처 키 (raydex_filter.enabled일 때만) — 표기 변환표까지 거친 비교 키
+        rx = (self.cfg.get("raydex_filter") or {}) if isinstance(getattr(self, "cfg", None), dict) else {}
+        rx_key = master.norm.key(str(rx.get("client") or ""))[0] if rx.get("enabled") else ""
         ai = self.common["author_ai_value"]
         skip_clients = [norm_text(c) for c in self.common.get("skip_clients") or []]
         now = datetime.now()
@@ -1061,7 +1077,8 @@ class Watcher:
             where = f"sheet={label} row={blk['rownum']}"
             all_protected = all(e["protect"] for e in entries)  # 재시작 첫 바퀴 + 묶음 전체 지문 그대로
             if blk["client_log"]:
-                self._log_on_change((key, blk["id"], "client"), "INFO", where + " " + blk["client_log"][0],
+                self._log_on_change((key, blk["id"], "client"), blk.get("client_log_level", "INFO"),
+                                    where + " " + blk["client_log"][0],
                                     *blk["client_log"][1:])
             else:
                 self._log_on_change((key, blk["id"], "client"), None)
@@ -1305,6 +1322,11 @@ class Watcher:
             if cell(row, "date"):  # 묶음 첫 행
                 finish_block(block)
                 res = master.resolve_full(client_text) if client_text else Resolution(None, "", hold=ST_UNREG)
+                raydex = bool(rx_key) and not res.manual and (
+                    master.norm.key(res.name)[0] == rx_key if res.name and res.hold != ST_UNREG
+                    else master.norm.key(client_text)[0].startswith(rx_key))
+                if raydex:  # 레이덱스 본인 → 거래 단절: 묶음 전체 사람처리 (manual_clients와 같은 길)
+                    res = Resolution(client_text.strip(), "", how="레이덱스", manual=RAYDEX_CUT_REASON)
                 client_note = res.note
                 resolved = None if res.hold == ST_UNREG or res.manual else res.name
                 block = {"rownum": rownum, "row": row, "client": resolved, "authors": [],
@@ -1314,7 +1336,10 @@ class Watcher:
                 counts["묶음"] += 1
                 cands = " | ".join(f"{c.name} {c.reg_no or '-'} 최근{c.last_date or '-'}" for c in res.candidates)
                 # 거래처 판정 로그는 finish_block에서 판정이 바뀔 때만 (매 폴링 반복 금지)
-                if res.manual:
+                if raydex:
+                    block["client_log"] = ("거래처 {!r} {} → 묶음 사람처리", client_text, RAYDEX_CUT_REASON)
+                    block["client_log_level"] = "WARNING"
+                elif res.manual:
                     block["client_log"] = ("거래처 {!r} 수동처리 ({}) → 묶음 사람처리", client_text, res.manual)
                 elif res.hold == ST_HCHECK:
                     block["client_log"] = ("거래처 {!r} {}", client_text, res.notice)

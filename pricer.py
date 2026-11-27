@@ -26,6 +26,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from pricer_job import RAYDEX_MAX_CONF, raydex_client, raydex_hint, raydex_mark, raydex_similar, split_raydex
 from watcher import (QUOTE_SUFFIX, QUOTED_STATES, RECHECK_RE, ST_HCHECK, ST_QUOTED_EDIT, ST_QUOTED_OK, ST_UNREG,
                      SheetWriter, strip_block_tag, with_block_tag)
 
@@ -55,14 +56,17 @@ _MISMATCH_RE = re.compile(r"^단가 개수 불일치 \([^)]*\) \| ")
 
 def _job_body(body: str) -> str:
     """산출근거에서 에이전트 표시('[가견적-…]', '단가 개수 불일치 …')를 뗀 본문.
-    재확인 표시 '[연마량 -0.3 추가(…) — 단가 재확인] 사람 단가 N 유지'는 사유만 남김 ('연마량 -0.3 추가(…) | …')."""
+    재확인 표시 '[연마량 -0.3 추가(…) — 단가 재확인] 사람 단가 N 유지'는 사유만 남김 ('연마량 -0.3 추가(…) | …').
+    맨 앞 '※레이덱스 유사품 (…) ' 표시는 남김."""
+    mark, body = split_raydex(body)
     body = _MISMATCH_RE.sub("", GAGYEON_RE.sub("", body))
     m = RECHECK_RE.match(body)
-    return f"{m.group(1)} | {body[m.end():]}".rstrip(" |") if m else body
+    return mark + (f"{m.group(1)} | {body[m.end():]}".rstrip(" |") if m else body)
 
 
 def awaiting_human(body: str) -> bool:
     """단가는 적혀 있고 사람 확인을 기다리는 행: 가견적, 또는 사람 단가 유지 + 재확인 (watcher 견적 이후 변경)."""
+    body = split_raydex(body)[1]
     return bool(GAGYEON_RE.match(body) or RECHECK_RE.match(body))
 
 
@@ -77,6 +81,10 @@ def requote_result(rq: dict, price: str, basis: str, status: str) -> tuple[str, 
     + 견적확인필요. 단가를 못 냄(미결·AI 실패) → 이전 단가 유지 + '[가견적-low] … 실패 — 이전 단가 유지' + 견적확인필요
     (사람이 '확인'/비우면 적힌 이전 단가로 사람확인)."""
     old, kind = rq.get("old_price") or "", rq.get("kind") or "재견적"
+    mark, basis = split_raydex(basis)
+    if mark:
+        p, b, st = requote_result(rq, price, basis, status)
+        return p, mark + b, st
     price = "" if price in (None, "") else str(price)
     if not price:
         if not old:
@@ -516,7 +524,8 @@ class Pricer:
         basis = basis or ""
         if qfp != fp or not price or method in HUMAN_METHODS or basis.startswith(UNREG_TAG):
             return None
-        return price, basis, ST_QUOTED if conf == "high" and not GAGYEON_RE.match(basis) else ST_CHECK
+        return price, basis, (ST_QUOTED if conf == "high" and not GAGYEON_RE.match(split_raydex(basis)[1])
+                              else ST_CHECK)
 
     def requote_clear(self, row_id) -> None:
         if self.dry_run:
@@ -558,12 +567,32 @@ class Pricer:
         """JobInput → (단가 칸, 산출근거, 상태, method, confidence). 사다리 → 미결이면 Claude.
         confidence high만 견적완료, mid/low는 '[가견적-mid/low]' + 견적확인필요, 실패는 단가 없이 견적확인필요.
         max_conf: AI 결과 confidence 상한 (보류-미등록 가견적 → mid). 사다리의 max_conf와 둘 중 낮은 쪽."""
-        from pricer_ai import AiError
-        from pricer_job import M_PENDING, quote_ladder, split_items
+        from pricer_job import split_items
 
         segs = split_items(inp)
+        rx_client = raydex_client(self.cfg)
+        rx = [raydex_similar(s, index, cutoff, rx_client) for s in segs] if rx_client else [None] * len(segs)
+        if any(rx):
+            ln = next(x for x in rx if x)
+            logger.info("레이덱스 유사품 거래처={} 입력 {!r} → {} (최대 {})", inp.client or "-",
+                        inp.raw.get("spec_qty") or inp.raw.get("main_msg"), raydex_mark(ln).strip(), RAYDEX_MAX_CONF)
         if len(segs) > 1:
-            return self.quote_job_multi(inp, segs, index, cutoff)
+            out = self.quote_job_multi(inp, segs, index, cutoff, rx)
+        else:
+            out = self._quote_job_one(inp, index, cutoff, max_conf, rx[0])
+        if not any(rx):
+            return out
+        price, basis, status, method, conf = out
+        if status == ST_QUOTED:  # high → 최대 mid: 사람이 단가를 정하게
+            conf, status = RAYDEX_MAX_CONF, ST_CHECK
+            basis = f"{gagyeon_tag(conf)} {re.sub(r' [|] high$', ' | ' + conf, basis)}"
+        return price, raydex_mark(next(x for x in rx if x)) + basis, status, method, conf
+
+    def _quote_job_one(self, inp, index, cutoff, max_conf=None, rx=None) -> tuple[str, str, str, str, str]:
+        """품목 하나 견적 (quote_job_row 참고). rx: 레이덱스 유사품 줄 → AI 프롬프트 참고 문구 + 최대 mid."""
+        from pricer_ai import AiError
+        from pricer_job import M_PENDING, quote_ladder
+
         q = quote_ladder(inp, index, cutoff)
         if q.method == M_PENDING:
             head = f"{q.tag} 미결" if q.tag else "미결"   # 운영자 지시 행 → '[지시] 미결 | …'
@@ -573,10 +602,11 @@ class Pricer:
             if ai is None:
                 return "", f"{head} | {q.basis} | AI 없음", ST_CHECK, M_PENDING, ""
             try:
-                caps = [c for c in (q.max_conf, max_conf) if c]
+                caps = [c for c in (q.max_conf, max_conf, RAYDEX_MAX_CONF if rx else None) if c]
                 cap = min(caps, key=lambda c: CONF_RANK[c]) if caps else None
                 extra = {"directive": q.directive} if q.directive else {}
-                q = ai.quote(inp, index, cutoff, hint=q.hint, tag=inp.client, max_conf=cap, **extra)
+                hint = " / ".join(h for h in (raydex_hint(rx) if rx else "", q.hint) if h)
+                q = ai.quote(inp, index, cutoff, hint=hint, tag=inp.client, max_conf=cap, **extra)
             except AiError as e:
                 return "", f"{head} | {q.basis} | {e}", ST_CHECK, M_PENDING, ""
         elif q.unit_price is None and not q.item_prices:
@@ -587,7 +617,7 @@ class Pricer:
             return price, q.label(), ST_QUOTED, q.method, q.confidence
         return price, f"{gagyeon_tag(q.confidence)} {q.label()}", ST_CHECK, q.method, q.confidence or ""
 
-    def quote_job_multi(self, inp, segs, index, cutoff) -> tuple[str, str, str, str, str]:
+    def quote_job_multi(self, inp, segs, index, cutoff, rx=None) -> tuple[str, str, str, str, str]:
         """다품목 한 행 (E에 '+'로 품목 여럿): 구간마다 사다리, 미결 구간은 Claude 한 번 호출로 함께.
         단가 칸 '60000/55000/50000', 산출근거는 구간별 '; ', confidence는 구간 중 최저이되 최대 mid
         → 항상 '[가견적-…]' + 견적확인필요. 한 구간이라도 단가를 못 내면 단가 비우고 견적확인필요."""
@@ -597,6 +627,9 @@ class Pricer:
         n = len(segs)
         qs = [quote_ladder(s, index, cutoff) for s in segs]
         pending = [i for i, q in enumerate(qs) if q.method == M_PENDING]
+        for i in pending:  # 레이덱스 유사품 구간 → AI 프롬프트 그 구간 줄에 참고 문구
+            if rx and rx[i]:
+                qs[i].hint = " / ".join(h for h in (raydex_hint(rx[i]), qs[i].hint) if h)
 
         def joined(quotes):
             return "; ".join(f"구간{i + 1} {q.label()}" for i, q in enumerate(quotes))
@@ -644,7 +677,8 @@ class Pricer:
         """보류-미등록 행 가견적 → (단가 칸, 산출근거, method, confidence). 거래처 없이(inp.client='') 사다리를 돌리므로
         동일품·거래처 과거 단가는 자연히 건너뜀: D열 사전단가 → AI(최대 mid). 산출근거 '[가견적-미등록 거래처] …'."""
         price, basis, _, method, conf = self.quote_job_row(inp, index, cutoff, max_conf=UNREG_MAX_CONF)
-        return price, f"{UNREG_TAG} {GAGYEON_RE.sub('', basis)}", method, conf
+        mark, basis = split_raydex(basis)
+        return price, f"{UNREG_TAG} {mark}{GAGYEON_RE.sub('', basis)}", method, conf
 
     @staticmethod
     def promote_unreg(inp, prev_method, prev_conf, body, index, cutoff) -> tuple[str, str]:
@@ -653,7 +687,10 @@ class Pricer:
         AI·다품목 → 적힌 단가 그대로 '[가견적-mid/low]' + 견적확인필요."""
         from pricer_job import M_PRESET, quote_preset
 
-        rest = body[len(UNREG_TAG):].lstrip()
+        mark, rest = split_raydex(body[len(UNREG_TAG):].lstrip())
+        if mark:  # 레이덱스 유사품 → 최대 mid (사람이 단가를 정함)
+            conf = prev_conf if prev_conf in ("mid", "low") else RAYDEX_MAX_CONF
+            return f"{mark}{gagyeon_tag(conf)} {GAGYEON_RE.sub('', rest)} | 거래처 등록 후", ST_CHECK
         if prev_method == M_PRESET:
             q = quote_preset(inp, index, cutoff)
             if q is not None and q.confidence == "low":
@@ -757,12 +794,14 @@ class Pricer:
                 msg = f"보류-미등록 해제 → {new_status} (단가 {price_cell}, 재호출 없음)"
             elif human_edit and len(human_price.split("/")) != n_items:
                 # 단가 개수 ≠ 품목 수 → 견적확인필요 유지 + 산출근거에 표시 (같은 표시가 이미 있으면 그대로)
-                g, rc = GAGYEON_RE.match(body), RECHECK_RE.match(body)
+                mark, rest = split_raydex(body)
+                g, rc = GAGYEON_RE.match(rest), RECHECK_RE.match(rest)
                 note = f"단가 개수 불일치 (단가 {len(human_price.split('/'))}개 ≠ 품목 {n_items}개)"
                 if rc:  # 재확인 표시는 남김 (사람이 '확인'하면 적힌 단가로 사람확인)
-                    new_body = f"[{rc.group(1)} — 단가 재확인] | {note} | {_MISMATCH_RE.sub('', body[rc.end():])}"
+                    new_body = f"[{rc.group(1)} — 단가 재확인] | {note} | {_MISMATCH_RE.sub('', rest[rc.end():])}"
                 else:
-                    new_body = f"{g.group(0) if g else ''}{note} | {_job_body(body)}"
+                    new_body = f"{g.group(0) if g else ''}{note} | {_job_body(rest)}"
+                new_body = mark + new_body
                 if new_body == body and status == ST_CHECK:
                     continue
                 set_basis(new_body)

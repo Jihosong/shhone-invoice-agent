@@ -33,8 +33,8 @@ def test_sheets_yaml_uses_new_names_and_intervals():
     assert {ST_PENDING, ST_POST_EDIT, ST_ISSUED, ST_PRINTED, ST_HUMAN_CHECK} <= set(values)
     assert not OLD & known_states(values)
     assert cfg["common"]["poll_interval_sec"] == 15 and cfg["issue"]["bundle_interval_min"] == 3
-    assert cfg["common"]["quote_settle_min"] == 2 and cfg["common"]["quote_tab_settle_min"] == 1
-    assert cfg["issue"]["bundle_grace_min"] == 2 and cfg["sheets"]["pipe"]["bundle_grace_min"] == 0
+    assert cfg["common"]["quote_settle_sec"] == 15 and cfg["common"]["quote_tab_settle_sec"] == 15
+    assert cfg["issue"]["bundle_grace_min"] == 1 and cfg["sheets"]["pipe"]["bundle_grace_min"] == 0
     assert cfg["sheets"]["imgagong"]["issue_trigger"] == "work_start"
     assert cfg["sheets"]["pipe"]["issue_trigger"] == "work_end"
 

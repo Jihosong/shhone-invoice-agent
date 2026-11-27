@@ -457,6 +457,80 @@ def quote_directive(inp: JobInput, text: str, index: LineIndex | None, cutoff_da
     return Quote(M_PENDING, basis="운영자 지시 → AI", directive=text, tag=DIRECTIVE_TAG)
 
 
+# ---------------------------------------------------------------- 레이덱스 유사품 필터 (한 회사 전용)
+# config/sheets.yaml raydex_filter: {client: "(주)레이덱스", enabled: true}. 임가공 견적(당월·견적 탭)에서 거래처가
+# 누구든 그 회사의 과거 품목(kind=job, 전 기간 — cutoff 이전)과 아래가 모두 맞으면 유사품:
+#   재질: 시트에 SUS만 적혔거나 재질 미기재 (다른 재질이 적히면 아님)
+#   사각: 시트에 '사각' 명시 또는 미기재 — 어느 쪽이든 통과 (막는 조건 없음)
+#   구경 차이 ≤ 0.1mm / 공차 상·하한 각각 차이 ≤ 0.02 (한쪽에 공차 없으면 통과) / 기장 차이 ≤ 10mm (한쪽에 없으면 통과)
+# 맞으면 산출근거 맨 앞 '※레이덱스 유사품 (2026-11-19 Ø28 +0.05~+0.06 L300 150,000원) ', confidence 최대 mid
+# (견적확인필요), AI 프롬프트에 '※ 레이덱스 유사품: 과거 단가 … 이보다 낮게 내지 말 것'. 그 회사 본인 행은 watcher가 사람처리.
+RAYDEX_DIA_TOL = 0.1     # mm
+RAYDEX_TOL_TOL = 0.02    # 공차 상·하한 각각
+RAYDEX_LEN_TOL = 10.0    # mm
+RAYDEX_MAX_CONF = "mid"
+RAYDEX_MARK = "※레이덱스 유사품"
+RAYDEX_MARK_RE = re.compile(r"^※레이덱스 유사품 \([^()]*\) ")
+_EPS = 1e-9
+
+
+def raydex_client(cfg: dict | None) -> str | None:
+    """설정의 레이덱스 거래처명 (raydex_filter.enabled가 참이고 client가 있을 때만)."""
+    f = (cfg or {}).get("raydex_filter") or {}
+    return str(f["client"]).strip() if f.get("enabled") and str(f.get("client") or "").strip() else None
+
+
+def _near(a, b, tol) -> bool:
+    return abs(float(a or 0) - float(b or 0)) <= tol + _EPS
+
+
+def raydex_ok(inp: JobInput, ln: DbLine) -> bool:
+    """시트 행(inp)과 레이덱스 과거 줄(ln)이 유사품 조건을 모두 만족하는지."""
+    mats = set(inp.material)
+    if mats and mats != {"SUS"}:
+        return False
+    if inp.dia is None or ln.dia is None or not _near(inp.dia, ln.dia, RAYDEX_DIA_TOL):
+        return False
+    if inp.tol_hi is not None and ln.tol_hi is not None and not (
+            _near(inp.tol_lo, ln.tol_lo, RAYDEX_TOL_TOL) and _near(inp.tol_hi, ln.tol_hi, RAYDEX_TOL_TOL)):
+        return False
+    return not inp.length or not ln.length or _near(inp.length, ln.length, RAYDEX_LEN_TOL)
+
+
+def raydex_similar(inp: JobInput, index: LineIndex | None, cutoff_date: date, client: str | None) -> DbLine | None:
+    """레이덱스 유사품 중 가장 최근 줄 (없으면 None). client=None이면 필터 꺼짐."""
+    if not client or index is None or inp.dia is None:
+        return None
+    cands = [ln for ln in index.client_lines("", client)
+             if ln.date < cutoff_date and ln.unit_price and ln.unit_price > 0 and raydex_ok(inp, ln)]
+    return max(cands, key=lambda ln: (ln.date, ln.id)) if cands else None
+
+
+def raydex_desc(ln: DbLine, price: bool = True) -> str:
+    """'2026-11-19 Ø28 +0.05~+0.06 L300 150,000원' (price=False면 단가 뺌)."""
+    parts = [ln.date.isoformat(), f"Ø{ln.dia:g}"]
+    if ln.tol_hi is not None:
+        parts.append(f"{float(ln.tol_lo or 0):+g}~{float(ln.tol_hi):+g}")
+    if ln.length:
+        parts.append(f"L{ln.length:g}")
+    return " ".join(parts) + (f" {int(ln.unit_price):,}원" if price else "")
+
+
+def raydex_mark(ln: DbLine) -> str:
+    return f"{RAYDEX_MARK} ({raydex_desc(ln)}) "
+
+
+def raydex_hint(ln: DbLine) -> str:
+    """AI 프롬프트 참고 줄 (build_user_message가 앞에 '※ '를 붙임)."""
+    return f"레이덱스 유사품: 과거 단가 {int(ln.unit_price):,}원 ({raydex_desc(ln, False)}) — 이보다 낮게 내지 말 것"
+
+
+def split_raydex(body: str) -> tuple[str, str]:
+    """산출근거 본문 → (레이덱스 표시(없으면 ''), 나머지)."""
+    m = RAYDEX_MARK_RE.match(body or "")
+    return (m.group(0), body[m.end():]) if m else ("", body or "")
+
+
 # ---------------------------------------------------------------- 다품목 (한 행에 품목 여럿)
 def _item_src_field(raw: dict) -> str:
     """품목 구간을 나눌 칸: E에 구경이 있으면 E, 아니면 D (parse_row·발행 줄과 같은 기준)."""
