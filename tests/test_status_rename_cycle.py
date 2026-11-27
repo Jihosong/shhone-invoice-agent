@@ -12,17 +12,17 @@ from tests.test_issuer import TWO_ROWS, ready
 from tests.test_issuer_job import JOB_COLS, REG
 from tests.test_watcher_legacy import FakeWS, make_watcher
 from tests.test_watcher_settle import age_all
-from watcher import (LEGACY_STATUS_NAMES, ST_CONFIRMED, ST_HUMAN_CHECK, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED,
+from watcher import (LEGACY_STATUS_NAMES, ST_CONFIRMED, ST_HUMAN_CHECK, ST_ISSUED, ST_PENDING, ST_POST_EDIT,
                      ST_PRINTED, ST_QUOTED, ST_QUOTED_EDIT, ST_QUOTED_OK, ApiMeter, SheetWriter, ensure_columns,
                      known_states, load_config)
 
-OLD = {"발행대기", "발행대기-수정됨", "AI발행", "AI발행-인쇄됨", "사람처리-발행확인"}
+OLD = {"발행대기", "발행대기-수정됨", "AI발행", "AI발행-인쇄됨", "사람처리-발행확인", "명세표발행대기-수정됨"}
 
 
 # ---------------------------------------------------------------- 이름·설정
 def test_new_names():
-    assert (ST_PENDING, ST_PENDING_EDITED, ST_ISSUED, ST_PRINTED, ST_HUMAN_CHECK) == (
-        "명세표발행대기", "명세표발행대기-수정됨", "명세표발행완료(AI)", "명세표인쇄완료(AI)", "사람처리-명세표중복확인")
+    assert (ST_PENDING, ST_POST_EDIT, ST_ISSUED, ST_PRINTED, ST_HUMAN_CHECK) == (
+        "명세표발행대기", "발행후수정-확인", "명세표발행완료(AI)", "명세표인쇄완료(AI)", "사람처리-명세표중복확인")
     assert set(LEGACY_STATUS_NAMES) == OLD
 
 
@@ -30,9 +30,13 @@ def test_sheets_yaml_uses_new_names_and_intervals():
     cfg = load_config()
     values = cfg["common"]["status_values"]
     assert not OLD & set(values)
-    assert {ST_PENDING, ST_PENDING_EDITED, ST_ISSUED, ST_PRINTED, ST_HUMAN_CHECK} <= set(values)
+    assert {ST_PENDING, ST_POST_EDIT, ST_ISSUED, ST_PRINTED, ST_HUMAN_CHECK} <= set(values)
     assert not OLD & known_states(values)
     assert cfg["common"]["poll_interval_sec"] == 15 and cfg["issue"]["bundle_interval_min"] == 3
+    assert cfg["common"]["quote_settle_min"] == 2 and cfg["common"]["quote_tab_settle_min"] == 1
+    assert cfg["issue"]["bundle_grace_min"] == 2 and cfg["sheets"]["pipe"]["bundle_grace_min"] == 0
+    assert cfg["sheets"]["imgagong"]["issue_trigger"] == "work_start"
+    assert cfg["sheets"]["pipe"]["issue_trigger"] == "work_end"
 
 
 def test_db_migration_renames_old_status():
@@ -65,12 +69,11 @@ def test_old_pending_name_edit_detected(tmp_path):
         rig.set(n, "status", "발행대기")
     rig.set(3, "qty", "9개")  # 파일에 담긴 뒤 수정
     rig.cycle()
-    assert rig.col("status") == [ST_PENDING_EDITED] * 2
-    assert rig.db("SELECT removed_at IS NOT NULL FROM issue_file_blocks") == [(1,)]
+    assert rig.col("status") == [ST_PENDING, ST_POST_EDIT]
 
 
 @pytest.mark.parametrize("old, new", [("AI발행", ST_ISSUED), ("AI발행-인쇄됨", ST_PRINTED),
-                                      ("발행대기-수정됨", ST_PENDING_EDITED)])
+                                      ("발행대기-수정됨", ST_POST_EDIT), ("명세표발행대기-수정됨", ST_POST_EDIT)])
 def test_old_names_kept_as_new(tmp_path, old, new):
     rig, _ = ready(TWO_ROWS, tmp_path)
     for n in (2, 3):
@@ -240,3 +243,17 @@ def test_spreadsheet_opened_once():
     rig.w.process_sheet("imgagong", JOB_SCFG)
     rig.w.process_sheet("imgagong", JOB_SCFG)
     assert opened == ["x"]
+
+
+def test_old_edited_name_ok_returns_to_pending(tmp_path):
+    """옛 '명세표발행대기-수정됨'(파일에 담김, 마감 전) → 발행후수정-확인 → '확인' → 명세표발행대기."""
+    rig, _ = ready(TWO_ROWS, tmp_path)
+    for n in (2, 3):
+        rig.set(n, "status", "명세표발행대기-수정됨")
+    rig.cycle()
+    assert rig.col("status") == [ST_POST_EDIT] * 2
+    assert rig.col("basis")[0].startswith("[발행 후 변경: 예전 '수정됨' 상태 → 경리나라 수정 여부 확인] ")
+    for n in (2, 3):
+        rig.set(n, "status", "확인")
+    rig.cycle()
+    assert rig.col("status") == [ST_PENDING] * 2

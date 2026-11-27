@@ -20,7 +20,7 @@ from tests.test_issuer_job import REG
 from tests.test_status_rename_cycle import RecWS
 from tests.test_watcher_legacy import make_watcher
 from tests.test_watcher_settle import age_all
-from watcher import (CHIDAE_DEFAULTS, ST_CHECK, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_QUOTED, ST_QUOTED_EDIT,
+from watcher import (CHIDAE_DEFAULTS, ST_CHECK, ST_ISSUED, ST_PENDING, ST_POST_EDIT, ST_QUOTED, ST_QUOTED_EDIT,
                      ST_QUOTED_OK, ST_TYPING, append_change_tag, load_config, stock_change)
 
 COLS = {"date": 1, "client": 2, "main_msg": 4, "spec_qty": 5, "difficulty": 6, "stock_removal": 8, "work_end": 10,
@@ -213,29 +213,73 @@ def pending(rig, filed):
     return rig
 
 
-def test_unfiled_pending_change_keeps_and_tags():
+def pending_at(rig):
+    return rig.w.con.execute("SELECT pending_at FROM rows WHERE row_id=?", (rig.row()[ID],)).fetchone()[0]
+
+
+def test_unfiled_pending_small_change_keeps_tags_and_restarts_grace():
     rig = pending(auto(), filed=False)
-    rig.row()[H] = "-0.3"
+    rig.w.con.execute("UPDATE rows SET pending_at='2026-01-01T00:00:00'")
+    rig.row()[H] = "-0.1"  # Ø50 대비 0.2% — 견적완료였어도 표시만
     assert rig.cycle() == []
     assert (rig.row()[S], rig.row()[P]) == (ST_PENDING, "30000")
-    assert tag_re("H -0.3 추가").search(rig.row()[B])
+    assert tag_re("H -0.1 추가").search(rig.row()[B])
+    assert pending_at(rig) > "2026-01-01T00:00:00"  # 유예 다시 셈
 
 
-def test_filed_pending_change_is_edited_rule():
+def test_unfiled_pending_s_change_does_not_restart_grace():
+    rig = pending(auto(), filed=False)
+    rig.w.con.execute("UPDATE rows SET pending_at='2026-01-01T00:00:00'")
+    rig.row()[PRE] = "입구 찍힘"
+    assert rig.cycle() == [] and rig.row()[S] == ST_PENDING
+    assert pending_at(rig) == "2026-01-01T00:00:00"
+
+
+def post_edit_tag(desc):
+    return f"[발행 후 변경: {desc} → 경리나라 수정 여부 확인] "
+
+
+def test_filed_pending_change_post_edit_then_ok():
     rig = pending(auto(), filed=True)
     rig.row()[E] = E50B
-    assert rig.cycle() == [ST_PENDING_EDITED]  # 예전 '-수정됨' 규칙 그대로
+    assert rig.cycle() == [watcher.ST_POST_EDIT]  # 재견적 없음
+    desc = f"E {E50[:20]}…→{E50B[:20]}…"
+    assert rig.row()[B].startswith(post_edit_tag(desc) + "[가사 11/26 1/1] [→ 20261127_1400.xls] "), rig.row()[B]
     assert rig.row()[P] == "30000" and "[변경" in rig.row()[B]
-    assert rig.w.con.execute("SELECT removed_at IS NOT NULL FROM issue_file_blocks").fetchone() == (1,)
+    assert rig.w.con.execute("SELECT removed_at FROM issue_file_blocks").fetchone() == (None,)
+    age_all(rig.w)
+    assert rig.cycle() == [] and rig.row()[S] == watcher.ST_POST_EDIT  # 사람이 볼 때까지 유지
+    rig.row()[S] = "확인"
+    assert rig.cycle() == [ST_PENDING]
+    assert rig.row()[B].startswith("[가사 11/26 1/1] [→ 20261127_1400.xls] ") and "발행 후 변경" not in rig.row()[B]
+    assert rig.cycle() == [] and rig.row()[S] == ST_PENDING
 
 
-def test_issued_change_keeps_and_tags():
-    rig = auto()
+def issued(rig):
     rig.row()[S], rig.row()[COLS["author"] - 1] = ST_ISSUED, "AI"
     rig.cycle()
+    return rig
+
+
+def test_issued_e_change_post_edit_then_ok():
+    rig = issued(auto())
     rig.row()[E] = E50B
+    assert rig.cycle() == [watcher.ST_POST_EDIT]
+    assert rig.row()[B].startswith("[발행 후 변경: E ") and rig.row()[P] == "30000"
+    rig.row()[H] = "-0.5"  # 확인 전 또 바뀜 → 설명 누적
     assert rig.cycle() == []
-    assert rig.row()[S] == ST_ISSUED and "[변경" in rig.row()[B]
+    assert "→Ø50 +0.0~+0.03 / 300…, H -0.5 추가 → 경리나라" in rig.row()[B], rig.row()[B]
+    rig.row()[S] = "확인"
+    assert rig.cycle() == [ST_ISSUED]
+    assert "발행 후 변경" not in rig.row()[B]
+
+
+def test_issued_s_change_only_tags():
+    rig = issued(auto())
+    rig.row()[PRE] = "입구 찍힘"
+    assert rig.cycle() == []
+    assert rig.row()[S] == ST_ISSUED and tag_re("S 입구 찍힘 추가").search(rig.row()[B])
+    assert "발행 후 변경" not in rig.row()[B]
 
 
 # ---------------------------------------------------------------- post_quote_recheck: true (기본 켜짐) — 사람 단가 행
@@ -376,14 +420,21 @@ def test_auto_s_change_keeps():
     assert ai.notes == [""]
 
 
-@pytest.mark.parametrize("filed", [False, True], ids=["파일 전", "파일에 담김"])
-def test_pending_h_large_only_tags(filed):
-    rig = pending(auto(), filed=filed)
-    rig.row()[H] = "-0.5"  # 1.0% — 견적완료였다면 재견적
-    if filed:
-        assert rig.cycle() == [ST_PENDING_EDITED]  # 예전 '-수정됨' 규칙 그대로
-    else:
-        assert rig.cycle() == [] and rig.row()[S] == ST_PENDING
+def test_unfiled_pending_h_large_requotes():
+    """담기 유예 중 큰 H → 견적완료 이후 변경 규칙 그대로 재견적 (견적완료였던 자동 행)."""
+    rig, ai = auto_note((36000, "high"))
+    rig = pending(rig, filed=False)
+    rig.row()[H] = "-0.5"  # 1.0%
+    assert requote(rig) == [ST_QUOTED]
+    assert rig.row()[P] == "36000" and "연마량 반영 재견적 30,000→36,000" in rig.row()[B]
+    assert ai.notes[-1].startswith("연마량 -0.5 추가됨")
+
+
+def test_filed_pending_h_large_post_edit():
+    rig = pending(auto(), filed=True)
+    rig.row()[H] = "-0.5"
+    assert rig.cycle() == [watcher.ST_POST_EDIT]
+    assert rig.row()[B].startswith(post_edit_tag("H -0.5 추가"))
     assert rig.row()[P] == "30000" and tag_re("H -0.5 추가").search(rig.row()[B])
     assert rig.w.con.execute("SELECT requote FROM rows").fetchone() == (None,)
 

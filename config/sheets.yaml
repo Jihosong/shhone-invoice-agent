@@ -5,9 +5,9 @@
 common:
   credentials_file: C:/dev/secrets/gcp-service-account.json
   poll_interval_sec: 15           # Sheets API 할당량 계산은 README '폴링 주기와 API 할당량'
-  quote_settle_min: 5            # 마지막 수정 후 N분 무변화 → 가견적
+  quote_settle_min: 2            # 마지막 수정 후 N분 무변화 → 가견적
   # 임가공 시트의 '견적' 탭 (시트 설정 quote_tab으로 이름 변경 가능): 당월 탭과 같은 열 배치로 견적만
-  #   (사다리·지시문·사람 확인/수정 → 견적완료(사람확인/수정) + 즉시 학습(날짜 = 그 행 날짜)). 작업완료·발행·명세표 처리 없음.
+  #   (사다리·지시문·사람 확인/수정 → 견적완료(사람확인/수정) + 즉시 학습(날짜 = 그 행 날짜)). 작업시작·작업완료·발행·명세표 처리 없음.
   #   행 날짜가 30일 지나면 산출근거 앞에 '[견적만]'을 붙이고 더는 건드리지 않음. 삭제되면 DB '삭제됨'만.
   quote_tab_settle_min: 1        # 견적 탭 확정 대기 (분)
   # 재시작 첫 바퀴 보호 (watcher): 켠 뒤 시트마다 첫 바퀴는 지문(hash_columns)이 DB와 같은 행의 상태·단가·산출근거를
@@ -37,8 +37,11 @@ common:
     - 견적완료(사람확인)          # 가견적 행 상태 칸만 비워 적힌 단가로 확정 (발행 조건상 견적완료)
     - 견적확인필요                # 견적확인필요 처리법: 상태 칸에 '확인'(또는 ok/OK) 입력 또는 비우기 → 견적완료(사람확인)
                                 #   / 단가 칸 수정 → 견적완료(사람수정). 그 밖의 모르는 글자는 건드리지 않음(WARNING)
-    - 명세표발행대기                  # 발행 조건 충족 → data/outbox 파일에 담김, 사람이 업로드 후 작성자 AI → 명세표발행완료(AI)
-    - 명세표발행대기-수정됨            # 파일에 담긴 뒤 행 수정 → 올린 파일과 어긋남, 사람이 확인 (작성자 AI/사람 이름으로 정리)
+    - 명세표발행대기                  # 발행 조건 충족 → 유예(issue.bundle_grace_min) 뒤 data/outbox 파일에 담김,
+                                    #   사람이 업로드 후 작성자 AI → 명세표발행완료(AI)
+    - 발행후수정-확인                 # 파일에 담긴 뒤(또는 명세표발행완료(AI) 뒤) 단가 칸(임가공 D·E·F·H, 파이프 품목 칸)·거래처 칸
+                                    #   변경 또는 줄 추가 → 재견적 없음, 산출근거 앞 '[발행 후 변경: … → 경리나라 수정 여부 확인]'.
+                                    #   경리나라 확인·수정 후 상태 칸에 '확인'(또는 비움) → 원래 상태(명세표발행대기/명세표발행완료(AI))
     - 사람처리-명세표중복확인          # 파일에 담긴 뒤 사람 작성자 → 경리나라 중복 발행 확인, 사람이 상태 칸 비우면 보통 사람처리
     - 진행중
     - 명세표발행완료(AI)
@@ -47,19 +50,24 @@ common:
     - 보류-미등록
     - 보류-화면이상
     - 제외-월말일괄
-    - 기존건-확인필요            # 최초 발견 시 이미 작업완료/출고완료 → 견적·발행 대상 아님
-  # 옛 이름(발행대기·발행대기-수정됨·AI발행·AI발행-인쇄됨·사람처리-발행확인)이 시트에 남아 있으면 다음 폴링에
+    - 기존건-확인필요            # 최초 발견 시 이미 발행 트리거 칸(임가공 작업시작·파이프 작업완료)/작업완료/출고완료 TRUE
+                                #   + 작성자 없음 → 견적·발행 대상 아님 (이미 TRUE인 행은 전환으로 보지 않음)
+  # 옛 이름(발행대기·발행대기-수정됨·명세표발행대기-수정됨·AI발행·AI발행-인쇄됨·사람처리-발행확인)이 시트에 남아 있으면 다음 폴링에
   # 새 이름으로 바꿔 씀 (watcher.LEGACY_STATUS_NAMES, DB rows.status도 시작할 때 이전)
   # (DB 전용 '삭제됨': 시트에서 row_id가 사라진 행 — 시트에는 쓰지 않으므로 위 목록에 넣지 않음)
 
 # 발행기 1단계 '반자동' (issuer/outbox.py) — 파일은 에이전트가, 업로드는 사람이
 #   발행 조건(묶음 단위): 모든 품목 행 견적완료(또는 견적확인필요 + 사람 단가) + 작성자 빈칸 + 기존건 아님
-#   + 모든 행 작업완료 TRUE + 그중 하나 이상 FALSE→TRUE를 에이전트가 봄 → 묶음 전체 '명세표발행대기'.
-#   bundle_interval_min마다(또는 agent.py issue) 아직 파일에 없는 명세표발행대기 묶음 → outbox_dir/YYYYMMDD_HHMM.xls.
-#   업로드 후 작성자를 AI로 → 묶음 전체 명세표발행완료(AI). 파일에 담긴 뒤 수정 → 명세표발행대기-수정됨(WARNING).
+#   + 모든 행 발행 트리거 칸(시트 설정 issue_trigger) TRUE + 그중 하나 이상 FALSE→TRUE를 에이전트가 봄
+#   → 묶음 전체 '명세표발행대기'. 처음 봤을 때 이미 TRUE인 행은 전환이 아님(기존건).
+#   담기 유예 bundle_grace_min: 명세표발행대기가 된 뒤 이 시간 안에 H·D·E·F가 바뀌면 견적완료 이후 변경 규칙
+#   (연마량 ≥0.4% 재견적 등)을 적용하고 유예를 다시 셈. 유예가 지난 묶음만 bundle_interval_min마다(또는 agent.py issue)
+#   outbox_dir/YYYYMMDD_HHMM.xls로. 업로드 후 작성자를 AI로 → 묶음 전체 명세표발행완료(AI).
+#   파일에 담긴 뒤·발행완료 뒤 단가 칸 변경 → 발행후수정-확인 (WARNING, S 등 단가와 무관한 칸은 표시만).
 issue:
   outbox_dir: data/outbox
   bundle_interval_min: 3
+  bundle_grace_min: 2             # 명세표발행대기 → 파일 담기 유예 (분). 시트 설정 bundle_grace_min이 우선
   # 공통메모(명세표마다 첫 줄에만). '(AI)'로 끝나야 월간 import가 AI 발행(statements.issued_by='AI')으로 알아봄.
   # 묶음 추적은 DB issue_file_blocks로 한다.
   memo_text: "(주)삼화호닝 기업 451-079229-04-018, 감사합니다. (AI)"
@@ -120,8 +128,8 @@ sheets:
       difficulty: 6               # F 난이도
       operator: 7                 # G 작업자
       stock_removal: 8            # H 연마량/치대 (드롭다운, 비면 일반)
-      work_start: 9               # I 작업시작
-      work_end: 10                # J 작업완료  <- 발행 트리거
+      work_start: 9               # I 작업시작  <- 발행 트리거 (issue_trigger: work_start)
+      work_end: 10                # J 작업완료
       inspect_done: 11            # K 검수완료
       inspector: 12               # L 검수자
       client_phone: 13            # M 거래처 연락처
@@ -141,7 +149,7 @@ sheets:
       row_id: 26                  # Z 행ID (에이전트가 최초 발견 시 기록)
     hash_columns: [client, main_msg, spec_qty, difficulty, stock_removal]
     item_columns: [spec_qty, main_msg]   # 하나라도 있으면 품목 행, 없으면 메모 행
-    issue_trigger: work_end
+    issue_trigger: work_start     # 발행 트리거 = I 작업시작 (2026-11 J 작업완료에서 변경)
     spec_format_hint: 'Ø내경 공차 / 길이 × 수량  (예: Ø30 +0.0~+0.03 / 720 × 2개)'
 
   pipe:                           # 호닝파이프 작업현황표
@@ -157,7 +165,7 @@ sheets:
       size: 4                     # D 규격 (I.D/O.D) '45x55'
       length: 5                   # E 길이 (mm)
       qty: 6                      # F 갯수 '144개'
-      work_end: 7                 # G 작업완료  <- 발행 트리거
+      work_end: 7                 # G 작업완료(절단 완료)  <- 발행 트리거
       shipped: 8                  # H 출고완료
       author: 9                   # I 거래명세표 (작성자 드롭다운) <- 잠금
       worker_sms: 10              # J
@@ -176,4 +184,5 @@ sheets:
     hash_columns: [client, pipe_type, size, length, qty]
     item_columns: [size, length, qty]    # 하나라도 있으면 품목 행, 없으면 메모 행
     issue_trigger: work_end
+    bundle_grace_min: 0           # 호닝파이프는 담기 유예 없음
     price_table: data/price_table.xlsx

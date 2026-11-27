@@ -16,7 +16,7 @@ from issuer.excel_upload import DEFAULT_MEMO_TEXT, Line, LineError, Statement, b
 from issuer.outbox import Issuer, format_outbox
 from pricer import PriceEntry, Pricer
 from tests.test_watcher_settle import age_all, make
-from watcher import (ST_CONFIRMED, ST_HUMAN_CHECK, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_QUOTED,
+from watcher import (ST_CONFIRMED, ST_HUMAN_CHECK, ST_ISSUED, ST_PENDING, ST_POST_EDIT, ST_QUOTED,
                      ST_TYPING)
 
 FIX = Path(__file__).resolve().parent / "fixtures" / "gyeongri"
@@ -248,16 +248,20 @@ def test_author_ai_closes_block_as_issued(tmp_path):
     assert rig.col("status") == [ST_ISSUED] * 3  # 다음 바퀴에도 유지
 
 
-def test_edit_after_issued_keeps_status(tmp_path):
+def test_edit_after_issued_post_edit_then_ok(tmp_path):
     rig, _ = ready(A_ROWS, tmp_path)
     rig.set(2, "author", "AI")
     rig.cycle()
     rig.set(2, "qty", "2개")
     rig.cycle()
-    assert rig.col("status") == [ST_ISSUED]  # 발행후수정: 상태 유지 + 로그
+    assert rig.col("status") == [ST_POST_EDIT]  # 재견적 없음, 사람 확인
+    assert rig.col("basis")[0].startswith("[발행 후 변경: F 1개→2개 → 경리나라 수정 여부 확인] ")
+    rig.set(2, "status", "확인")
+    rig.cycle()
+    assert rig.col("status") == [ST_ISSUED]
 
 
-def test_edit_while_pending_marks_edited(tmp_path):
+def test_edit_while_pending_marks_post_edit(tmp_path):
     warnings = []
     sink = logger.add(lambda m: warnings.append(str(m)), level="WARNING")
     try:
@@ -266,25 +270,46 @@ def test_edit_while_pending_marks_edited(tmp_path):
         rig.cycle()
     finally:
         logger.remove(sink)
-    assert rig.col("status") == [ST_PENDING_EDITED] * 3
-    assert rig.col("basis")[0].startswith(f"[{CLIENT} 11/26 1/3] [→ {path.name} 뺌(수정됨)] ")
-    assert rig.db("SELECT removed_at IS NOT NULL FROM issue_file_blocks") == [(1,)]
-    assert any("명세표발행대기-수정됨" in m for m in warnings)
+    # 바뀐 행만 발행후수정-확인, 나머지는 명세표발행대기 그대로
+    assert rig.col("status") == [ST_PENDING, ST_POST_EDIT, ST_PENDING]
+    assert rig.col("basis")[1].startswith(f"[발행 후 변경: F 2개→3개 → 경리나라 수정 여부 확인] [{CLIENT} 11/26 2/3] "
+                                          f"[→ {path.name}] ")
+    assert rig.db("SELECT removed_at FROM issue_file_blocks") == [(None,)]
+    assert any("발행후수정-확인" in m for m in warnings)
     # 사람이 볼 때까지 유지 — 시간이 지나도 재견적·재발행 안 함
     age_all(rig.w)
     assert rig.cycle(bundle=True, out=tmp_path) is None
-    assert rig.col("status") == [ST_PENDING_EDITED] * 3
-    # 사람이 정리하고 작성자 AI → 명세표발행완료(AI)
+    assert rig.col("status") == [ST_PENDING, ST_POST_EDIT, ST_PENDING]
+    # 업로드 후 작성자 AI → 마감. 확인 전 행은 그대로, '확인'하면 명세표발행완료(AI)
     rig.set(2, "author", "AI")
+    rig.cycle()
+    assert rig.col("status") == [ST_ISSUED, ST_POST_EDIT, ST_ISSUED]
+    rig.cycle()
+    assert rig.col("status") == [ST_ISSUED, ST_POST_EDIT, ST_ISSUED]
+    rig.set(3, "status", "확인")
     rig.cycle()
     assert rig.col("status") == [ST_ISSUED] * 3
 
 
-def test_row_added_to_pending_block_marks_whole_block_edited(tmp_path):
+def test_ok_before_upload_returns_to_pending(tmp_path):
+    rig, _ = ready(A_ROWS, tmp_path)
+    rig.set(2, "length", "800")
+    rig.cycle()
+    assert rig.col("status") == [ST_POST_EDIT]
+    rig.set(2, "status", "확인")
+    rig.cycle()
+    assert rig.col("status") == [ST_PENDING]
+    rig.set(2, "author", "AI")
+    rig.cycle()
+    assert rig.col("status") == [ST_ISSUED]
+
+
+def test_row_added_to_pending_block_marks_new_row(tmp_path):
     rig, _ = ready(A_ROWS, tmp_path)
     rig.values.append(r("", "", "50x60", "500", "1개"))
     rig.cycle()
-    assert rig.col("status") == [ST_PENDING_EDITED] * 2
+    assert rig.col("status") == [ST_PENDING, ST_POST_EDIT]
+    assert rig.col("basis")[1].startswith("[발행 후 변경: 줄 추가(파일에 없음) → ")
 
 
 def test_edit_before_file_requotes(tmp_path):

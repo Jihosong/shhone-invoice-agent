@@ -4,9 +4,11 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
 - 행 지문(hash_columns)으로 변경을 감지해 SQLite rows 테이블에 기록
 - 비어 있는 row_id 칸에 ID 부여
 - 상태 열(입력중/확정/제외-월말일괄 …) 갱신
-- 기존건 규칙: 처음 발견했을 때 이미 작업완료/출고완료가 TRUE인 행은 '기존건-확인필요'로
-  고정(견적·발행 대상 아님). 알고 있던 행의 작업완료가 FALSE→TRUE로 바뀐 순간만
-  work_end_flipped_at에 기록 → 발행 대상은 이 값이 있는 행뿐.
+- 발행 트리거 칸(시트 설정 issue_trigger — 임가공 work_start=I 작업시작, 호닝파이프 work_end=G 절단 완료).
+  기존건 규칙: 처음 발견했을 때 이미 트리거 칸(또는 작업완료·출고완료)이 TRUE인 행은 '기존건-확인필요'로
+  고정(견적·발행 대상 아님). 알고 있던 행의 트리거 칸이 FALSE→TRUE로 바뀐 순간만
+  work_end_flipped_at에 기록 → 발행 대상은 이 값이 있는 행뿐. (DB 열 이름 work_end_*는 옛 이름 그대로 —
+  rows.trigger_col에 어느 칸 기준인지 적고, 트리거 칸이 바뀌면 그 바퀴 값을 새 기준으로 삼아 전환으로 보지 않음)
   기존건 판정은 rows.legacy에 고정 저장하고, 시트 상태는 작성자 우선:
   작성자가 사람 값이면 기존건이어도 상태를 비움(사람처리), 빈칸일 때만 '기존건-확인필요'.
 묶음(block) 규칙 (두 시트 공통):
@@ -28,7 +30,7 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   (사전단가 → AI 최대 mid, 산출근거 '[가견적-미등록 거래처] …', 상태는 보류-미등록 그대로·발행 차단).
   거래처가 나중에 해석되면 재호출 없이 사전단가 → 견적완료, AI → 견적확인필요(가견적 유지).
   로그: 거래처 판정(동명확인·수동처리·미등록 등)·작성자 섞임은 그 묶음의 판정이 바뀔 때만 찍음(매 폴링 반복 안 함).
-  '작업완료 체크 → 발행 후보'는 묶음이 발행 조건(작성자 없음·기존건/보류/제외 아님·전 행 작업완료)을 만족할 때만.
+  '트리거 칸(임가공 작업시작·파이프 작업완료) 체크 → 발행 후보'는 묶음이 발행 조건(작성자 없음·기존건/보류/제외 아님·전 행 체크)을 만족할 때만.
   첫 묶음보다 위의 날짜 없는 행은 건너뜀. block_id = 묶음 첫 행의 row_id.
   확정 판정도 묶음 단위: 묶음 last_change = 묶음 안 품목 행 last_change 중 최신.
   quote_settle_min이 안 지났으면 묶음 전체 '입력중', 지났으면 묶음 전체 함께 '확정'.
@@ -90,21 +92,27 @@ ST_CHECK = "견적확인필요"
 ST_HCHECK = "동명확인"  # homonyms 이름인데 법인/개인 표시 없음 → 기본 쪽으로 가견적만, 발행 안 함
 ST_DELETED = "삭제됨"  # DB 전용 (시트에 쓰지 않음): 시트에서 row_id가 사라진 행
 ST_PENDING = "명세표발행대기"  # 발행 조건 충족 → data/outbox 파일에 담김(또는 담길 예정), 사람이 업로드
-ST_PENDING_EDITED = "명세표발행대기-수정됨"  # 파일에 담긴 뒤 행이 수정됨 → 올린 파일과 어긋남, 사람이 봐야 함
+# 파일에 담긴 뒤(또는 명세표발행완료(AI) 뒤) 단가에 영향 주는 칸이 바뀜 → 재견적 없이 사람 확인.
+# 산출근거 맨 앞 '[발행 후 변경: H -0.5 추가 → 경리나라 수정 여부 확인]'. 사람이 상태 칸에 '확인'(또는 비움)
+# → 원래 상태(명세표발행대기 / 명세표발행완료(AI))로. 옛 '명세표발행대기-수정됨'은 이 상태로 통합
+ST_POST_EDIT = "발행후수정-확인"
+POST_EDIT_NOTE_KEEP = 3  # 확인 전까지 쌓이는 변경 설명 (최근 N개)
 # 파일에 담긴 뒤 사람 작성자가 붙음 → 사람처리지만 경리나라 중복 발행 확인 필요. 사람이 상태 칸을 비우면 보통 사람처리
 ST_HUMAN_CHECK = "사람처리-명세표중복확인"
 # 단가(에이전트 또는 사람)를 가진 상태 — 재시작 첫 바퀴 대량 재견적 판정의 분모
-QUOTE_HELD = frozenset({*QUOTED_STATES, ST_CHECK, ST_PENDING, ST_PENDING_EDITED, ST_HCHECK})
+QUOTE_HELD = frozenset({*QUOTED_STATES, ST_CHECK, ST_PENDING, ST_POST_EDIT, ST_HCHECK})
 # 옛 상태 이름 → 새 이름. 시트에 옛 이름이 남아 있으면 새 이름으로 보고 다음 쓰기에 바꿔 씀 (DB는 ensure_columns가 이전)
-LEGACY_STATUS_NAMES = {"발행대기": ST_PENDING, "발행대기-수정됨": ST_PENDING_EDITED, "AI발행": ST_ISSUED,
-                       "AI발행-인쇄됨": ST_PRINTED, "사람처리-발행확인": ST_HUMAN_CHECK}
+LEGACY_STATUS_NAMES = {"발행대기": ST_PENDING, "발행대기-수정됨": ST_POST_EDIT, "AI발행": ST_ISSUED,
+                       "AI발행-인쇄됨": ST_PRINTED, "사람처리-발행확인": ST_HUMAN_CHECK,
+                       "명세표발행대기-수정됨": ST_POST_EDIT}
 # 상태 칸에 사람이 적는 '확인' 표시 — 상태 칸을 비운 것과 똑같이 취급 (견적확인필요 → 견적완료(사람확인) 등)
 HUMAN_OK_WORDS = frozenset({"확인", "ok"})  # casefold 비교: ok / OK / Ok
 HOLD_PREFIX = "보류-"
 # 산출근거 칸 맨 앞 묶음 표시 "[거래처(비고) 날짜 n/총줄수] "
-# 뒤에 붙는 안내 "[동명확인: …]" / "[수동처리: …]" / "[주의: …]" / 발행 파일 "[→ 20261126_1430.xls]"도
-# 에이전트 표시로 함께 뗀다
-BLOCK_TAG_RE = re.compile(r"^(?:\[(?:[^\[\]]* \d+/\d+|(?:동명확인|수동처리|주의):[^\[\]]*|→ [^\[\]]*)\] ?)+")
+# 뒤에 붙는 안내 "[동명확인: …]" / "[수동처리: …]" / "[주의: …]" / 발행 파일 "[→ 20261126_1430.xls]",
+# 맨 앞 "[발행 후 변경: …]"도 에이전트 표시로 함께 뗀다
+BLOCK_TAG_RE = re.compile(
+    r"^(?:\[(?:[^\[\]]* \d+/\d+|(?:동명확인|수동처리|주의|발행 후 변경):[^\[\]]*|→ [^\[\]]*)\] ?)+")
 ROW_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 SCHEMA = """
@@ -127,7 +135,12 @@ FILE_BLOCK_EXTRA = {"human_flag_at": "TEXT", "human_ack_at": "TEXT"}
 EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_flipped_at": "TEXT",
                  "legacy": "INTEGER", "block_id": "TEXT", "client_resolved": "TEXT", "client_note": "TEXT",
                  "deleted_at": "TEXT", "client_reg_no": "TEXT", "item_fp": "TEXT", "watch_vals": "TEXT",
-                 "tab_gid": "TEXT", "requote": "TEXT"}
+                 "tab_gid": "TEXT", "requote": "TEXT",
+                 # 발행 트리거 칸 이름(work_end_state가 어느 칸 값인지) / 명세표발행대기가 된 때·그 전 상태
+                 # (파일 담기 유예·유예 중 변경 규칙) / 발행후수정-확인 전 상태·변경 설명
+                 "trigger_col": "TEXT", "pending_at": "TEXT", "pre_pending": "TEXT", "pre_edit": "TEXT",
+                 "post_edit_note": "TEXT"}
+TRIGGER_LABELS = {"work_start": "작업시작", "work_end": "작업완료"}
 
 # ---------------------------------------------------------------- 견적완료 이후 변경 (임가공)
 # 어느 칸이 바뀌었는지 알려고 행마다 이 칸들의 마지막 값을 rows.watch_vals(JSON)에 둔다.
@@ -135,6 +148,7 @@ WATCH_SPEC = ("main_msg", "spec_qty", "difficulty")   # D·E·F: 사양
 WATCH_STOCK = "stock_removal"                         # H: 연마량/치대
 WATCH_NOTES = {"pre_note": "호닝 전 노트"}  # S (옛 T·U 호닝 후 칸은 시트에서 삭제)
 WATCH_FIELDS = (*WATCH_SPEC, WATCH_STOCK, *WATCH_NOTES)
+PRICE_FIELDS = (*WATCH_SPEC, WATCH_STOCK)            # 단가에 영향 주는 칸 (D·E·F·H) — S는 표시만
 # 사람 단가를 유지한 채 재확인을 요청한 표시 (산출근거 맨 앞, 묶음 표시 뒤). 사람이 '확인'/비우면 pricer가
 # 견적완료(사람확인), 단가를 고치면 견적완료(사람수정) — 가견적 표시 '[가견적-…]'과 같은 대접
 RECHECK_RE = re.compile(r"^\[([^\[\]]*) — 단가 재확인\](?: 사람 단가 [\d,/]+ 유지)?(?: \| |\s*$)")
@@ -236,7 +250,7 @@ def known_states(status_values: list[str]) -> set[str]:
     """시트 상태 칸에 에이전트가 쓰는 값 전부. 이 밖의 글자(+ 사람 확인 표시 제외)는 모르는 값 → 손대지 않음."""
     return set(status_values) | QUOTED_STATES | {
         ST_TYPING, ST_CONFIRMED, ST_ISSUED, ST_PRINTED, ST_SKIP, ST_LEGACY, ST_UNREG, ST_HOMONYM, ST_SCREEN, ST_HCHECK,
-        ST_PENDING, ST_PENDING_EDITED, ST_HUMAN_CHECK, ST_CHECK}
+        ST_PENDING, ST_POST_EDIT, ST_HUMAN_CHECK, ST_CHECK}
 
 
 def ensure_columns(con: sqlite3.Connection) -> None:
@@ -956,7 +970,7 @@ class Watcher:
                     reserved_ids: set[str] = frozenset()) -> set[str]:
         """탭 하나 처리 → 이 탭의 행ID 집합. quote=True면 '견적' 탭 (견적만):
         스냅샷 키 '<시트>#견적'(pricer는 견적·즉시 학습, 발행기는 안 봄), 확정 대기 common.quote_tab_settle_min(기본 1분),
-        작업완료·출고완료 칸 무시(기존건·발행 후보 없음), 월초 점검 없음. 행 날짜(없으면 처음 본 날)가
+        작업시작·작업완료·출고완료 칸 무시(기존건·발행 후보 없음), 월초 점검 없음. 행 날짜(없으면 처음 본 날)가
         QUOTE_FREEZE_DAYS(30일) 지난 행은 산출근거 앞에 '[견적만]'을 붙이고 더는 건드리지 않음.
         reserved_ids: 다른 탭(견적 탭)이 쓰는 행ID — 이 탭에 같은 ID가 있으면(복사) 새 ID 부여."""
         cols = scfg["columns"]
@@ -976,6 +990,11 @@ class Watcher:
         item_cols = scfg.get("item_columns") or []
         # 견적완료 이후 변경 규칙은 임가공(job)만 — 파이프는 예전처럼 지문이 바뀌면 재견적
         watch_fields = [f for f in WATCH_FIELDS if f in cols] if scfg.get("kind") == "job" else []
+        # 칸별 지난 값(rows.watch_vals) — 임가공은 D·E·F·H·S, 호닝파이프는 품목 칸 (발행 후 변경 설명용)
+        diff_fields = watch_fields or [c for c in item_hash_cols if c in cols]
+        price_fields = [f for f in PRICE_FIELDS if f in watch_fields] if watch_fields else diff_fields
+        trig_name = scfg.get("issue_trigger") or "work_end"  # 발행 트리거 칸 (임가공 work_start, 파이프 work_end)
+        trig_label = TRIGGER_LABELS.get(trig_name, trig_name)
         pq_rules = dict(CHIDAE_DEFAULTS)
         if watch_fields:  # pricing 절은 매 바퀴 다시 읽음 (고치면 재시작 없이 반영 — pricer_job과 같음)
             try:
@@ -988,12 +1007,12 @@ class Watcher:
         ai = self.common["author_ai_value"]
         skip_clients = [norm_text(c) for c in self.common.get("skip_clients") or []]
         now = datetime.now()
-        # 발행 파일에 담긴 묶음: block_id → (파일명, removed_at) — 산출근거 '[→ 파일]' 표시·명세표발행대기-수정됨 판정
+        # 발행 파일에 담긴 묶음: block_id → (파일명, removed_at, issued_at) — 산출근거 '[→ 파일]' 표시·발행후수정-확인 판정
         filed_map, human_map = {}, {}
-        for bid, fn, rm, hf, ha in self.con.execute(
-                "SELECT block_id, file_name, removed_at, human_flag_at, human_ack_at FROM issue_file_blocks"
+        for bid, fn, rm, hf, ha, iss in self.con.execute(
+                "SELECT block_id, file_name, removed_at, human_flag_at, human_ack_at, issued_at FROM issue_file_blocks"
                 " WHERE sheet=?", (key,)):
-            filed_map[bid] = (fn, rm)
+            filed_map[bid] = (fn, rm, iss)
             human_map[bid] = (hf, ha)  # 사람처리-명세표중복확인 표시한 때 / 사람이 확인(상태 칸 비움)한 때
 
         writer = SheetWriter(cols, scfg["data_start_row"], scfg["hash_columns"], label)
@@ -1062,10 +1081,14 @@ class Watcher:
                         e["author"] = human
                         self.con.execute("UPDATE rows SET author=? WHERE row_id=?", (human, e["row_id"]))
             block_last = max(e["last_change"] for e in entries)
-            # 견적완료 이후 변경 (임가공): 견적완료·명세표발행대기·발행완료 행의 D·E·F·H·S 변경은 재견적 없이
-            # 산출근거 끝에 '[변경 …]'만. 그 행의 변경은 그 행으로 끝 — 묶음 재견적 안 함
+            filed = filed_map.get(blk["id"])  # (파일명, removed_at, issued_at) | None
+            # 견적완료 이후 변경 (임가공): 견적완료·명세표발행대기·발행완료 행의 D·E·F·H·S 변경은 산출근거 끝에 '[변경 …]'.
+            # 그 행의 변경은 그 행으로 끝 — 묶음 재견적 안 함. 파일에 아직 안 담긴 명세표발행대기(담기 유예 중)는
+            # 명세표발행대기 전 상태(rows.pre_pending)로 보고 견적완료 이후 변경 규칙(큰 변경 재견적 등)을 그대로 적용
             for e in entries:
                 e["pq"] = None
+                e["pq_status"] = ((e["pre_pending"] or ST_QUOTED) if e["status"] == ST_PENDING and not filed
+                                  else None)
                 e["final"] = watch_fields and self.post_quote_final(
                     e["status"], cell(e["row"], "basis") if "basis" in cols else "", pq_rules)
                 if e["final"] and not e["unknown_status"] and not e["protect"] and not blk.get("frozen"):
@@ -1083,6 +1106,13 @@ class Watcher:
                     if e["pq"]["requote"]:  # pricer가 확정 때 읽어 AI 프롬프트·산출근거에 씀
                         self.con.execute("UPDATE rows SET requote=? WHERE row_id=?",
                                          (json.dumps(e["pq"]["requote"], ensure_ascii=False), e["row_id"]))
+            # 파일 담기 유예 중(명세표발행대기, 파일 전) 단가 칸(D·E·F·H)이 바뀜 → 유예를 처음부터 다시 셈
+            if not filed and any(e["status"] == ST_PENDING and not e["protect"] and e["watch_diff"]
+                                 and any(f in e["watch_diff"] for f in price_fields) for e in entries):
+                self.con.execute("UPDATE rows SET pending_at=? WHERE block_id=? AND status=?",
+                                 (now_iso(), blk["id"], ST_PENDING))
+                logger.info("{} client={} 명세표발행대기(파일 담기 유예 중) 단가 칸 변경 → 유예 다시 셈", where,
+                            entries[0]["client_log"])
             # 묶음 안 한 행이라도 바뀌었거나, 알던 묶음에 새 행이 붙으면 묶음 전체가 '변경'
             news = [e["is_new"] for e in entries]
             block_changed = any(e["changed"] and not e["pq"] for e in entries) or (any(news) and not all(news))
@@ -1100,20 +1130,22 @@ class Watcher:
             if client_fix:
                 logger.info("sheet={} row={} 거래처 수정 {!r} → {} {} (동명확인 해제)",
                             label, blk["rownum"], blk["client_text"], blk["client"], blk["reg_no"])
-            filed = filed_map.get(blk["id"])  # (파일명, removed_at) | None
             for e in entries:
                 if blk["manual"]:
                     e["new_status"] = None  # 사람처리
                     continue
                 status = "" if screen_cleared and e["status"] == ST_SCREEN else e["status"]
+                active = not e["protect"] and not e["unknown_status"] and not blk.get("frozen")
+                if active and not human:
+                    status = self.post_edit_step(e, status, filed, price_fields, cols, label)
+                post_file = status in (ST_POST_EDIT, *ISSUED_STATES) or (status == ST_PENDING and filed)
                 row_changed = block_changed
-                if e["final"]:
-                    if status in (ST_PENDING_EDITED, *ISSUED_STATES) or (status == ST_PENDING and filed):
-                        # 파일에 담긴 명세표발행대기·발행완료: 예전 '-수정됨'/'발행후수정' 규칙 그대로
-                        row_changed = block_changed or e["changed"]
-                    else:  # 견적완료(·파일 전 명세표발행대기): 다른 행이 바뀌어도, 자기 칸이 바뀌어도 그대로
-                        # 자동 견적 행의 큰 변경(requote)만 입력중 → 확정 → 재견적
-                        row_changed = e["changed"] and (not e["pq"] or bool(e["pq"]["requote"]))
+                if post_file:
+                    # 파일에 담긴 명세표발행대기·발행완료·발행후수정-확인: 재견적 없음 (변경은 post_edit_step이 표시)
+                    row_changed = False
+                elif e["final"]:  # 견적완료(·파일 전 명세표발행대기): 다른 행이 바뀌어도, 자기 칸이 바뀌어도 그대로
+                    # 자동 견적 행의 큰 변경(requote)만 입력중 → 확정 → 재견적
+                    row_changed = e["changed"] and (not e["pq"] or bool(e["pq"]["requote"]))
                 row_changed = row_changed and not client_fix
                 new_status = self.decide_status(
                     label, e["rownum"], e["client_log"], e["author"], status, row_changed,
@@ -1121,38 +1153,28 @@ class Watcher:
                     unregistered=blk["client"] is None or blk["hold"] == ST_UNREG, homonym=homonym,
                     filed=filed is not None)
                 if hcheck and new_status and new_status not in (ST_TYPING, ST_SKIP, ST_LEGACY, ST_PENDING,
-                                                                ST_PENDING_EDITED, *ISSUED_STATES) \
+                                                                ST_POST_EDIT, *ISSUED_STATES) \
                         and not new_status.startswith(HOLD_PREFIX):
                     new_status = ST_HCHECK
-                if e["pq"] and e["pq"]["recheck"] and new_status in (*QUOTED_STATES, ST_CHECK):
+                if e["pq"] and e["pq"]["recheck"] and (new_status in (*QUOTED_STATES, ST_CHECK)
+                                                       or (new_status == ST_PENDING and not filed)):
                     new_status = ST_CHECK  # 사람 단가 유지 + 재확인 요청
                 e["new_status"] = new_status
             # 파일에 담긴 명세표발행대기 묶음은 보류로 덮지 않음 (올린 파일과의 관계가 우선)
-            keep = {None, ST_SKIP, ST_PENDING_EDITED, *ISSUED_STATES} | ({ST_PENDING} if filed else set())
+            keep = {None, ST_SKIP, ST_POST_EDIT, *ISSUED_STATES} | ({ST_PENDING} if filed else set())
             holds = [e["new_status"] for e in entries if (e["new_status"] or "").startswith(HOLD_PREFIX)]
             if holds:
                 hold = next((h for h in (ST_UNREG, ST_HOMONYM, ST_SCREEN) if h in holds), holds[0])
                 for e in entries:
                     if e["new_status"] not in keep:
                         e["new_status"] = hold
-            # 파일에 담긴 뒤 묶음이 수정됨 → 묶음 전체 명세표발행대기-수정됨 (새로 붙은 행 포함), 파일에서 뺀 것으로 기록
-            if filed and not all_protected and any(e["new_status"] == ST_PENDING_EDITED for e in entries):
-                for e in entries:
-                    if e["new_status"] not in (None, ST_SKIP, *ISSUED_STATES):
-                        e["new_status"] = ST_PENDING_EDITED
-                if not filed[1]:
-                    logger.warning("sheet={} row={} client={} 명세표발행대기 중 수정 → 명세표발행대기-수정됨 ({}에서 뺌 — "
-                                   "이미 올렸다면 경리나라 명세표와 어긋남, 확인 필요)",
-                                   label, blk["rownum"], entries[0]["client_log"], filed[0])
-                    self.con.execute("UPDATE issue_file_blocks SET removed_at=? WHERE block_id=?",
-                                     (now_iso(), blk["id"]))
-                    filed = filed_map[blk["id"]] = (filed[0], now_iso())
             if any(e["just_flipped"] for e in entries):
-                why = self.issue_block_reason(blk, entries, human, ai)
+                why = self.issue_block_reason(blk, entries, human, ai, trig_label)
                 if why:
-                    logger.debug("{} client={} 작업완료 체크 (발행 후보 아님: {})", where, entries[0]["client_log"], why)
+                    logger.debug("{} client={} {} 체크 (발행 후보 아님: {})", where, entries[0]["client_log"], trig_label,
+                                 why)
                 else:
-                    logger.info("{} client={} 작업완료 체크 → 발행 후보", where, entries[0]["client_log"])
+                    logger.info("{} client={} {} 체크 → 발행 후보", where, entries[0]["client_log"], trig_label)
             # 파일에 담긴 뒤 사람 작성자가 붙음 → 사람처리이되 상태 '사람처리-명세표중복확인' + 산출근거 주의 + WARNING.
             # 사람이 묶음 안 아무 행의 상태 칸을 비우면 확인한 것으로 보고 보통 사람처리 (다시 표시 안 함).
             caution = ""
@@ -1226,6 +1248,8 @@ class Watcher:
                     if hcheck:
                         tag += f" [{blk['notice']}]"
                     tag += file_mark + caution
+                    if e["new_status"] == ST_POST_EDIT:  # 산출근거 맨 앞 — 사람이 '확인'하면 다음 바퀴에 빠짐
+                        tag = f"[발행 후 변경: {e['post_edit_note'] or '내용 변경'} → 경리나라 수정 여부 확인] {tag}"
                 # 묶음 표시는 에이전트가 처리하는 행에만 — 사람처리·제외-월말일괄 행의 산출근거는 안 건드림
                 # (manual_clients 묶음은 사람처리지만 사유를 적음)
                 if "basis" in cols and (e["new_status"] not in (None, ST_SKIP) or blk["manual"]):
@@ -1347,28 +1371,32 @@ class Watcher:
             if not unknown_status:
                 self._log_on_change(("unknown_status", key, row_id), None)
 
-            # 견적 탭: 작업완료·출고완료 칸은 보지 않음 (기존건·발행 후보 판정 없음)
+            # 견적 탭: 작업시작·작업완료·출고완료 칸은 보지 않음 (기존건·발행 후보 판정 없음)
+            trig = bool_state(cell(row, trig_name)) if trig_name in cols and not quote else "FALSE"
             work_end = bool_state(cell(row, "work_end")) if "work_end" in cols and not quote else "FALSE"
             just_flipped = False
             shipped = bool_state(cell(row, "shipped")) if "shipped" in cols and not quote else "FALSE"
+            pre_pending = pre_edit = post_edit_note = None
 
             # --- DB 갱신 ---
             rec = self.con.execute(
                 "SELECT fingerprint, last_change, status, work_end_state, work_end_flipped_at, legacy, item_fp,"
-                " watch_vals FROM rows WHERE row_id=?",
+                " watch_vals, trigger_col, pre_pending, pre_edit, post_edit_note FROM rows WHERE row_id=?",
                 (row_id,)).fetchone()
             if rec is None:
                 changed = False  # 최초 발견은 '변경'으로 보지 않음
                 items_changed = True
                 last_change = now
-                legacy = "TRUE" in (work_end, shipped)
+                # 처음 봤을 때 이미 트리거 칸(임가공 작업시작)·작업완료·출고완료 중 하나라도 TRUE → 기존건
+                legacy = "TRUE" in (trig, work_end, shipped)
                 flipped_at = None
                 self.con.execute(
                     "INSERT INTO rows(row_id, sheet, tab, row_number, fingerprint, first_seen, last_change, status, author)"
                     " VALUES(?,?,?,?,?,?,?,?,?)",
                     (row_id, key, ws.title, rownum, fp, now_iso(), now_iso(), status, author))
             else:
-                db_fp, db_last, db_status, prev_work_end, flipped_at, db_legacy, db_item_fp, db_watch = rec
+                (db_fp, db_last, db_status, prev_work_end, flipped_at, db_legacy, db_item_fp, db_watch, db_trig,
+                 pre_pending, pre_edit, post_edit_note) = rec
                 # 정체성은 row_id, 변경 여부는 hash_columns 지문으로만 — 행 번호·묶음 위치·n/m은 보지 않음
                 changed = db_fp != fp
                 items_changed = db_item_fp != item_fp  # 예전 DB(값 없음)면 변경으로 봄
@@ -1384,13 +1412,19 @@ class Watcher:
                     legacy = True
                 elif prev_work_end is None:
                     # 이 규칙 이전에 발견된 행: 이전 상태를 모르므로 최초 발견처럼 판정 (이미 발행된 건 제외)
-                    legacy = db_status not in ISSUED_STATES and "TRUE" in (work_end, shipped)
+                    legacy = db_status not in ISSUED_STATES and "TRUE" in (trig, work_end, shipped)
                 else:
                     legacy = False
-                    if prev_work_end == "FALSE" and work_end == "TRUE":
+                    if (db_trig or "work_end") != trig_name:
+                        # 트리거 칸이 바뀜(작업완료→작업시작): 지난 값은 다른 칸 것 → 이번 값을 새 기준으로 (전환 아님)
+                        self._log_on_change(("trigger_col", key, row_id), "INFO",
+                                            "sheet={} row={} 발행 트리거 칸 {}→{} — 이번 값 {}을 기준으로 (전환으로 안 봄)",
+                                            label, rownum, db_trig or "work_end", trig_name, trig)
+                        prev_work_end = trig
+                    if prev_work_end == "FALSE" and trig == "TRUE":
                         flipped_at = now_iso()
                         just_flipped = True  # 로그는 finish_block에서 — 묶음이 발행 조건을 만족할 때만 '발행 후보'
-                    elif work_end == "FALSE" and flipped_at and db_status not in ISSUED_STATES:
+                    elif trig == "FALSE" and flipped_at and db_status not in ISSUED_STATES:
                         flipped_at = None  # 체크 해제 → 발행 후보에서 빠짐
                 self.con.execute(
                     "UPDATE rows SET sheet=?, tab=?, row_number=?, fingerprint=?, last_change=?, author=? WHERE row_id=?",
@@ -1398,7 +1432,7 @@ class Watcher:
             if legacy:
                 flipped_at = None  # 기존건은 절대 발행 대상 아님
             # 견적완료 이후 변경 처리용: 지난 바퀴 값과 비교해 어느 칸이 바뀌었는지 (None = 예전 DB라 모름)
-            watch_now = {f: cell(row, f) for f in watch_fields}
+            watch_now = {f: cell(row, f) for f in diff_fields}
             try:
                 watch_prev = json.loads(db_watch) if rec is not None and db_watch else None
             except ValueError:
@@ -1409,19 +1443,20 @@ class Watcher:
             # 재시작 첫 바퀴 + 지문 그대로 → 보호 (상태·쓰기 없음). 감시 칸 기억도 다음 바퀴까지 그대로 둠
             protect = first and rec is not None and not changed
             watch_store = (db_watch if protect and db_watch else
-                           json.dumps(watch_now, ensure_ascii=False) if watch_fields else None)
+                           json.dumps(watch_now, ensure_ascii=False) if diff_fields else None)
             self.con.execute(
                 "UPDATE rows SET work_end_state=?, shipped_state=?, work_end_flipped_at=?, legacy=?,"
                 " block_id=?, client_resolved=?, client_reg_no=?, client_note=?, item_fp=?, watch_vals=?,"
-                " tab_gid=? WHERE row_id=?",
-                (work_end, shipped, flipped_at, int(legacy), block["id"], client, block["reg_no"], client_note,
-                 item_fp, watch_store, gid, row_id))
+                " tab_gid=?, trigger_col=? WHERE row_id=?",
+                (trig, shipped, flipped_at, int(legacy), block["id"], client, block["reg_no"], client_note,
+                 item_fp, watch_store, gid, trig_name, row_id))
 
             # 상태는 묶음이 끝날 때 함께 결정 (finish_block)
             block["entries"].append({
                 "rownum": rownum, "row_id": row_id, "row": row, "author": author, "status": status,
                 "status_raw": status_raw, "unknown_status": unknown_status,
-                "work_end": work_end, "just_flipped": just_flipped,
+                "trigger": trig, "just_flipped": just_flipped, "pre_pending": pre_pending, "pre_edit": pre_edit,
+                "post_edit_note": post_edit_note,
                 "fp": fp, "changed": changed, "items_changed": items_changed, "is_new": rec is None, "db_status": db_status if rec else None, "last_change": last_change, "legacy": legacy,
                 "flipped_at": flipped_at, "client_log": client_log, "client_note": client_note,
                 "watch_diff": watch_diff, "protect": protect})
@@ -1534,8 +1569,10 @@ class Watcher:
         return total
 
     @staticmethod
-    def issue_block_reason(blk: dict, entries: list[dict], human: str | None, ai: str) -> str | None:
-        """작업완료 체크된 묶음이 발행 후보가 아닌 이유 (None = 후보: 견적만 끝나면 명세표발행대기로 감)."""
+    def issue_block_reason(blk: dict, entries: list[dict], human: str | None, ai: str,
+                           trig_label: str = "작업완료") -> str | None:
+        """트리거 칸(임가공 작업시작·파이프 작업완료) 체크된 묶음이 발행 후보가 아닌 이유
+        (None = 후보: 견적만 끝나면 명세표발행대기로 감)."""
         if blk["manual"]:
             return "수동처리"
         if human:
@@ -1546,12 +1583,12 @@ class Watcher:
             st = e["new_status"]
             if e.get("unknown_status"):
                 return f"상태 칸 모르는 값 {e['status_raw']!r}"
-            if st in (ST_SKIP, ST_HCHECK, ST_PENDING, ST_PENDING_EDITED, *ISSUED_STATES) or (st or "").startswith(HOLD_PREFIX):
+            if st in (ST_SKIP, ST_HCHECK, ST_PENDING, ST_POST_EDIT, *ISSUED_STATES) or (st or "").startswith(HOLD_PREFIX):
                 return st
             if e["author"]:
                 return f"작성자 {e['author']}"
-        if not all(e["work_end"] == "TRUE" for e in entries):
-            return "다른 줄 작업완료 대기"
+        if not all(e["trigger"] == "TRUE" for e in entries):
+            return f"다른 줄 {trig_label} 대기"
         return None
 
     def mark_deleted(self, key, label, tab, values, cols, data_start_row, seen_ids, gid=None) -> None:
@@ -1582,9 +1619,9 @@ class Watcher:
             status == ST_CHECK and bool(RECHECK_RE.match(strip_block_tag(basis))))
 
     def post_quote_final(self, status: str, basis: str, rules: dict) -> bool:
-        """재견적하지 않고 변경 표시만 하는 행: 견적완료(자동·사람확인·사람수정)·명세표발행대기(-수정됨)·발행완료.
+        """견적완료 이후 변경 규칙 대상 행: 견적완료(자동·사람확인·사람수정)·명세표발행대기·발행후수정-확인·발행완료.
         post_quote_recheck가 켜져 있으면 사람 단가 유지 + 재확인 중인 견적확인필요도."""
-        return status in (*QUOTED_STATES, ST_PENDING, ST_PENDING_EDITED, *ISSUED_STATES) or (
+        return status in (*QUOTED_STATES, ST_PENDING, ST_POST_EDIT, *ISSUED_STATES) or (
             bool(rules.get("post_quote_recheck")) and self.human_priced(status, basis))
 
     def post_quote_change(self, e: dict, cols: dict, price: str, rules: dict, stamp: str) -> dict | None:
@@ -1597,12 +1634,14 @@ class Watcher:
           (AI 프롬프트에 '연마량 -0.5 추가됨, 치대 반영', high면 새 단가로 견적완료, 아니면 견적확인필요)
         - 사람 단가 행 → '[사양 변경 — 단가 재확인] 사람 단가 N 유지' / '[연마량 -0.5 추가(구경 대비 0.8%) — 단가 재확인]'
           + 견적확인필요. 예전 DB(watch_vals 없음)라 어느 칸인지 모름 → '[내용 변경 — 단가 재확인]'
-        S 변경, 기준 미만 H 변경, 명세표발행대기 이후 행은 표시만."""
+        S 변경, 기준 미만 H 변경, 파일에 담긴 명세표발행대기·발행완료 행은 표시만 (발행후수정-확인은 post_edit_step).
+        파일에 아직 안 담긴 명세표발행대기(담기 유예 중)는 e['pq_status'](명세표발행대기 전 상태)로 판정."""
         diff = e["watch_diff"]
         basis = e["row"][cols["basis"] - 1] if "basis" in cols else ""
         on = bool(rules.get("post_quote_recheck"))
-        human = on and self.human_priced(e["status"], basis)
-        auto = on and e["status"] == ST_QUOTED and not HUMAN_BASIS_RE.match(strip_block_tag(basis))
+        status = e.get("pq_status") or e["status"]
+        human = on and self.human_priced(status, basis)
+        auto = on and status == ST_QUOTED and not HUMAN_BASIS_RE.match(strip_block_tag(basis))
         reasons, notes = [], []
         if diff is None:  # 예전 DB: 어느 칸인지 모름
             if not (e["changed"] and e["items_changed"]):
@@ -1658,6 +1697,50 @@ class Watcher:
 
         return {"recheck": recheck, "reasons": reasons, "changes": changes, "body": body, "requote": requote}
 
+    def post_edit_step(self, e: dict, status: str, filed: tuple | None, price_fields: list[str], cols: dict,
+                       label: str) -> str:
+        """발행후수정-확인 판정 → 이번 바퀴에 판정할 상태.
+        - 발행후수정-확인인데 사람이 상태 칸에 '확인'(또는 비움) → 원래 상태(rows.pre_edit; 없으면 파일 묶음이
+          마감됐으면 명세표발행완료(AI), 아니면 명세표발행대기)로 돌아가고 변경 설명을 지움.
+        - 파일에 담긴 명세표발행대기·명세표발행완료(AI)·발행후수정-확인 행의 단가 칸(D·E·F·H, 파이프는 품목 칸)·거래처 칸이
+          바뀌었거나, 파일에 담긴 묶음에 줄이 새로 붙음 → 재견적 없이 발행후수정-확인 + 변경 설명(rows.post_edit_note)
+          누적. S 등 단가와 무관한 칸은 여기서 보지 않음 (산출근거 끝 '[변경 …]' 표시만)."""
+        rid = e["row_id"]
+        if e["db_status"] == ST_POST_EDIT and status == "":
+            back = e["pre_edit"] or (ST_ISSUED if filed and filed[2] else ST_PENDING)
+            logger.info("sheet={} row={} client={} 발행후수정-확인 → 사람 확인 → {}", label, e["rownum"], e["client_log"], back)
+            self.con.execute("UPDATE rows SET pre_edit=NULL, post_edit_note=NULL WHERE row_id=?", (rid,))
+            e["pre_edit"] = e["post_edit_note"] = None
+            status = back
+        if status in ISSUED_STATES or status == ST_POST_EDIT or (status == ST_PENDING and filed):
+            descs = []
+            diff = e["watch_diff"]
+            if diff:
+                descs = [change_desc(re.sub(r"\d", "", rowcol_to_a1(1, cols[f])), *diff[f])
+                         for f in price_fields if f in diff]
+            if e["changed"] and not descs:
+                descs = ["내용 변경" if diff is None else "거래처 칸 변경"]
+        elif filed and e["is_new"]:
+            descs = ["줄 추가(파일에 없음)"]
+            status = ST_ISSUED if filed[2] else ST_PENDING
+        else:
+            return status
+        if status == ST_POST_EDIT and not e["post_edit_note"] and e["status_raw"] != ST_POST_EDIT:
+            # 옛 '명세표발행대기-수정됨'이 적힌 행 → 새 이름으로, 설명은 옛 상태라고만
+            descs = descs or ["예전 '수정됨' 상태"]
+        if not descs:
+            return status
+        if status != ST_POST_EDIT:
+            logger.warning("sheet={} row={} client={} {} 뒤 변경({}) → 발행후수정-확인 (재견적 안 함, 경리나라 명세표 수정 여부 "
+                           "확인 후 상태 칸에 '확인')", label, e["rownum"], e["client_log"],
+                           "파일 " + filed[0] + "에 담긴" if filed and status == ST_PENDING else status, ", ".join(descs))
+            e["pre_edit"] = e["pre_edit"] or status
+        notes = [x for x in (e["post_edit_note"] or "").split(", ") if x] + descs
+        e["post_edit_note"] = ", ".join(notes[-POST_EDIT_NOTE_KEEP:])
+        self.con.execute("UPDATE rows SET pre_edit=?, post_edit_note=? WHERE row_id=?",
+                         (e["pre_edit"], e["post_edit_note"], rid))
+        return ST_POST_EDIT
+
     def sync_quote_fp(self, row_id: str, fp: str) -> None:
         """재확인 표시한 행: pricer job_quotes 지문을 지금 내용으로 → 사람이 '확인'/비우면 적힌 단가로 사람확인."""
         if self.con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_quotes'").fetchone():
@@ -1668,11 +1751,12 @@ class Watcher:
         """None = 사람이 처리(상태 비움).
 
         client는 묶음 첫 행에서 해석한 거래처명(미등록이면 원문). 우선순위:
-        제외-월말일괄 > 사람처리 > 명세표발행대기(파일에 담김) > 보류-미등록 > 보류-동명 > 기존건-확인필요 > 일반 규칙.
+        제외-월말일괄 > 사람처리 > 발행후수정-확인·명세표발행대기(파일에 담김) > 보류-미등록 > 보류-동명 > 기존건-확인필요
+        > 일반 규칙.
 
-        명세표발행대기-수정됨은 사람이 볼 때까지 유지 (작성자 AI → 명세표발행완료(AI), 사람 이름 → 사람처리).
-        명세표발행대기 + 파일에 담김(filed) + 묶음 수정 → 명세표발행대기-수정됨 (올린 파일과 어긋남).
-        아직 파일에 안 담긴 명세표발행대기가 수정되면 일반 규칙(입력중 → 재견적)으로 — 아무도 올릴 수 없었으므로.
+        발행후수정-확인은 사람이 '확인'할 때까지 유지 (판정은 post_edit_step — 여기 오는 changed는 늘 False).
+        파일에 담긴 명세표발행대기는 그대로 (수정되면 post_edit_step이 발행후수정-확인으로).
+        아직 파일에 안 담긴 명세표발행대기(담기 유예 중)는 견적완료 이후 변경 규칙 — 큰 변경이면 입력중 → 재견적.
 
         월말 일괄 거래처(skip_clients)는 작성자·기존건·완료/출고 여부와 무관하게 항상 '제외-월말일괄'.
         그 외: 작성자가 사람 값이면 기존건이어도 사람처리가 우선. '기존건-확인필요'는 작성자 빈칸인 기존건에만.
@@ -1684,10 +1768,8 @@ class Watcher:
             return ST_SKIP
         if author and author != ai:
             return None
-        if status == ST_PENDING_EDITED:
+        if status == ST_POST_EDIT or (status == ST_PENDING and filed):
             return status
-        if status == ST_PENDING and filed:
-            return ST_PENDING_EDITED if changed else status
         if unregistered:
             return ST_UNREG
         if homonym:

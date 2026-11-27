@@ -3,19 +3,24 @@
 업로드는 사람이 한다. 흐름 (매 바퀴 watcher → pricer 다음):
 0) 작성자 잠금(묶음 단위): 묶음 안 어느 행이든 사람 작성자가 있으면(다른 줄은 비어 있거나 AI여도) 사람 것 —
    마감·명세표발행대기·파일 담기 모두 안 함 (watcher가 이미 묶음 전체 사람처리로 둠).
-1) 마감: 상태 명세표발행대기/명세표발행대기-수정됨인 묶음에서 사람이 아무 행의 작성자를 'AI'로 바꿨고 그 묶음이 파일에
+1) 마감: 상태 명세표발행대기(/발행후수정-확인)인 묶음에서 사람이 아무 행의 작성자를 'AI'로 바꿨고 그 묶음이 파일에
    담겨 있으면 → 묶음 전체 명세표발행완료(AI), 모든 행 작성자 'AI'로 통일, rows.issued_at·issue_file_blocks.issued_at 기록.
+   발행후수정-확인 행은 상태를 그대로 두고(사람 확인 전) '확인'하면 돌아갈 상태만 명세표발행완료(AI)로.
    임가공이면 행마다 발행 줄을 lines(source='sheet')로 즉시 학습 (sheet_lines.py, 월간 import가 공식 줄로 대체).
 2) 명세표발행대기 표시: 묶음 단위 조건 —
    - 모든 품목 행 상태 견적완료(호닝파이프는 견적확인필요인데 사람이 단가를 적은 것도), 이번 바퀴에 바뀐 상태가 아님.
      임가공은 견적완료만 — 견적확인필요 행에는 에이전트 가견적 단가가 적혀 있다 (사람 확인은 pricer가 견적완료(사람수정/사람확인)로 바꿈)
    - 모든 행 작성자 빈칸, 기존건 아님 (보류·동명확인·사람처리·제외는 위 상태 조건에서 이미 빠짐)
-   - 모든 행 작업완료 TRUE, 그중 하나 이상은 에이전트가 FALSE→TRUE를 직접 봄(work_end_flipped_at)
+   - 모든 행 발행 트리거 칸(시트 설정 issue_trigger — 임가공 작업시작, 호닝파이프 작업완료) TRUE,
+     그중 하나 이상은 에이전트가 FALSE→TRUE를 직접 봄(work_end_flipped_at)
    - 줄을 만들 수 있음(거래처 사업자번호·날짜·규격·수량·단가) — 시트 kind에 builder가 있어야 함(pipe, job)
    - 아직 어느 파일에도 담긴 적 없는 묶음
-   일부만 작업완료면 기다림. 작업완료가 먼저고 견적이 늦으면 견적완료된 다음 바퀴에 명세표발행대기.
+   일부만 체크면 기다림. 체크가 먼저고 견적이 늦으면 견적완료된 다음 바퀴에 명세표발행대기.
+   명세표발행대기가 된 때(rows.pending_at)·그 전 상태(rows.pre_pending)를 DB에 둔다.
 3) 묶음 파일(bundle — `agent.py issue`, run 루프에서는 issue.bundle_interval_min마다):
    명세표발행대기인데 아직 파일에 없는 묶음을 모아 data/outbox/YYYYMMDD_HHMM.xls 한 파일(묶음 하나 = 명세표 한 장).
+   담기 유예 issue.bundle_grace_min(시트 설정 bundle_grace_min이 우선 — 호닝파이프 0): 명세표발행대기가 된 뒤
+   (유예 중 단가 칸이 바뀌면 watcher가 다시 셈) 이만큼 지난 묶음만 담는다.
    쓰기 직전 시트를 다시 읽어 상태 명세표발행대기·내용 그대로인 묶음만 담는다. DB issue_file_blocks의 block_id가
    PRIMARY KEY라 같은 묶음이 두 파일에 들어갈 수 없다(동시에 돌아도 DB가 막음). 산출근거 태그 뒤 '[→ 파일명]'.
 """
@@ -26,15 +31,15 @@ import sqlite3
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
 
 from issuer.excel_upload import (DEFAULT_MEMO_TEXT, LINE_BUILDERS, LineCtx, LineError, Statement, block_date, parse_price,
                                  write_xls)
-from watcher import (QUOTED_STATES, REG_NO_RE, ST_ISSUED, ST_PENDING, ST_PENDING_EDITED, ST_SKIP, SheetWriter,
-                     bool_state, now_iso, warn_once, with_block_tag)
+from watcher import (QUOTED_STATES, REG_NO_RE, ST_ISSUED, ST_PENDING, ST_POST_EDIT, ST_SKIP, SheetWriter, bool_state,
+                     now_iso, warn_once, with_block_tag)
 
 ROOT = Path(__file__).resolve().parent.parent
 ST_QUOTED = "견적완료"
@@ -76,9 +81,15 @@ class Issuer:
         p = Path(self.icfg.get("outbox_dir") or DEFAULT_OUTBOX)
         return p if p.is_absolute() else ROOT / p
 
-    def filed(self, sheet: str) -> dict[str, tuple[str, str | None]]:
-        return {bid: (fn, rm) for bid, fn, rm in self.con.execute(
-            "SELECT block_id, file_name, removed_at FROM issue_file_blocks WHERE sheet=?", (sheet,))}
+    def filed(self, sheet: str) -> dict[str, tuple[str, str | None, str | None]]:
+        """block_id → (파일명, removed_at, issued_at)."""
+        return {bid: (fn, rm, iss) for bid, fn, rm, iss in self.con.execute(
+            "SELECT block_id, file_name, removed_at, issued_at FROM issue_file_blocks WHERE sheet=?", (sheet,))}
+
+    def grace(self, scfg: dict) -> timedelta:
+        """명세표발행대기 → 파일 담기 유예. 시트 설정 bundle_grace_min > issue.bundle_grace_min > 0."""
+        v = scfg.get("bundle_grace_min", self.icfg.get("bundle_grace_min", 0))
+        return timedelta(minutes=float(v or 0))
 
     # ------------------------------------------------------------------ 바퀴
     def run_once(self, snapshots: dict[str, dict], bundle: bool = False, out_dir: Path | None = None) -> Path | None:
@@ -112,7 +123,9 @@ class Issuer:
             authors = [self._cell(scfg, r, "author") for r in rows]
             if self.human_author(scfg, rows):
                 continue  # 묶음 안 사람 작성자가 하나라도 있으면 사람 것 — 마감·명세표발행대기 안 함
-            if statuses & {ST_PENDING, ST_PENDING_EDITED} and self.ai in authors:
+            closable = ST_PENDING in statuses or (ST_POST_EDIT in statuses and not (filed.get(block_id) or
+                                                                                      (None,) * 3)[2])
+            if closable and self.ai in authors:
                 if block_id in filed:
                     self._close(key, label, scfg, block_id, rows, writer, filed[block_id][0], snap)
                     counts[ST_ISSUED] += 1
@@ -121,6 +134,8 @@ class Issuer:
                 continue
             if block_id in filed or scfg.get("kind") not in LINE_BUILDERS:
                 continue
+            if all(r["status"] == ST_PENDING for r in rows):
+                continue  # 이미 명세표발행대기 (담기 유예 중) — 다시 표시하면 유예가 계속 다시 시작됨
             reason = self.waiting_reason(scfg, rows)
             if reason:
                 continue
@@ -129,11 +144,16 @@ class Issuer:
             except LineError as e:
                 warn_once(f"issuer sheet={label} row={rows[0]['rownum']} 묶음 {block_id} 발행 조건은 맞지만 줄을 못 만듦: {e}")
                 continue
+            ts = now_iso()
             for r in rows:
-                writer.add(r["rownum"], "status", ST_PENDING, r["row"], row_id=r["row_id"], expect_fp=r.get("fp"))
+                if r["status"] != ST_PENDING:
+                    writer.add(r["rownum"], "status", ST_PENDING, r["row"], row_id=r["row_id"], expect_fp=r.get("fp"))
+                if not self.dry_run:  # pre_pending: 유예 중 변경 규칙에 쓰는 그 전 상태 (이미 대기였던 행은 그대로)
+                    self.con.execute(
+                        "UPDATE rows SET status=?, pending_at=?,"
+                        " pre_pending=CASE WHEN ?=? THEN pre_pending ELSE ? END WHERE row_id=?",
+                        (ST_PENDING, ts, r["status"], ST_PENDING, r["status"], r["row_id"]))
                 r["status"] = ST_PENDING
-                if not self.dry_run:
-                    self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (ST_PENDING, r["row_id"]))
             counts[ST_PENDING] += 1
             logger.info("issuer sheet={} row={} client={} 묶음 {} ({}줄) → 명세표발행대기", label, rows[0]["rownum"],
                         rows[0].get("client_resolved"), block_id, len(rows))
@@ -152,13 +172,16 @@ class Issuer:
 
     def waiting_reason(self, scfg: dict, rows: list[dict]) -> str | None:
         """명세표발행대기로 갈 수 없는 이유 (None = 조건 충족). 대부분 '아직 기다림'이라 로그는 안 남김."""
+        trig = scfg.get("issue_trigger") or "work_end"  # 임가공 work_start(작업시작), 호닝파이프 work_end
         for r in rows:
             st = r["status"]
             if st != self._cell(scfg, r, "status"):
                 return "이번 바퀴에 상태가 바뀜 (단가 칸이 아직 시트 값 기준이 아님)"
             if st == ST_CHECK and scfg.get("kind") == "job":
                 return "견적확인필요 (임가공은 견적완료만 발행)"
-            if st == ST_CHECK:
+            if st == ST_PENDING:
+                pass  # 묶음 일부가 유예 중 재견적돼 다시 견적완료 → 나머지 대기 행과 함께 다시 명세표발행대기
+            elif st == ST_CHECK:
                 try:
                     parse_price(self._cell(scfg, r, "unit_price"))
                 except LineError:
@@ -169,10 +192,10 @@ class Issuer:
                 return "작성자 있음"
             if r.get("legacy"):
                 return "기존건"
-            if bool_state(self._cell(scfg, r, "work_end")) != "TRUE":
-                return "작업완료 대기"
+            if bool_state(self._cell(scfg, r, trig)) != "TRUE":
+                return f"{trig} 대기"
         if not any(r.get("work_end_flipped_at") for r in rows):
-            return "작업완료 전환을 에이전트가 보지 못함"
+            return f"{trig} 전환을 에이전트가 보지 못함"
         return None
 
     def statement(self, key: str, scfg: dict, snap: dict, block_id: str, rows: list[dict]) -> Statement:
@@ -209,6 +232,14 @@ class Issuer:
         ts = now_iso()
         for r in rows:
             if r["status"] in ("", None, ST_SKIP):  # 사람처리·제외 행은 손대지 않음
+                continue
+            if r["status"] == ST_POST_EDIT:
+                # 사람 확인 전 — 상태는 그대로, '확인'하면 명세표발행완료(AI)로 돌아가게만
+                if self._cell(scfg, r, "author") != self.ai:
+                    writer.add(r["rownum"], "author", self.ai, r["row"], row_id=r["row_id"], expect_fp=r.get("fp"))
+                if not self.dry_run:
+                    self.con.execute("UPDATE rows SET pre_edit=?, author=?, issued_at=COALESCE(issued_at, ?)"
+                                     " WHERE row_id=?", (ST_ISSUED, self.ai, ts, r["row_id"]))
                 continue
             if r["status"] != ST_ISSUED:
                 writer.add(r["rownum"], "status", ST_ISSUED, r["row"], row_id=r["row_id"], expect_fp=r.get("fp"))
@@ -266,6 +297,22 @@ class Issuer:
                       and not any(self._cell(scfg, r, "author") or r.get("author") for r in rows)]
             if not blocks:
                 continue
+            grace = self.grace(scfg)
+            if grace:
+                now = datetime.now()
+                kept = []
+                for bid, rows in blocks:
+                    ids = [r["row_id"] for r in rows]
+                    (last,) = self.con.execute(f"SELECT MAX(pending_at) FROM rows WHERE row_id IN "
+                                               f"({','.join('?' * len(ids))})", ids).fetchone()
+                    if last and now - datetime.fromisoformat(last) < grace:
+                        logger.debug("issuer sheet={} 묶음 {} 담기 유예 중 (명세표발행대기 {} 이후 {}분)",
+                                     snap.get("label", key), bid, last, grace.total_seconds() / 60)
+                        continue
+                    kept.append((bid, rows))
+                blocks = kept
+                if not blocks:
+                    continue
             fresh = None if self.dry_run else self._fresh_rows(scfg, snap)
             for bid, rows in blocks:
                 if fresh is not None and not self._still_pending(scfg, rows, fresh):
