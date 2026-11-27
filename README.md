@@ -82,6 +82,9 @@ python agent.py run
 
 시트 표기가 경리나라 등록명과 달라 `보류-미등록`이 되면 `config/client_aliases.yaml`에 별칭을 적는다
 (watcher가 매 폴링 다시 읽음).
+임가공 `보류-미등록` 행도 안정화 뒤 거래처 없이 가견적을 적는다(D열 사전단가 → AI 최대 mid, 산출근거
+`[가견적-미등록 거래처] …`, 상태는 보류-미등록 그대로라 발행 안 됨). 별칭·`clients add`·월말 import로 거래처가
+풀리면 AI 재호출 없이 사전단가는 `견적완료`, AI 가견적은 `견적확인필요`(가견적 유지)로 넘어간다.
 
 ```bash
 python agent.py clients find 에스티엠   # 정식명 / 사업자번호 / 최근거래 / 올해 건수

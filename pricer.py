@@ -9,7 +9,8 @@ v1: 호닝파이프(kind: pipe) — data/price_table.xlsx '삼화호닝' 시트 
     → 그 행은 lines(source='sheet')로 즉시 학습 (sheet_lines.py).
 
 watcher가 한 바퀴 돈 뒤 그 결과(snapshot)를 받아 처리한다.
-대상: 상태 '확정' + 작성자 빈칸 + 기존건 아님. 시트 쓰기는 시트당 batch_update 한 번
+대상: 상태 '확정' + 작성자 빈칸 + 기존건 아님 (임가공은 안정화된 보류-미등록 행도 — 거래처 없이 가견적,
+상태는 보류-미등록 그대로. 거래처가 해석되면 재호출 없이 사전단가 → 견적완료, AI → 견적확인필요). 시트 쓰기는 시트당 batch_update 한 번
 (agent.py run·issue: watcher와 같은 writer — 사람 '확인'/단가 수정 행은 중간 '확정' 없이 바로 견적완료(사람확인/사람수정)).
 """
 from __future__ import annotations
@@ -24,7 +25,8 @@ from pathlib import Path
 
 from loguru import logger
 
-from watcher import QUOTED_STATES, RECHECK_RE, ST_HCHECK, ST_QUOTED_EDIT, ST_QUOTED_OK, SheetWriter, strip_block_tag, with_block_tag
+from watcher import (QUOTED_STATES, RECHECK_RE, ST_HCHECK, ST_QUOTED_EDIT, ST_QUOTED_OK, ST_UNREG, SheetWriter,
+                     strip_block_tag, with_block_tag)
 
 ROOT = Path(__file__).parent
 PRICE_SHEET = "삼화호닝"
@@ -36,6 +38,9 @@ ST_QUOTED = "견적완료"
 ST_CHECK = "견적확인필요"
 ST_LEGACY = "기존건-확인필요"
 GAGYEON_RE = re.compile(r"^\[가견적-(mid|low)\]\s*")  # 임가공 가견적 표시 (단가는 적되 발행 차단)
+# 보류-미등록 묶음의 임가공 가견적 (거래처 없이 사전단가 → AI 최대 mid). 상태는 보류-미등록 그대로
+UNREG_TAG = "[가견적-미등록 거래처]"
+UNREG_MAX_CONF = "mid"
 _PRICE_CELL_RE = re.compile(r"\d[\d,]*(?:/\d[\d,]*)*")
 
 
@@ -412,9 +417,10 @@ class Pricer:
         n = sheet_lines.add_sheet_lines(self.con, r["row_id"], client, reg_no, day, lines, note="시트 확정")
         logger.info("시트 확정 줄 학습 row_id={} 거래처={} {} 줄 {}", r["row_id"], client, day, n)
 
-    def quote_job_row(self, inp, index, cutoff) -> tuple[str, str, str, str, str]:
+    def quote_job_row(self, inp, index, cutoff, max_conf=None) -> tuple[str, str, str, str, str]:
         """JobInput → (단가 칸, 산출근거, 상태, method, confidence). 사다리 → 미결이면 Claude.
-        confidence high만 견적완료, mid/low는 '[가견적-mid/low]' + 견적확인필요, 실패는 단가 없이 견적확인필요."""
+        confidence high만 견적완료, mid/low는 '[가견적-mid/low]' + 견적확인필요, 실패는 단가 없이 견적확인필요.
+        max_conf: AI 결과 confidence 상한 (보류-미등록 가견적 → mid). 사다리의 max_conf와 둘 중 낮은 쪽."""
         from pricer_ai import AiError
         from pricer_job import M_PENDING, quote_ladder, split_items
 
@@ -429,7 +435,9 @@ class Pricer:
             if ai is None:
                 return "", f"미결 | {q.basis} | AI 없음", ST_CHECK, M_PENDING, ""
             try:
-                q = ai.quote(inp, index, cutoff, hint=q.hint, tag=inp.client, max_conf=q.max_conf)
+                caps = [c for c in (q.max_conf, max_conf) if c]
+                cap = min(caps, key=lambda c: CONF_RANK[c]) if caps else None
+                q = ai.quote(inp, index, cutoff, hint=q.hint, tag=inp.client, max_conf=cap)
             except AiError as e:
                 return "", f"미결 | {q.basis} | {e}", ST_CHECK, M_PENDING, ""
         price = "/".join(str(p) for _, p in q.item_prices) if q.item_prices else q.unit_price
@@ -483,6 +491,29 @@ class Pricer:
         except ValueError:
             return None
 
+    def quote_unreg(self, inp, index, cutoff) -> tuple[str, str, str, str]:
+        """보류-미등록 행 가견적 → (단가 칸, 산출근거, method, confidence). 거래처 없이(inp.client='') 사다리를 돌리므로
+        동일품·거래처 과거 단가는 자연히 건너뜀: D열 사전단가 → AI(최대 mid). 산출근거 '[가견적-미등록 거래처] …'."""
+        price, basis, _, method, conf = self.quote_job_row(inp, index, cutoff, max_conf=UNREG_MAX_CONF)
+        return price, f"{UNREG_TAG} {GAGYEON_RE.sub('', basis)}", method, conf
+
+    @staticmethod
+    def promote_unreg(inp, prev_method, prev_conf, body, index, cutoff) -> tuple[str, str]:
+        """보류-미등록 가견적 행의 거래처가 해석됨 (내용 그대로) → (산출근거, 상태). AI 재호출 없음.
+        사전단가 → 견적완료 high (해석된 거래처 과거 단가와 3배 이상 차이면 사전단가 규칙대로 '[가견적-low]' + 견적확인필요).
+        AI·다품목 → 적힌 단가 그대로 '[가견적-mid/low]' + 견적확인필요."""
+        from pricer_job import M_PRESET, quote_preset
+
+        rest = body[len(UNREG_TAG):].lstrip()
+        if prev_method == M_PRESET:
+            q = quote_preset(inp, index, cutoff)
+            if q is not None and q.confidence == "low":
+                return f"{gagyeon_tag('low')} {q.label()} | 거래처 등록 후", ST_CHECK
+            label = re.sub(r" \| (?:mid|low)$", " | high", q.label() if q is not None else rest)
+            return f"{label} | 거래처 등록 후 확정", ST_QUOTED
+        conf = prev_conf if prev_conf in ("mid", "low") else UNREG_MAX_CONF
+        return f"{gagyeon_tag(conf)} {rest} | 거래처 등록 후", ST_CHECK
+
     def process_job(self, key: str, scfg: dict, snap: dict) -> None:
         """임가공 시트. 확정 행 → 사다리/Claude 견적. 견적확인필요 행 → 사람이 단가를 고쳤으면 그 값으로 견적완료.
         확정으로 돌아온 가견적 행(사람이 상태 칸을 비움, 내용 지문 그대로) → 적힌 단가로 견적완료.
@@ -526,20 +557,55 @@ class Pricer:
                 if not self.dry_run:
                     self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
                 continue
-            if status not in (ST_CONFIRMED, ST_CHECK) and not hcheck:
+            unreg = status == ST_UNREG and r.get("unreg_quote")
+            if status not in (ST_CONFIRMED, ST_CHECK) and not hcheck and not unreg:
                 continue
 
             def set_basis(text, tag=tag):
                 set_cell(rownum, "basis", with_block_tag(tag, text) if tag else text)
 
             learn = False   # 사람 확정 → lines(source='sheet') 즉시 학습
-            prev = self.job_quote_get(r["row_id"]) if status in (ST_CONFIRMED, ST_CHECK) else None
+            prev = self.job_quote_get(r["row_id"]) if status in (ST_CONFIRMED, ST_CHECK, ST_UNREG) else None
+            same_fp = prev is not None and prev[1] == (r.get("fp") or "")
+            if unreg:
+                # 보류-미등록: 거래처 없이 가견적 한 번 (내용이 그대로면 다시 안 함 — AI 비용). 상태 칸은 watcher 것 그대로
+                if (same_fp and body.startswith(UNREG_TAG)) or (price_cell and not body):
+                    continue  # 이미 가견적함 / 사람이 적은 가격
+                index = index or self.job_index()
+                inp = JobInput.from_sheet_row(row, cols, "", "", date.today())
+                price, basis, method, conf = self.quote_unreg(inp, index, cutoff)
+                set_cell(rownum, "unit_price", price)
+                set_basis(basis)
+                self.job_quote_put(r["row_id"], price, r.get("fp"), method, conf, basis)
+                counts["미등록가견적"] += 1
+                logger.info("임가공 가견적(미등록) sheet={} row={} 거래처={!r} | 단가 {} | {} | {} | {}", label, rownum,
+                            cell(row, "client"), price or "-", method, conf or "-", ST_UNREG)
+                continue
             human_price = norm_price_cell(price_cell)
             human_edit = human_price and prev is not None and (
                 (status == ST_CHECK and human_price != (prev[0] or ""))
                 or (status == ST_CONFIRMED and prev[1] == (r.get("fp") or "") and awaiting_human(body)))
             n_items = item_count(JobInput.from_sheet_row(row, cols, "", "").raw) if human_edit else 1
-            if human_edit and len(human_price.split("/")) != n_items:
+            unreg_done = (status == ST_CONFIRMED and same_fp and body.startswith(UNREG_TAG)
+                          and bool(prev[0]) and bool(human_price))
+            if unreg_done:
+                # 보류-미등록 가견적 행의 거래처가 해석됨 (월말 import·clients add·별칭) → 재호출 없이 넘김
+                rest = body[len(UNREG_TAG):].lstrip()
+                if human_price != prev[0]:  # 보류 중에 사람이 단가를 고침 → 그 값으로
+                    new_status = ST_QUOTED_EDIT
+                    basis = f"사람 수정 {price_cell} (에이전트 {prev[0]}) | {rest}"
+                    self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis)
+                    learn = True
+                else:
+                    index = index or self.job_index()
+                    inp = JobInput.from_sheet_row(row, cols, r.get("client_resolved") or "",
+                                                  r.get("client_reg_no") or "", date.today())
+                    method, conf = self.con.execute("SELECT method, confidence FROM job_quotes WHERE row_id=?",
+                                                    (r["row_id"],)).fetchone()
+                    basis, new_status = self.promote_unreg(inp, method, conf, body, index, cutoff)
+                set_basis(basis)
+                msg = f"보류-미등록 해제 → {new_status} (단가 {price_cell}, 재호출 없음)"
+            elif human_edit and len(human_price.split("/")) != n_items:
                 # 단가 개수 ≠ 품목 수 → 견적확인필요 유지 + 산출근거에 표시 (같은 표시가 이미 있으면 그대로)
                 g, rc = GAGYEON_RE.match(body), RECHECK_RE.match(body)
                 note = f"단가 개수 불일치 (단가 {len(human_price.split('/'))}개 ≠ 품목 {n_items}개)"
@@ -610,6 +676,6 @@ class Pricer:
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
 
         tail = self.flush_own(writer, shared, base, snap)
-        logger.info("pricer sheet={} 견적완료={} (사람수정 {} 사람확인 {}) 견적확인필요={} 동명확인가견적={}{}", label,
+        logger.info("pricer sheet={} 견적완료={} (사람수정 {} 사람확인 {}) 견적확인필요={} 동명확인가견적={} 미등록가견적={}{}", label,
                     sum(counts[s] for s in QUOTED_STATES), counts[ST_QUOTED_EDIT], counts[ST_QUOTED_OK],
-                    counts[ST_CHECK], counts[ST_HCHECK], tail)
+                    counts[ST_CHECK], counts[ST_HCHECK], counts["미등록가견적"], tail)

@@ -22,7 +22,9 @@ config/sheets.yaml 설정에 따라 시트별 활성 월 탭을 폴링한다.
   작성자 잠금은 묶음 단위: 묶음 안 어느 행이든(보통 날짜 있는 첫 행, 메모 행 포함) 사람 작성자가 있으면
   묶음 전체 사람처리 — 다른 줄 작성자가 비어 있어도. 기존건-확인필요·명세표발행대기·명세표발행완료(AI) 판정보다 우선.
   서로 다른 작성자가 섞이면(예: 1행 고문, 2행 AI) 사람처리 + WARNING.
-  첫 행 거래처를 못 찾으면 묶음 전체 '보류-미등록'.
+  첫 행 거래처를 못 찾으면 묶음 전체 '보류-미등록'. 임가공은 안정화 뒤 pricer가 거래처 없이 가견적
+  (사전단가 → AI 최대 mid, 산출근거 '[가견적-미등록 거래처] …', 상태는 보류-미등록 그대로·발행 차단).
+  거래처가 나중에 해석되면 재호출 없이 사전단가 → 견적완료, AI → 견적확인필요(가견적 유지).
   로그: 거래처 판정(동명확인·수동처리·미등록 등)·작성자 섞임은 그 묶음의 판정이 바뀔 때만 찍음(매 폴링 반복 안 함).
   '작업완료 체크 → 발행 후보'는 묶음이 발행 조건(작성자 없음·기존건/보류/제외 아님·전 행 작업완료)을 만족할 때만.
   첫 묶음보다 위의 날짜 없는 행은 건너뜀. block_id = 묶음 첫 행의 row_id.
@@ -1173,6 +1175,9 @@ class Watcher:
                                   "client_note": e["client_note"],
                                   "block_date": blk["date"], "block_label": tag_client,
                                   "needs_quote": e["new_status"] == ST_HCHECK and e["status"] != ST_HCHECK,
+                                  # 보류-미등록 가견적 (임가공): 묶음이 안정화된 뒤에만 — 입력 중엔 견적 안 함
+                                  "unreg_quote": (e["new_status"] == ST_UNREG and not e["unknown_status"]
+                                                  and now - block_last >= settle),
                                   "block_tag": tag})
 
         block: dict | None = None
