@@ -9,8 +9,9 @@ v1: 호닝파이프(kind: pipe) — data/price_table.xlsx '삼화호닝' 시트 
     → 그 행은 lines(source='sheet')로 즉시 학습 (sheet_lines.py).
 
 watcher가 한 바퀴 돈 뒤 그 결과(snapshot)를 받아 처리한다.
-대상: 상태 '확정' + 작성자 빈칸 + 기존건 아님 (임가공은 안정화된 보류-미등록 행도 — 거래처 없이 가견적,
-상태는 보류-미등록 그대로. 거래처가 해석되면 재호출 없이 사전단가 → 견적완료, AI → 견적확인필요). 시트 쓰기는 시트당 batch_update 한 번
+대상: 상태 '확정' + 작성자 빈칸 + 기존건 아님 + 안정화된 보류-미등록 행 (상태는 보류-미등록 그대로·발행 차단,
+산출근거 '[가견적-미등록 거래처] …'). 호닝파이프: 단가표로 단가 → 해석되면 다시 계산해 견적완료(보류 중 사람이
+고친 단가는 사람수정). 임가공: 거래처 없이 가견적 → 해석되면 재호출 없이 사전단가 → 견적완료, AI → 견적확인필요. 시트 쓰기는 시트당 batch_update 한 번
 (agent.py run·issue: watcher와 같은 writer — 사람 '확인'/단가 수정 행은 중간 '확정' 없이 바로 견적완료(사람확인/사람수정)).
 """
 from __future__ import annotations
@@ -38,7 +39,7 @@ ST_QUOTED = "견적완료"
 ST_CHECK = "견적확인필요"
 ST_LEGACY = "기존건-확인필요"
 GAGYEON_RE = re.compile(r"^\[가견적-(mid|low)\]\s*")  # 임가공 가견적 표시 (단가는 적되 발행 차단)
-# 보류-미등록 묶음의 임가공 가견적 (거래처 없이 사전단가 → AI 최대 mid). 상태는 보류-미등록 그대로
+# 보류-미등록 묶음 가견적 (호닝파이프 단가표 / 임가공 거래처 없이 사전단가 → AI 최대 mid). 상태는 보류-미등록 그대로
 UNREG_TAG = "[가견적-미등록 거래처]"
 UNREG_MAX_CONF = "mid"
 _PRICE_CELL_RE = re.compile(r"\d[\d,]*(?:/\d[\d,]*)*")
@@ -280,7 +281,9 @@ class Pricer:
             # 동명확인: 기본 쪽 거래처로 가견적만 (동명확인에 막 들어온 바퀴에 한 번). 상태는 동명확인 그대로
             # → 견적완료가 안 되므로 발행 대상이 아님. 거래처 칸을 고치면 watcher가 확정 → 여기서 정식 견적.
             hcheck = r["status"] == ST_HCHECK and r.get("needs_quote")
-            if (r["status"] != ST_CONFIRMED and not hcheck) or r["author"] or r.get("legacy"):
+            # 보류-미등록 (안정화 뒤): 단가표로 단가·산출근거만, 상태는 보류-미등록 그대로 (발행 차단)
+            unreg = r["status"] == ST_UNREG and r.get("unreg_quote")
+            if (r["status"] != ST_CONFIRMED and not hcheck and not unreg) or r["author"] or r.get("legacy"):
                 continue
             row, rownum = r["row"], r["rownum"]
 
@@ -288,20 +291,53 @@ class Pricer:
                 writer.add(rownum, name, value, row, row_id=r["row_id"], expect_fp=r.get("fp"))
 
             tag = r.get("block_tag") or ""
+            price_cell, body = cell(row, "unit_price"), strip_block_tag(cell(row, "basis"))
+
+            def set_basis(text, tag=tag):
+                set_cell(rownum, "basis", with_block_tag(tag, text) if tag else text)
+
+            prev = self.job_quote_get(r["row_id"]) if body.startswith(UNREG_TAG) else None
+            same_fp = prev is not None and prev[1] == (r.get("fp") or "")
+            if unreg:
+                if (price_cell and not body) or same_fp:
+                    continue  # 사람이 적은 가격 / 이미 가견적함 (보류 중 사람이 고친 단가는 해제 때 사람수정)
+                try:
+                    price, basis = quote_pipe(table, cell(row, "size"), cell(row, "length"),
+                                              cell(row, "qty"), cell(row, "pipe_type"))
+                    method = "단가표"
+                except QuoteError as e:
+                    price, basis, method = "", str(e), "실패"
+                basis = f"{UNREG_TAG} {basis}"
+                set_cell(rownum, "unit_price", price)
+                set_basis(basis)
+                self.job_quote_put(r["row_id"], price, r.get("fp"), method, "", basis)
+                counts["미등록가견적"] += 1
+                logger.info("pricer sheet={} row={} client={} {} : 가견적 {} ({})", label, rownum,
+                            cell(row, "client"), ST_UNREG, f"{price:,}" if price else "-", basis)
+                continue
+            human_price = norm_price_cell(price_cell)
+            if same_fp and r["status"] == ST_CONFIRMED and human_price and human_price != (prev[0] or ""):
+                # 보류-미등록 가견적 행의 거래처가 해석됨 + 보류 중 사람이 단가를 고침 → 그 값으로
+                new_status, msg = ST_QUOTED_EDIT, f"보류-미등록 해제, 사람 단가 {price_cell} 유지"
+                basis = f"사람 수정 {price_cell} (에이전트 {prev[0] or '없음'}) | {body[len(UNREG_TAG):].lstrip()}"
+                set_basis(basis)
+                self.job_quote_human(r["row_id"], human_price, r.get("fp"), "사람수정", basis)
             # 산출근거의 묶음 표시는 watcher가 붙인 것 — 그것만 있으면 근거 없는 것으로 봄
-            if cell(row, "unit_price") and not strip_block_tag(cell(row, "basis")):
+            elif price_cell and not body:
                 # 사람이 적은 가격 → 건드리지 않음
                 new_status, msg = ST_QUOTED, "사람 입력 가격 유지"
             else:
                 try:
                     price, basis = quote_pipe(table, cell(row, "size"), cell(row, "length"),
                                               cell(row, "qty"), cell(row, "pipe_type"))
+                    if body.startswith(UNREG_TAG):  # 보류-미등록 가견적 행의 거래처가 해석됨 → 다시 계산해 확정
+                        basis += " | 거래처 등록 후 확정"
                     set_cell(rownum, "unit_price", price)
-                    set_cell(rownum, "basis", with_block_tag(tag, basis) if tag else basis)
+                    set_basis(basis)
                     new_status, msg = ST_QUOTED, f"{price:,} ({basis})"
                 except QuoteError as e:
                     set_cell(rownum, "unit_price", "")
-                    set_cell(rownum, "basis", with_block_tag(tag, str(e)) if tag else str(e))
+                    set_basis(str(e))
                     new_status, msg = ST_CHECK, str(e)
             if hcheck:
                 new_status = ST_HCHECK  # 단가만 적고 발행 보류
@@ -315,9 +351,9 @@ class Pricer:
                 self.con.execute("UPDATE rows SET status=? WHERE row_id=?", (new_status, r["row_id"]))
 
         tail = self.flush_own(writer, shared, base, snap)
-        logger.info("pricer sheet={} 견적완료={} (사람수정 {} 사람확인 {}) 견적확인필요={} 동명확인가견적={}{}", label,
-                    sum(counts[s] for s in QUOTED_STATES), counts[ST_QUOTED_EDIT], counts[ST_QUOTED_OK],
-                    counts[ST_CHECK], counts[ST_HCHECK], tail)
+        logger.info("pricer sheet={} 견적완료={} (사람수정 {} 사람확인 {}) 견적확인필요={} 동명확인가견적={} 미등록가견적={}{}",
+                    label, sum(counts[s] for s in QUOTED_STATES), counts[ST_QUOTED_EDIT], counts[ST_QUOTED_OK],
+                    counts[ST_CHECK], counts[ST_HCHECK], counts["미등록가견적"], tail)
 
     # ------------------------------------------------------------ 임가공 (kind: job)
     def job_index(self):
