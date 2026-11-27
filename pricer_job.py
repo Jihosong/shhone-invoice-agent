@@ -21,6 +21,13 @@
        24개월 초과 → 미결 (Quote.hint에 직전 단가·날짜 + '최소 +5% 이상 제안할 것', max_conf=mid).
      수량이 직전의 3배 이상 / ⅓ 이하면 동일품으로 확정하지 않고 미결 (Quote.hint로 직전 건을 B단계에 넘김).
   c. 미결 — B단계(Claude 견적, pricer_ai)로 넘김.
+운영자 지시 (D 주요 메시지·S 물품 세부 정보에 '계산해줘·로 해줘·적용·cm²당·원으로·올려·그대로·무시…' 같은 지시 어휘):
+  사전단가(a)·동일품(b)을 건너뛰고 지시가 최우선. 결정적 패턴은 코드가 계산 (method=지시계산, high):
+    'cm²당(센티스퀘어당) N원' → π × 내경(cm) × 기장(cm) × N, 100원 버림 (내경·기장 없으면 확인필요)
+    '직전 단가 +N%' / 'N% 올려·내려' → 같은 거래처 직전 동일품 × (1±N%), 100원 버림 (직전 없으면 확인필요)
+    '지난번 그대로' / '이전 단가로' → 직전 동일품 단가 그대로 / '개당 N원' / 'N원으로' → N
+  그 밖의 지시 → 미결(Quote.directive)로 B단계: 프롬프트 맨 위 '※ 운영자 지시(최우선)', 결과 최대 mid
+  (config/sheets.yaml pricing.directive_ai_high: true면 high 허용). 지시 행 산출근거 본문은 '[지시]'로 시작.
 모든 DB 검색은 cutoff_date **이전**(당일 제외) 자료만 — 백테스트 정답 누출 방지.
 """
 from __future__ import annotations
@@ -39,6 +46,8 @@ from job_parse import (RAW_FIELDS, is_stock_removal, item_texts, norm, parse_chi
 M_PRESET = "사전단가"
 M_SAME = "동일품"
 M_PENDING = "미결"
+M_DIRECTIVE = "지시계산"
+DIRECTIVE_TAG = "[지시]"
 
 SAME_DIA_TOL = 0.3       # mm
 SAME_LEN_TOL = 0.05      # 비율
@@ -122,10 +131,13 @@ class Quote:
     hint: str = ""   # 미결일 때 B단계 참고 사례 맨 위에 둘 한 줄 (예: 수량 차이 큰 직전 동일품)
     max_conf: str | None = None   # B단계 결과 confidence 상한 (24개월 초과 동일품 → mid)
     cost_usd: float = 0.0   # B단계 API 비용
+    directive: str = ""   # 운영자 지시문 (D·S) — 미결이면 B단계 프롬프트 맨 위에 최우선으로
+    tag: str = ""         # 산출근거 본문 맨 앞: '[지시]' / 계산 못 한 지시 '[지시: cm²당 20원 — 기장 없음]'
 
     def label(self) -> str:
-        """산출근거 본문 'method | basis | conf' (블록태그는 pricer가 붙임)."""
-        return f"{self.method} | {self.basis} | {self.confidence or '-'}"
+        """산출근거 본문 '[tag] method | basis | conf' (블록태그·가견적 태그는 pricer가 앞에 붙임)."""
+        body = f"{self.method} | {self.basis} | {self.confidence or '-'}"
+        return f"{self.tag} {body}" if self.tag else body
 
 
 def item_keywords(text: str) -> frozenset:
@@ -276,33 +288,49 @@ def quote_same_item(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_
     return Quote(M_SAME, price, conf, " / ".join(parts), ln.id)
 
 
-_freeze_cache: tuple[str, float, str] | None = None   # (경로, mtime, 값)
+_pricing_cache: tuple[str, float, dict] | None = None   # (경로, mtime, pricing 절)
 
 
-def freeze_conf(path=None) -> str:
-    """6~12개월 동일품 confidence: FREEZE_CONF > config/sheets.yaml pricing.same_item_6_12m_confidence > mid.
-    파일이 바뀌면(mtime) 다시 읽는다. high/mid 외 값은 경고 후 mid."""
-    global _freeze_cache
-    if FREEZE_CONF:
-        return FREEZE_CONF
+def _pricing_cfg(path=None) -> dict:
+    """config/sheets.yaml의 pricing 절 (파일이 바뀌면(mtime) 다시 읽음). 파일이 없으면 {}."""
+    global _pricing_cache
     from pathlib import Path
 
     path = Path(path or Path(__file__).parent / "config" / "sheets.yaml")
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        return FREEZE_CONF_DEFAULT
-    if _freeze_cache is None or _freeze_cache[:2] != (str(path), mtime):
+        return {}
+    if _pricing_cache is None or _pricing_cache[:2] != (str(path), mtime):
         import yaml
-        from loguru import logger
 
         with open(path, encoding="utf-8") as f:
-            v = ((yaml.safe_load(f) or {}).get("pricing") or {}).get("same_item_6_12m_confidence", FREEZE_CONF_DEFAULT)
-        if v not in ("high", "mid"):
-            logger.warning("sheets.yaml pricing.same_item_6_12m_confidence={!r} — high/mid만 가능 → mid", v)
-            v = FREEZE_CONF_DEFAULT
-        _freeze_cache = (str(path), mtime, v)
-    return _freeze_cache[2]
+            _pricing_cache = (str(path), mtime, (yaml.safe_load(f) or {}).get("pricing") or {})
+    return _pricing_cache[2]
+
+
+def freeze_conf(path=None) -> str:
+    """6~12개월 동일품 confidence: FREEZE_CONF > config/sheets.yaml pricing.same_item_6_12m_confidence > mid.
+    파일이 바뀌면(mtime) 다시 읽는다. high/mid 외 값은 경고 후 mid."""
+    if FREEZE_CONF:
+        return FREEZE_CONF
+    v = _pricing_cfg(path).get("same_item_6_12m_confidence", FREEZE_CONF_DEFAULT)
+    if v not in ("high", "mid"):
+        from loguru import logger
+
+        logger.warning("sheets.yaml pricing.same_item_6_12m_confidence={!r} — high/mid만 가능 → mid", v)
+        v = FREEZE_CONF_DEFAULT
+    return v
+
+
+DIRECTIVE_AI_HIGH: bool | None = None   # 지정하면 config보다 우선 (테스트용)
+
+
+def directive_ai_high(path=None) -> bool:
+    """자유 지시 AI 결과의 high 허용: config/sheets.yaml pricing.directive_ai_high (기본 false → 최대 mid)."""
+    if DIRECTIVE_AI_HIGH is not None:
+        return DIRECTIVE_AI_HIGH
+    return _pricing_cfg(path).get("directive_ai_high", False) is True
 
 
 def pct(rate: float) -> str:
@@ -322,6 +350,106 @@ def raise_rate(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_ids=(
     lines = [ln for ln in index.client_lines(inp.reg_no, inp.client)
              if ln.date < cutoff_date and ln.id not in exclude_ids]
     return client_trend(lines).raise_rate()
+
+
+# ---------------------------------------------------------------- 운영자 지시 (D·S)
+DIRECTIVE_FIELDS = (("main_msg", "D"), ("pre_note", "S"))   # D 주요 메시지, S 물품 세부 정보
+_AREA = r"(?:센[티치]\s*스퀘어|평방\s*센[티치]|제곱\s*센[티치]|cm\s*(?:²|2|\^2)|㎠)"
+# 지시 어휘 — 하나라도 있으면 '지시 있음' (사전단가·동일품 지름길을 건너뜀)
+DIRECTIVE_RE = re.compile(
+    r"계산\s*해|로\s*해\s*(?:줘|주세요|주십시오|라|요)|적용|" + _AREA + r"|원\s*으로|올려|내려|"
+    r"\d\s*(?:만\s*)?(?:원|%|퍼센트|프로)?\s*(?:인상|인하)|"   # '1000원인상' ('학인하고' 같은 오타는 제외)
+    r"그대로|무시|임가공\s*이지|(?:지난\s*번|이전|직전)\s*(?:단가|가격)|개당\s*\d", re.I)
+_WON = r"(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(만)?\s*원"
+# 'cm²당 20원' · '센티스퀘어당 20원' · 시트에 실제로 쓰는 'cm2/18' · 'cm2/23원' (원 생략 가능)
+_AREA_RATE_RE = re.compile(_AREA + r"\s*(?:당|에|/)\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(만)?\s*(?:원)?", re.I)
+_PCT = r"(\d+(?:\.\d+)?)\s*(?:%|퍼센트|프로)"
+_PREV_PCT_RE = re.compile(r"(?:직전|이전|지난\s*번)\s*(?:단가|가격)?\s*(?:에서|대비|의)?\s*([+-])\s*" + _PCT)
+_PCT_WORD_RE = re.compile(_PCT + r"\s*(올려|올리|인상|내려|내리|인하)")
+_PREV_SAME_RE = re.compile(r"(?:지난\s*번|직전|이전)\s*(?:이랑|과|하고|와)?\s*(?:단가|가격)?\s*(?:으로|로)?\s*"
+                           r"(?:그대로|동일|같이|똑같이)|(?:이전|직전|지난\s*번)\s*(?:단가|가격)\s*(?:으로|로)")
+_PER_PIECE_RE = re.compile(r"개당\s*" + _WON)
+_WON_TO_RE = re.compile(_WON + r"\s*으로")
+
+
+def directive_text(raw: dict) -> str:
+    """D·S 중 지시 어휘가 있는 칸 → 'D: … / S: …' (지시 없으면 '')."""
+    return " / ".join(f"{lab}: {norm(raw.get(f, ''))}" for f, lab in DIRECTIVE_FIELDS
+                      if DIRECTIVE_RE.search(norm(raw.get(f, ""))))
+
+
+def _won(num: str, man: str | None) -> int:
+    v = Decimal(num.replace(",", ""))
+    return int(v * 10000 if man else v)
+
+
+def floor100(v) -> int:
+    """100원 단위 버림."""
+    return int(Decimal(str(v)) // 100 * 100)
+
+
+def area_price(dia_mm: float, length_mm: float, rate: int) -> tuple[int, str]:
+    """π × 내경(cm) × 기장(cm) × cm²당 단가, 100원 버림 → (단가, 식). Ø160 L2380 20원 → 239,267.6 → 239,200."""
+    import math
+
+    raw = math.pi * (dia_mm / 10) * (length_mm / 10) * rate
+    price = floor100(raw)
+    return price, f"π×{dia_mm / 10:g}cm×{length_mm / 10:g}cm×{rate:,}원 = {raw:,.0f} → {price:,} (100원 버림)"
+
+
+def quote_directive(inp: JobInput, text: str, index: LineIndex | None, cutoff_date: date,
+                    exclude_ids=()) -> Quote:
+    """운영자 지시가 있는 행 (사전단가·동일품 지름길 없이). 결정적 패턴이면 지시계산 high,
+    계산할 수 없으면 단가 없이 '[지시: … — 사유]' (pricer가 견적확인필요로), 그 밖은 미결(directive) → B단계."""
+    def fail(what: str, why: str) -> Quote:
+        return Quote(M_DIRECTIVE, None, None, f"운영자 지시 '{text}'", tag=f"[지시: {what} — {why}]",
+                     directive=text)
+
+    def ok(price: int, how: str) -> Quote:
+        return Quote(M_DIRECTIVE, price, "high", how, tag=DIRECTIVE_TAG, directive=text)
+
+    def prev_line():
+        if index is None:
+            return None
+        cands = same_item_lines(inp, index, cutoff_date, exclude_ids, loose_kw=True)
+        return cands[0] if cands else None
+
+    # a. cm²당 N원 (먼저: 'cm²당 20원으로'의 '20원으로'를 개당 단가로 읽지 않게)
+    if m := _AREA_RATE_RE.search(text):
+        rate = _won(m.group(1), m.group(2))
+        what = f"cm²당 {rate:,}원"
+        if inp.dia is None:
+            return fail(what, "내경 없음")
+        if not inp.length:
+            return fail(what, "기장 없음")
+        price, how = area_price(inp.dia, inp.length, rate)
+        return ok(price, f"{what}: {how}")
+    # c. 직전 단가 ±N% / N% 올려·내려
+    if m := _PREV_PCT_RE.search(text):
+        rate = float(m.group(2)) / 100 * (1 if m.group(1) == "+" else -1)
+    elif m := _PCT_WORD_RE.search(text):
+        rate = float(m.group(1)) / 100 * (1 if m.group(2) in ("올려", "올리", "인상") else -1)
+    if m:
+        what = f"직전 단가 {pct(rate)}"
+        ln = prev_line()
+        if ln is None:
+            return fail(what, "직전 동일품 없음")
+        price = raised_price(int(ln.unit_price), rate)
+        return ok(price, f"{what}: 직전 {ln.unit_price:,}원 ({ln.date.isoformat()}) → {price:,} (100원 버림)")
+    # d. 지난번 그대로 / 이전 단가로
+    if _PREV_SAME_RE.search(text):
+        what = "직전 단가 그대로"
+        ln = prev_line()
+        if ln is None:
+            return fail(what, "직전 동일품 없음")
+        return ok(int(ln.unit_price), f"{what}: 직전 {ln.unit_price:,}원 ({ln.date.isoformat()})")
+    # b. 개당 N원 / N원으로
+    if m := (_PER_PIECE_RE.search(text) or _WON_TO_RE.search(text)):
+        price = _won(m.group(1), m.group(2))
+        if price <= 0:
+            return fail(m.group(0).strip(), "단가 0")
+        return ok(price, f"개당 {price:,}원 (지시 '{m.group(0).strip()}')")
+    return Quote(M_PENDING, basis="운영자 지시 → AI", directive=text, tag=DIRECTIVE_TAG)
 
 
 # ---------------------------------------------------------------- 다품목 (한 행에 품목 여럿)
@@ -356,9 +484,13 @@ def split_items(inp: JobInput) -> list[JobInput]:
 
 # ---------------------------------------------------------------- 사다리
 def quote_ladder(inp: JobInput, index: LineIndex, cutoff_date: date, exclude_ids=()) -> Quote:
-    """a 사전단가 → b 동일품 → c 미결 (B단계에서 Claude). 미결 Quote도 hint를 가질 수 있다."""
+    """운영자 지시(있으면 최우선) → a 사전단가 → b 동일품 → c 미결 (B단계에서 Claude).
+    미결 Quote도 hint·directive를 가질 수 있다."""
     if cutoff_date is None:
         raise ValueError("cutoff_date 필수 (백테스트 정답 누출 방지)")
+    d = directive_text(inp.raw)
+    if d:
+        return quote_directive(inp, d, index, cutoff_date, exclude_ids)
     return (quote_preset(inp, index, cutoff_date, exclude_ids)
             or quote_same_item(inp, index, cutoff_date, exclude_ids)
             or Quote(M_PENDING, basis="사전단가·동일품 없음"))

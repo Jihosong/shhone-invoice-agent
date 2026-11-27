@@ -1,4 +1,4 @@
-"""임가공 과거 사례(DB lines, kind='job') 적재 + 유사건 검색 인터페이스.
+"""임가공 과거 사례(DB lines, kind='job', 호닝파이프 품목 제외) 적재 + 유사건 검색 인터페이스.
 
 견적 엔진(아직 없음)과 백테스트가 함께 쓴다. **유사건 검색은 반드시 cutoff_date 이전 자료만** 본다 —
 백테스트에서 그 행의 실제 발행 단가(=정답)나 그 뒤 자료가 후보로 새어 들어오지 않게.
@@ -42,7 +42,11 @@ class DbLine:
 def load_job_lines(con: sqlite3.Connection, start: str = "0000-00-00", end: str = "9999-99-99",
                    official_only: bool = False) -> list[DbLine]:
     """lines(kind='job') + 같은 날·같은 거래처 명세표 → 사업자번호·statement_id. 날짜·id 순.
-    시트 확정 줄(source='sheet', sheet_lines.py)도 포함 — official_only=True면 공식 import 줄만 (백테스트)."""
+    시트 확정 줄(source='sheet', sheet_lines.py)도 포함 — official_only=True면 공식 import 줄만 (백테스트).
+    품목명이 호닝파이프·소관(파이프)·H.P인 줄은 kind와 무관하게 뺀다 (feedback.is_pipe_item) — 옛 분류로
+    job이 된 호닝파이프 줄('160-190-2340')이 동일품·유사품·거래처 단가·AI 참고 사례에 섞이지 않게."""
+    from feedback import is_pipe_item
+
     stm = defaultdict(list)
     for sid, d, client, reg, item, spec in con.execute(
             "SELECT id, date, client, reg_no, item, spec FROM statements WHERE date BETWEEN ? AND ?", (start, end)):
@@ -55,6 +59,8 @@ def load_job_lines(con: sqlite3.Connection, start: str = "0000-00-00", end: str 
             "SELECT id, date, client, item, spec, qty, unit_price, supply, dia, length, tol_lo, tol_hi, reg_no"
             " FROM lines WHERE kind='job' AND date BETWEEN ? AND ?"
             + (" AND COALESCE(source, 'export')<>'sheet'" if official_only else "") + " ORDER BY date, id", (start, end)):
+        if is_pipe_item(item):
+            continue
         cands = stm.get((d, client), [])
         pick = [c for c in cands if c[2] == item and (c[3] or "") == (spec or "")] or cands
         sid = "|".join(str(c[0]) for c in pick) if len(pick) > 1 and len(cands) > 1 else (

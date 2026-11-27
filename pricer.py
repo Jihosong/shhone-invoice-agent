@@ -557,17 +557,22 @@ class Pricer:
             return self.quote_job_multi(inp, segs, index, cutoff)
         q = quote_ladder(inp, index, cutoff)
         if q.method == M_PENDING:
+            head = f"{q.tag} 미결" if q.tag else "미결"   # 운영자 지시 행 → '[지시] 미결 | …'
             if self.dry_run:  # 시트에 안 쓰면 다음 바퀴에 또 미결 → 매 바퀴 API 비용. dry-run은 호출 안 함
-                return "", f"미결 | {q.basis} | dry-run AI 생략", ST_CHECK, M_PENDING, ""
+                return "", f"{head} | {q.basis} | dry-run AI 생략", ST_CHECK, M_PENDING, ""
             ai = self.ai()
             if ai is None:
-                return "", f"미결 | {q.basis} | AI 없음", ST_CHECK, M_PENDING, ""
+                return "", f"{head} | {q.basis} | AI 없음", ST_CHECK, M_PENDING, ""
             try:
                 caps = [c for c in (q.max_conf, max_conf) if c]
                 cap = min(caps, key=lambda c: CONF_RANK[c]) if caps else None
-                q = ai.quote(inp, index, cutoff, hint=q.hint, tag=inp.client, max_conf=cap)
+                extra = {"directive": q.directive} if q.directive else {}
+                q = ai.quote(inp, index, cutoff, hint=q.hint, tag=inp.client, max_conf=cap, **extra)
             except AiError as e:
-                return "", f"미결 | {q.basis} | {e}", ST_CHECK, M_PENDING, ""
+                return "", f"{head} | {q.basis} | {e}", ST_CHECK, M_PENDING, ""
+        elif q.unit_price is None and not q.item_prices:
+            # 계산할 수 없는 운영자 지시 ('[지시: cm²당 20원 — 기장 없음]') → 단가 없이 견적확인필요
+            return "", q.label(), ST_CHECK, q.method, ""
         price = "/".join(str(p) for _, p in q.item_prices) if q.item_prices else q.unit_price
         if q.confidence == "high":
             return price, q.label(), ST_QUOTED, q.method, q.confidence
@@ -578,7 +583,7 @@ class Pricer:
         단가 칸 '60000/55000/50000', 산출근거는 구간별 '; ', confidence는 구간 중 최저이되 최대 mid
         → 항상 '[가견적-…]' + 견적확인필요. 한 구간이라도 단가를 못 내면 단가 비우고 견적확인필요."""
         from pricer_ai import AiError
-        from pricer_job import M_PENDING, quote_ladder
+        from pricer_job import M_DIRECTIVE, M_PENDING, quote_ladder
 
         n = len(segs)
         qs = [quote_ladder(s, index, cutoff) for s in segs]
@@ -587,6 +592,13 @@ class Pricer:
         def joined(quotes):
             return "; ".join(f"구간{i + 1} {q.label()}" for i, q in enumerate(quotes))
 
+        failed = [q for q in qs if q.method == M_DIRECTIVE and q.unit_price is None]
+        if failed:  # 계산할 수 없는 운영자 지시 구간 → 단가 없이 견적확인필요 (AI 안 부름)
+            return "", f"{failed[0].tag} 다품목 {n}구간: {joined(qs)}", ST_CHECK, M_DIRECTIVE, ""
+        if all(q.method == M_DIRECTIVE and q.confidence == "high" for q in qs):
+            # 모든 구간이 운영자 지시 계산 (cm²당 N원 등 — 품목마다 각각) → 다품목 상한 없이 견적완료
+            price = "/".join(str(q.unit_price) for q in qs)
+            return price, f"[지시] 다품목 {n}구간: {joined(qs)}", ST_QUOTED, M_DIRECTIVE, "high"
         if pending:
             why = None
             if self.dry_run:  # 매 바퀴 API 비용 방지 (단품과 같음)

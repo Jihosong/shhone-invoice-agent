@@ -10,6 +10,8 @@
   다품목 한 행(E에 '+'로 품목 여럿)은 quote_multi: 구간 목록(규칙으로 정해진 구간은 단가 표시)을 주고
   미결 구간들을 한 번의 호출로 {"items": [{segment, …B.5}]} 배열로 받는다 (호출 1건으로 셈).
   사다리가 max_conf를 주면(24개월 초과 동일품) 결과 confidence를 그 아래로 깎는다.
+- 운영자 지시(D·S, pricer_job.directive_text)가 있는 미결 행: 프롬프트 맨 위에 '※ 운영자 지시(최우선): …',
+  결과는 최대 mid (config pricing.directive_ai_high: true면 high 허용), 산출근거 '[지시] AI-… | [지시 반영] …'.
 - temperature: Sonnet 5.5는 기본값이 아닌 temperature를 400으로 거절 → 보내지 않는다.
   thinking: max_tokens 300 안에서 답만 내도록 between_tools(사고 없음).
 - 호출마다 토큰·비용을 logs/ai_calls.jsonl에 한 줄씩 남긴다. 운영 호출은 하루 DAILY_LIMIT건까지,
@@ -73,6 +75,7 @@ FIELD_LABELS = {"main_msg": "D 주요 메시지", "spec_qty": "E 공차x갯수·
                 "pre_size": "H 연마량/치대", "pre_note": "S 호닝 전 매니저 노트"}
 CONF_RANK = {"low": 0, "mid": 1, "high": 2}
 AI_PRESET_MAX = "mid"   # AI가 D열 숫자를 근거로 낸 사전단가의 confidence 상한
+DIRECTIVE_MAX = "mid"   # 운영자 자유 지시를 AI가 반영한 결과의 confidence 상한 (config로 high 허용)
 
 _log_lock = threading.Lock()
 
@@ -131,8 +134,17 @@ def client_tendency(inp: JobInput, index: LineIndex, cutoff: date, exclude_ids=(
     return inflation.client_trend(lines).line()
 
 
-def build_user_message(inp: JobInput, index: LineIndex, cutoff: date, exclude_ids=(), hint: str = "") -> str:
-    parts = ["# 견적 요청",
+def directive_head(directive: str) -> list[str]:
+    """프롬프트 맨 위 운영자 지시 (최우선)."""
+    if not directive:
+        return []
+    return [f"※ 운영자 지시(최우선): {directive}",
+            "  위 지시를 아래 규칙·참고 사례보다 먼저 따르고, basis에 지시를 어떻게 반영했는지 적어라.", ""]
+
+
+def build_user_message(inp: JobInput, index: LineIndex, cutoff: date, exclude_ids=(), hint: str = "",
+                       directive: str = "") -> str:
+    parts = directive_head(directive) + ["# 견적 요청",
              f"- 접수일: {inp.on_date.isoformat() if inp.on_date else '-'}",
              f"- 거래처: {inp.client or '(미해석)'}"]
     parts += [f"- {FIELD_LABELS[k]}: {v}" for k, v in inp.raw.items() if v]
@@ -185,9 +197,9 @@ def _merge_cases(lists, n: int) -> list[DbLine]:
 
 
 def build_multi_message(inp: JobInput, segs: list[JobInput], quotes: list[Quote], pending: list[int],
-                        index: LineIndex, cutoff: date, exclude_ids=()) -> str:
+                        index: LineIndex, cutoff: date, exclude_ids=(), directive: str = "") -> str:
     """다품목 한 행: 행 원문 + 구간 목록(규칙으로 정해진 구간은 단가와 함께) + 견적할 구간 번호들."""
-    parts = ["# 견적 요청 (한 행에 품목 여럿 — 구간별 견적)",
+    parts = directive_head(directive) + ["# 견적 요청 (한 행에 품목 여럿 — 구간별 견적)",
              f"- 접수일: {inp.on_date.isoformat() if inp.on_date else '-'}",
              f"- 거래처: {inp.client or '(미해석)'}"]
     parts += [f"- {FIELD_LABELS[k]}: {v}" for k, v in inp.raw.items() if v]
@@ -395,23 +407,32 @@ class AiPricer:
         return ans, cost
 
     @staticmethod
-    def _to_quote(ans: dict, cost: float, max_conf: str | None) -> Quote:
-        """답 → Quote. max_conf(24개월 초과 동일품)·AI 사전단가 상한 적용."""
+    def _to_quote(ans: dict, cost: float, max_conf: str | None, directive: str = "") -> Quote:
+        """답 → Quote. max_conf(24개월 초과 동일품)·AI 사전단가·운영자 지시(최대 mid, config로 high 허용) 상한 적용."""
+        from pricer_job import DIRECTIVE_TAG, directive_ai_high
+
         conf, basis = ans["confidence"], ans["basis"]
         if max_conf and CONF_RANK[conf] > CONF_RANK[max_conf]:
             conf, basis = max_conf, f"{basis} (24개월 초과 동일품 → 최대 {max_conf})"
         if ans["method"] == "사전단가" and conf == "high":  # 규칙 단계가 거른 D열 숫자를 AI가 단가로 읽은 것
             conf, basis = AI_PRESET_MAX, f"{basis} (AI 사전단가 → 최대 {AI_PRESET_MAX})"
-        return Quote("AI-" + ans["method"], ans["unit_price"], conf, basis, cost_usd=cost)
+        if not directive:
+            return Quote("AI-" + ans["method"], ans["unit_price"], conf, basis, cost_usd=cost)
+        basis = f"[지시 반영] {basis}"
+        if CONF_RANK[conf] > CONF_RANK[DIRECTIVE_MAX] and not directive_ai_high():
+            conf, basis = DIRECTIVE_MAX, f"{basis} (운영자 지시 AI → 최대 {DIRECTIVE_MAX})"
+        return Quote("AI-" + ans["method"], ans["unit_price"], conf, basis, cost_usd=cost, directive=directive,
+                     tag=DIRECTIVE_TAG)
 
     def quote(self, inp: JobInput, index: LineIndex, cutoff: date, exclude_ids=(), hint: str = "",
-              tag: str = "", max_conf: str | None = None) -> Quote:
-        """미결 행 → Quote(method='AI-<방법>'). max_conf가 있으면 confidence를 그 아래로. 실패하면 AiError."""
-        user_msg = build_user_message(inp, index, cutoff, exclude_ids, hint)
+              tag: str = "", max_conf: str | None = None, directive: str = "") -> Quote:
+        """미결 행 → Quote(method='AI-<방법>'). max_conf가 있으면 confidence를 그 아래로.
+        directive(운영자 지시)가 있으면 프롬프트 맨 위에 최우선으로, 결과 최대 mid. 실패하면 AiError."""
+        user_msg = build_user_message(inp, index, cutoff, exclude_ids, hint, directive)
         ans, cost = self._call(user_msg, tag, inp.client, parse_answer)
         logger.debug("AI 견적 {} {} → {:,} ({}/{}) ${:.4f}", tag, inp.client, ans["unit_price"], ans["method"],
                      ans["confidence"], cost)
-        return self._to_quote(ans, cost, max_conf)
+        return self._to_quote(ans, cost, max_conf, directive)
 
     def quote_multi(self, inp: JobInput, segs: list[JobInput], quotes: list[Quote], index: LineIndex,
                     cutoff: date, exclude_ids=(), tag: str = "") -> list[Quote]:
@@ -422,12 +443,13 @@ class AiPricer:
         pending = [i for i, q in enumerate(quotes) if q.method == M_PENDING]
         if not pending:
             return []
-        user_msg = build_multi_message(inp, segs, quotes, pending, index, cutoff, exclude_ids)
+        directive = next((quotes[i].directive for i in pending if quotes[i].directive), "")
+        user_msg = build_multi_message(inp, segs, quotes, pending, index, cutoff, exclude_ids, directive)
         answers, cost = self._call(user_msg, tag, inp.client, lambda t: parse_multi_answer(t, pending),
                                    MULTI_SCHEMA, 100 + MULTI_TOKENS_PER_ITEM * len(pending))
         logger.debug("AI 다품목 견적 {} {} → {} ${:.4f}", tag, inp.client,
                      "/".join(f"{a['unit_price']:,}" for a in answers), cost)
-        return [self._to_quote(a, cost if k == 0 else 0.0, quotes[i].max_conf)
+        return [self._to_quote(a, cost if k == 0 else 0.0, quotes[i].max_conf, quotes[i].directive)
                 for k, (i, a) in enumerate(zip(pending, answers))]
 
 
