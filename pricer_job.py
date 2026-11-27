@@ -23,8 +23,8 @@
   c. 미결 — B단계(Claude 견적, pricer_ai)로 넘김.
 운영자 지시 (D 주요 메시지·S 물품 세부 정보에 '계산해줘·로 해줘·적용·cm²당·원으로·올려·그대로·무시…' 같은 지시 어휘):
   사전단가(a)·동일품(b)을 건너뛰고 지시가 최우선. 결정적 패턴은 코드가 계산 (method=지시계산, high):
-    'cm²당(센티스퀘어당) N원' → π × 내경(cm) × 기장(cm) × N, 100원 버림 (내경·기장 없으면 확인필요)
-    '직전 단가 +N%' / 'N% 올려·내려' → 같은 거래처 직전 동일품 × (1±N%), 100원 버림 (직전 없으면 확인필요)
+    'cm²당(센티스퀘어당) N원' → π × 내경(cm) × 기장(cm) × N, 1,000원 버림 (내경·기장 없으면 확인필요)
+    '직전 단가 +N%' / 'N% 올려·내려' → 같은 거래처 직전 동일품 × (1±N%), 1,000원 버림 (직전 없으면 확인필요)
     '지난번 그대로' / '이전 단가로' → 직전 동일품 단가 그대로 / '개당 N원' / 'N원으로' → N
   그 밖의 지시 → 미결(Quote.directive)로 B단계: 프롬프트 맨 위 '※ 운영자 지시(최우선)', 결과 최대 mid
   (config/sheets.yaml pricing.directive_ai_high: true면 high 허용). 지시 행 산출근거 본문은 '[지시]'로 시작.
@@ -383,18 +383,21 @@ def _won(num: str, man: str | None) -> int:
     return int(v * 10000 if man else v)
 
 
-def floor100(v) -> int:
-    """100원 단위 버림."""
-    return int(Decimal(str(v)) // 100 * 100)
+DIRECTIVE_UNIT = 1000   # 지시계산(cm²당·±N%) 결과 버림 단위 — 239,263 → 239,000
+
+
+def floor_unit(v, unit: int = DIRECTIVE_UNIT) -> int:
+    """unit원 단위 버림 (기본 1,000원)."""
+    return int(Decimal(str(v)) // unit * unit)
 
 
 def area_price(dia_mm: float, length_mm: float, rate: int) -> tuple[int, str]:
-    """π × 내경(cm) × 기장(cm) × cm²당 단가, 100원 버림 → (단가, 식). Ø160 L2380 20원 → 239,267.6 → 239,200."""
+    """π × 내경(cm) × 기장(cm) × cm²당 단가, 1,000원 버림 → (단가, 식). Ø160 L2380 20원 → 239,263.7 → 239,000."""
     import math
 
     raw = math.pi * (dia_mm / 10) * (length_mm / 10) * rate
-    price = floor100(raw)
-    return price, f"π×{dia_mm / 10:g}cm×{length_mm / 10:g}cm×{rate:,}원 = {raw:,.0f} → {price:,} (100원 버림)"
+    price = floor_unit(raw)
+    return price, f"π×{dia_mm / 10:g}cm×{length_mm / 10:g}cm×{rate:,}원 = {raw:,.0f} → {price:,} (1,000원 버림)"
 
 
 def quote_directive(inp: JobInput, text: str, index: LineIndex | None, cutoff_date: date,
@@ -434,8 +437,10 @@ def quote_directive(inp: JobInput, text: str, index: LineIndex | None, cutoff_da
         ln = prev_line()
         if ln is None:
             return fail(what, "직전 동일품 없음")
-        price = raised_price(int(ln.unit_price), rate)
-        return ok(price, f"{what}: 직전 {ln.unit_price:,}원 ({ln.date.isoformat()}) → {price:,} (100원 버림)")
+        raw = Decimal(int(ln.unit_price)) * (1 + Decimal(str(rate)))
+        price = floor_unit(raw)
+        return ok(price, f"{what}: 직전 {ln.unit_price:,}원 ({ln.date.isoformat()}) × {1 + rate:g} = {raw:,.0f}"
+                         f" → {price:,} (1,000원 버림)")
     # d. 지난번 그대로 / 이전 단가로
     if _PREV_SAME_RE.search(text):
         what = "직전 단가 그대로"

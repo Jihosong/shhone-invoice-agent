@@ -68,15 +68,43 @@ def normalize_spec(spec):
     return _SINGLE_RE.sub(fix_single, s)
 
 
-# 품목명에 이 말이 있으면 호닝파이프(기성품) 줄 — 규격 모양과 무관하게 kind='pipe' (임가공 이력 검색에서 제외).
-# '소관'은 '소관파이프'를 포함. 'H.P'는 호닝파이프 약칭 (대소문자·점 뒤 공백 무시)
-PIPE_ITEM_WORDS = ("호닝파이프", "소관파이프", "소관", "H.P")
-_PIPE_ITEM_RE = re.compile(r"호닝\s*파이프|소관|(?<![A-Za-z])H\s*\.\s*P(?![A-Za-z])", re.I)
+# 파이프 판매 줄(kind='pipe', 임가공 이력 검색에서 제외) 판정 — 품목명은 NFKC·공백 제거 후 비교.
+#   ① 품목명이 호닝파이프/소관파이프/H.P로 시작 (그 단어뿐인 줄 포함)
+#   ② 품목명에 호닝파이프·소관파이프·소관·H.P가 있고, 그 말을 뺀 나머지에 작업 단어가 없음 ('소관및호닝파이프')
+#   ③ 규격이 파이프 규격(내경·외경·길이: '160-190-2340'·'160x190 2340'·'80x90 L760')이고 품목명(파이프 말 뺀 나머지)에
+#      작업 단어가 없음
+# 작업 단어: 호닝(재호닝)·용접·면작업·수리·연마·도금 ('외경쎈타레스연마 20/25/1000'·'내경도금비 159.7/180/560'은 작업) — '소관용접후호닝'·'후랜지용접소관호닝'·'시린더호닝(소관용접후)'은 임가공(job).
+_PIPE_START_RE = re.compile(r"^(?:호닝파이프|소관파이프|H\.P(?![A-Za-z]))", re.I)
+_PIPE_WORD_RE = re.compile(r"호닝파이프|소관파이프|소관|(?<![A-Za-z])H\.P(?![A-Za-z])", re.I)
+_WORK_RE = re.compile(r"호닝|용접|면작업|수리|연마|도금")
+
+
+def _compact_item(item) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", item)) if isinstance(item, str) else ""
+
+
+def _has_work_word(compact: str) -> bool:
+    """파이프 말(호닝파이프의 '호닝' 등)을 뺀 품목명에 작업 단어가 있는지."""
+    return bool(_WORK_RE.search(_PIPE_WORD_RE.sub(" ", compact)))
 
 
 def is_pipe_item(item) -> bool:
-    """품목명이 호닝파이프·소관(파이프)·H.P 줄인지."""
-    return bool(isinstance(item, str) and _PIPE_ITEM_RE.search(unicodedata.normalize("NFKC", item)))
+    """품목명만으로 파이프 판매 줄인지 (규칙 ①·②)."""
+    c = _compact_item(item)
+    return bool(_PIPE_START_RE.match(c) or (_PIPE_WORD_RE.search(c) and not _has_work_word(c)))
+
+
+def is_pipe_spec(spec) -> bool:
+    """규격이 파이프 규격(내경 < 외경 + 길이, Ø·공차 표기 없음)인지."""
+    if not isinstance(spec, str) or re.search(r"[ØΦ∅⌀φ~±+]", spec):
+        return False
+    m = _PIPE_DIMS_RE.search(spec)
+    return bool(m and float(m.group(1)) < float(m.group(2)))
+
+
+def is_pipe_line(item, spec) -> bool:
+    """파이프 판매 줄 (규칙 ①·②·③) — kind='pipe', 임가공 이력에서 제외."""
+    return is_pipe_item(item) or (is_pipe_spec(spec) and not _has_work_word(_compact_item(item)))
 
 
 def category_of(item, kind=None):
@@ -113,27 +141,33 @@ def parse_tol(seg):
     return (None, None)
 
 # 호닝파이프 규격 '내경/외경/길이': '40/50/1191' · '45x55 1228' · '160-190-2340' · '80x90 L760'
-_PIPE_DIMS_RE = re.compile(r"(\d+\.?\d*)\s*[/xX×*\-]\s*(\d+\.?\d*)\s*(?:[/xX×*\-]|\s)\s*L?\s*(\d+\.?\d*)")
+_PIPE_DIMS_RE = re.compile(r"(?<![\d.])(\d+\.?\d*)\s*[/xX×*\-]\s*(\d+\.?\d*)\s*(?:[/xX×*\-]|\s)\s*L?\s*(\d+\.?\d*)")
 
 
-def reclassify_pipe_lines(con) -> int:
-    """기존 DB의 품목명 호닝파이프·소관·H.P 줄 중 kind<>'pipe'인 것을 pipe로 다시 분류 (규격 다시 파싱,
-    dia·공차 비움, category 기성품). 반환 바꾼 줄 수."""
+def reclassify_pipe_lines(con) -> tuple[int, int]:
+    """기존 DB를 파이프 판매 규칙(is_pipe_line)으로 다시 분류 — 양방향. 규격을 다시 파싱해 kind·치수·category 갱신.
+    반환 (job→pipe 줄 수, pipe→job 줄 수)."""
     ensure_columns(con)
-    rows = [(lid, item, spec) for lid, item, spec in
-            con.execute("SELECT id, item, spec FROM lines WHERE COALESCE(kind, '')<>'pipe'") if is_pipe_item(item)]
-    for lid, item, spec in rows:
+    to_pipe, to_job = [], []
+    for lid, item, spec, kind in con.execute("SELECT id, item, spec, kind FROM lines"):
+        pipe = is_pipe_line(item, spec)
+        if pipe and kind != "pipe":
+            to_pipe.append((lid, item, spec))
+        elif not pipe and kind == "pipe":
+            to_job.append((lid, item, spec))
+    for lid, item, spec in to_pipe + to_job:
         p = parse_spec(spec, item)
-        con.execute("UPDATE lines SET kind='pipe', dia=NULL, tol_lo=NULL, tol_hi=NULL, length=?, pipe_id=?, pipe_od=?,"
-                    " category=? WHERE id=?", (p["length"], p["pipe_id"], p["pipe_od"], category_of(item, "pipe"), lid))
-    return len(rows)
+        con.execute("UPDATE lines SET kind=?, dia=?, tol_lo=?, tol_hi=?, length=?, pipe_id=?, pipe_od=?, category=?"
+                    " WHERE id=?", (p["kind"], p["dia"], p["tol_lo"], p["tol_hi"], p["length"], p["pipe_id"],
+                                    p["pipe_od"], category_of(item, p["kind"]), lid))
+    return len(to_pipe), len(to_job)
 
 
 def parse_spec(spec, item):
     """규격 문자열 → dict(kind, dia, tol_lo, tol_hi, length, pipe_id, pipe_od)"""
     out = dict(kind=None, dia=None, tol_lo=None, tol_hi=None, length=None, pipe_id=None, pipe_od=None)
-    if is_pipe_item(item):
-        # 호닝파이프 품목은 규격 모양과 무관하게 pipe ('160-190-2340', '80x90 L760', 규격 없음도).
+    if is_pipe_line(item, spec):
+        # 파이프 판매 줄은 규격 모양과 무관하게 pipe ('160-190-2340', '80x90 L760', 규격 없음도).
         # 예전엔 '/ x × *' 구분자만 pipe로 봐서 '-'·'L' 표기 줄이 job으로 떨어져 임가공 이력에 섞였다.
         out["kind"] = "pipe"
         m = isinstance(spec, str) and _PIPE_DIMS_RE.search(spec)
@@ -413,9 +447,9 @@ def main(stm_path, line_path, db_path, master_path=None):
                     "reg_no,spec_norm,category) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     import sheet_lines
 
-    n_re = reclassify_pipe_lines(con)  # 시트 학습 줄(source=sheet) 중 옛 규칙으로 job이 된 호닝파이프 줄
-    if n_re:
-        print("호닝파이프 품목 줄 pipe로 재분류=%d" % n_re)
+    n_pipe, n_job = reclassify_pipe_lines(con)  # 시트 학습 줄(source=sheet) 중 옛 규칙으로 분류된 줄
+    if n_pipe or n_job:
+        print("파이프 판매 규칙 재분류: job→pipe=%d pipe→job=%d" % (n_pipe, n_job))
     n_gone = sheet_lines.replace_by_official(con)
     con.commit()
     print("시트 확정 줄(source=sheet): 공식 줄로 대체되어 삭제=%d 남음=%d" % (

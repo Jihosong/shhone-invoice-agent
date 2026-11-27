@@ -50,19 +50,20 @@ def test_directive_detection(d, s, hit):
 # ---------------------------------------------------------------- a. cm²당 N원
 def test_area_rate_cm2():
     q = ladder(job(E160, d="센티스퀘어당 20원으로 계산해줘"))
-    # π × 16cm × 238cm × 20원 = 239,263.7 → 100원 버림 239,200
-    assert (q.method, q.unit_price, q.confidence) == (M_DIRECTIVE, 239_200, "high")
+    # π × 16cm × 238cm × 20원 = 239,263.7 → 1,000원 버림 239,000
+    assert (q.method, q.unit_price, q.confidence) == (M_DIRECTIVE, 239_000, "high")
+    assert "= 239,264 → 239,000 (1,000원 버림)" in q.basis
     assert q.label().startswith("[지시] 지시계산 | cm²당 20원: π×16cm×238cm×20원")
 
 
 @pytest.mark.parametrize("d", ["cm²당 20원", "cm2당 20원", "㎠당 20원", "cm2/20", "cm2/20원"])
 def test_area_rate_spellings(d):
-    assert ladder(job(E160, d=d)).unit_price == 239_200
+    assert ladder(job(E160, d=d)).unit_price == 239_000
 
 
 def test_area_rate_multi_items_each():
     segs = pricer_job.split_items(job("Ø160+0.0~+0.05/2380/2개 + Ø100+0.0~+0.05/1000/1개", d="cm²당 20원"))
-    assert [ladder(s).unit_price for s in segs] == [239_200, 62_800]   # π×10×100×20 = 62,831 → 62,800
+    assert [ladder(s).unit_price for s in segs] == [239_000, 62_000]   # π×10×100×20 = 62,831 → 62,000
 
 
 def test_area_rate_without_length_needs_check():
@@ -76,7 +77,7 @@ def test_area_rate_without_length_needs_check():
 
 # ---------------------------------------------------------------- b. 개당 N원 / N원으로
 @pytest.mark.parametrize("d,s,price", [
-    ("개당 45,000원", "", 45_000), ("", "45000원으로 해줘", 45_000), ("5만원으로 해줘", "", 50_000),
+    ("개당 45,300원", "", 45_300), ("", "45000원으로 해줘", 45_000),   # 개당 N원은 그대로 (버림 없음) ("5만원으로 해줘", "", 50_000),
     ("원통연마개당3만원이라함", "", 30_000)])
 def test_per_piece(d, s, price):
     q = ladder(job("Ø50/300/2개", d=d, s=s))
@@ -87,11 +88,11 @@ def test_per_piece(d, s, price):
 def test_prev_plus_10pct():
     hist = [ln(1, "2026-09-01", 38_500, length=300), ln(2, "2025-01-01", 30_000, length=300)]
     q = ladder(job("Ø50+0.0~+0.05/300/2개", d="직전 단가 +10%"), hist)
-    assert (q.method, q.unit_price, q.confidence) == (M_DIRECTIVE, 42_300, "high")  # 38,500×1.1=42,350 → 42,300
+    assert (q.method, q.unit_price, q.confidence) == (M_DIRECTIVE, 42_000, "high")  # 38,500×1.1=42,350 → 42,000
     assert "직전 38,500원 (2026-09-01)" in q.basis
 
 
-@pytest.mark.parametrize("d,price", [("10% 올려", 42_300), ("5% 내려", 36_500), ("지난번 그대로", 38_500),
+@pytest.mark.parametrize("d,price", [("10% 올려", 42_000), ("5% 내려", 36_000), ("지난번 그대로", 38_500),
                                      ("이전 단가로 해줘", 38_500)])
 def test_prev_variants(d, price):
     q = ladder(job("Ø50+0.0~+0.05/300/2개", d=d), [ln(1, "2026-09-01", 38_500, length=300)])
@@ -108,7 +109,7 @@ def test_directive_skips_same_item():
     hist = [ln(1, "2026-11-01", 900_000, dia=160.0, length=2380)]
     assert ladder(job(E160), hist).method == M_SAME                       # 지시 없음 → 동일품
     q = ladder(job(E160, d="cm²당 20원으로 계산해줘"), hist)
-    assert (q.method, q.unit_price) == (M_DIRECTIVE, 239_200)
+    assert (q.method, q.unit_price) == (M_DIRECTIVE, 239_000)
 
 
 def test_directive_in_s_skips_preset():
@@ -159,14 +160,14 @@ def test_free_directive_high_allowed_by_config(tmp_path, monkeypatch):
 def test_directive_row_quoted_high_in_ops():
     price, basis, st, method, conf = pricer.Pricer({}, None).quote_job_row(
         job(E160, d="센티스퀘어당 20원으로 계산해줘"), LineIndex.build([]), CUT)
-    assert (price, st, method, conf) == (239_200, pricer.ST_QUOTED, M_DIRECTIVE, "high")
+    assert (price, st, method, conf) == (239_000, pricer.ST_QUOTED, M_DIRECTIVE, "high")
     assert basis.startswith("[지시] 지시계산")
 
 
 def test_multi_items_all_directive_quoted():
     price, basis, st, _, conf = pricer.Pricer({}, None).quote_job_row(
         job("Ø160+0.0~+0.05/2380/2개 + Ø100+0.0~+0.05/1000/1개", d="cm²당 20원"), LineIndex.build([]), CUT)
-    assert (price, st, conf) == ("239200/62800", pricer.ST_QUOTED, "high") and basis.startswith("[지시] 다품목 2구간")
+    assert (price, st, conf) == ("239000/62000", pricer.ST_QUOTED, "high") and basis.startswith("[지시] 다품목 2구간")
 
 
 # ---------------------------------------------------------------- 지시 없는 행은 기존 동작
