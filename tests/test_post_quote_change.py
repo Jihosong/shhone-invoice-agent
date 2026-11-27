@@ -1,6 +1,6 @@
 """견적완료 이후 변경 처리 (임가공).
 
-기본(post_quote_recheck: false): 견적완료(자동·사람확인·사람수정)·명세표발행대기·발행완료 행은 D·E·F·H·S·T·U가
+기본(post_quote_recheck: false): 견적완료(자동·사람확인·사람수정)·명세표발행대기·발행완료 행은 D·E·F·H·S가
 바뀌어도 재견적 없이 단가·상태 유지 + 산출근거 끝 '[변경 11/27 14:05: H -0.3 추가]'(최근 3개).
 견적 전(입력중·확정·견적확인필요) 행은 재견적. 파일에 담긴 명세표발행대기는 '-수정됨' 그대로.
 post_quote_recheck: true면 사람 단가 행의 사양·큰 치대 변경 → 견적확인필요(단가 유지).
@@ -23,8 +23,8 @@ from watcher import (CHIDAE_DEFAULTS, ST_CHECK, ST_ISSUED, ST_PENDING, ST_PENDIN
                      ST_QUOTED_OK, ST_TYPING, append_change_tag, load_config, stock_change)
 
 COLS = {"date": 1, "client": 2, "main_msg": 4, "spec_qty": 5, "difficulty": 6, "stock_removal": 8, "work_end": 10,
-        "author": 15, "pre_note": 19, "post_size": 20, "post_note": 21, "status": 24, "unit_price": 25, "basis": 26,
-        "row_id": 28}
+        "author": 15, "pre_note": 19, "status": 22, "unit_price": 23, "basis": 24,
+        "row_id": 26}
 SCFG = {"spreadsheet_id": "x", "label": "임가공", "kind": "job", "data_start_row": 3, "columns": COLS,
         "hash_columns": ["client", "main_msg", "spec_qty", "difficulty", "stock_removal"],
         "item_columns": ["spec_qty", "main_msg"]}

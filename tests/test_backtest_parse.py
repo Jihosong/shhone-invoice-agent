@@ -125,5 +125,29 @@ def test_header_map_differs_per_tab():
         "호닝 전 치수", "호닝 전 매니저 노트", "문자 보고", "호닝 후 치수", "호닝 후 매니저 노트"]
     new = ["날짜", "거래처", "물품사진", "주요 메시지", "공차x갯수, 조도", "난이도", "작업자", "연마량 / 치대"] + [""] * 10 + [
         "호닝 전 매니저 노트", "호닝 후 치수", "호닝 후 매니저 노트"]
-    assert header_map(old)["pre_size"] == 18 and header_map(old)["post_note"] == 22
-    assert header_map(new)["pre_size"] == 7 and header_map(new)["post_size"] == 19
+    assert header_map(old)["pre_size"] == 18 and header_map(old)["pre_note"] == 19
+    assert header_map(new)["pre_size"] == 7 and header_map(new)["pre_note"] == 18
+    assert "post_size" not in header_map(old) and "post_note" not in header_map(new)  # T·U 삭제: 읽지 않음
+
+
+def test_collect_rows_reads_old_and_new_tabs():
+    """옛 탭(S·T·U 호닝 후 칸 있음)과 T·U 삭제 후 새 탭(상태·단가가 V·W)을 헤더 이름으로 둘 다 읽는다."""
+    from backtest import collect_rows
+
+    class Master:
+        def resolve_full(self, text):
+            class R: name, reg_no, hold, how, manual = text, "", None, "정확일치", False
+            return R()
+
+    h1 = ["인니어"] * 26
+    old_h = ["날짜", "거래처", "물품사진", "주요 메시지", "공차x갯수, 조도", "난이도", "작업자", "연마량 / 치대"] + [""] * 10 + [
+        "호닝 전 매니저 노트", "호닝 후 치수", "호닝 후 매니저 노트", "", "", "상태", "단가", "산출근거"]
+    new_h = ["날짜", "거래처", "물품사진", "주요 메시지", "공차x갯수, 조도", "난이도", "작업자", "연마량 / 치대"] + [""] * 10 + [
+        "호닝 전 매니저 노트", "", "", "상태", "단가", "산출근거"]
+    old_r = ["10/2", "가사", "", "", "Ø50 / 1개", "상", "", "-0.3"] + [""] * 10 + ["흑피", "50.02", "OK", "", "", "견적완료", "40000", ""]
+    new_r = ["11/3", "나사", "", "", "Ø60 / 2개", "", "", ""] + [""] * 10 + ["SUS", "", "", "견적완료", "50000", ""]
+    rows, per_tab, _ = collect_rows([("10월", 2026, [h1, old_h, old_r]), ("11월", 2026, [h1, new_h, new_r])], 2026, Master())
+    assert [r["tab"] for r in rows] == ["10월", "11월"]
+    assert rows[0]["raw_pre_size"] == "-0.3" and rows[0]["raw_pre_note"] == "흑피" and rows[0]["dia"] == 50.0
+    assert rows[1]["raw_pre_note"] == "SUS" and rows[1]["qty"] == 2 and rows[1]["date"] == "2026-11-03"
+    assert not any(k.startswith("raw_post") for r in rows for k in r)

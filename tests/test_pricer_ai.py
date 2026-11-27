@@ -223,7 +223,7 @@ def test_norm_price_cell(cell, norm):
 
 # ---------------------------------------------------------------- 운영 process_job: 사람 확인·수정 흐름
 COLS = {"date": 1, "client": 2, "main_msg": 4, "spec_qty": 5, "difficulty": 6, "stock_removal": 8, "pre_note": 19,
-        "post_size": 20, "post_note": 21, "author": 15, "status": 24, "unit_price": 25, "basis": 26, "row_id": 28}
+        "author": 15, "status": 22, "unit_price": 23, "basis": 24, "row_id": 26}
 
 
 class FakeWriter:
@@ -244,8 +244,8 @@ class FakeWriter:
 
 
 def sheet_row(e="Ø80 / 1개", d="", status="확정", price="", basis="", h=""):
-    row = [""] * 28
-    row[1], row[3], row[4], row[7], row[23], row[24], row[25] = "가사", d, e, h, status, price, basis
+    row = [""] * 26
+    row[1], row[3], row[4], row[7], row[21], row[22], row[23] = "가사", d, e, h, status, price, basis
     return row
 
 
@@ -346,11 +346,12 @@ def test_max_conf_caps_ai_result(tmp_path):
 
 def test_prompt_lists_all_raw_fields_and_chidae():
     raw = {"main_msg": "-0.5", "spec_qty": "Ø77+0.0~+0.03 / 1개", "difficulty": "상", "pre_size": "-0.3",
-           "pre_note": "흑피", "post_size": "77.02", "post_note": "OK"}
+           "pre_note": "흑피", "post_size": "77.02", "post_note": "OK"}  # 옛 T·U 키는 무시
     msg = build_user_message(JobInput.from_raw(raw, "가사", REG, CUT), LineIndex.build([]), CUT)
     for lbl in ("D 주요 메시지: -0.5", "E 공차x갯수·조도", "F 난이도: 상", "H 연마량/치대: -0.3",
-                "S 호닝 전 매니저 노트: 흑피", "T 호닝 후 치수: 77.02", "U 호닝 후 매니저 노트: OK"):
+                "S 호닝 전 매니저 노트: 흑피"):
         assert lbl in msg
+    assert "호닝 후" not in msg and "77.02" not in msg  # T·U는 시트에서 삭제 → 프롬프트에 없음
     assert "치대 0.3mm" in msg and "연마량(치대) 표기다. 단가가 아니다" in msg
     empty = build_user_message(job("Ø77 / 1개"), LineIndex.build([]), CUT)
     assert "F 난이도" not in empty and "치대 없음" in empty  # 빈 칸 생략

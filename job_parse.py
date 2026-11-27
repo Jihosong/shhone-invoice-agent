@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-RAW_FIELDS = ("main_msg", "spec_qty", "difficulty", "pre_size", "pre_note", "post_size", "post_note")
+RAW_FIELDS = ("main_msg", "spec_qty", "difficulty", "pre_size", "pre_note")  # 옛 T·U(호닝 후 치수·노트)는 시트에서 삭제
 
 # ---------------------------------------------------------------- 파서
 _N = r"\d+(?:\.\d+)?"

@@ -5,7 +5,7 @@
     같은 거래처 유사 8건(모자라면 같은 거래처 최근 건으로 채움, 사다리 hint는 맨 위)
     · 타 거래처 유사 5건 · 거래처 인상 성향(같은 품목 연도쌍 최근 3쌍).
   참고 사례는 모두 cutoff_date 이전, exclude_ids(백테스트 정답 줄) 제외.
-- 견적할 행은 D·E·F·H·S·T·U 원문 전부(빈 칸 생략) + 파싱값(구경·공차·기장·수량·재질·특이사항·치대).
+- 견적할 행은 D·E·F·H·S 원문 전부(빈 칸 생략) + 파싱값(구경·공차·기장·수량·재질·특이사항·치대).
 - 출력은 부록 B.5 JSON 하나 (structured outputs로 형식 강제). max_tokens 300.
   다품목 한 행(E에 '+'로 품목 여럿)은 quote_multi: 구간 목록(규칙으로 정해진 구간은 단가 표시)을 주고
   미결 구간들을 한 번의 호출로 {"items": [{segment, …B.5}]} 배열로 받는다 (호출 1건으로 셈).
@@ -70,8 +70,7 @@ MULTI_SCHEMA = {
 MULTI_TOKENS_PER_ITEM = 200   # 다품목 호출 max_tokens = 100 + 견적할 구간 수 × 이 값
 
 FIELD_LABELS = {"main_msg": "D 주요 메시지", "spec_qty": "E 공차x갯수·조도", "difficulty": "F 난이도",
-                "pre_size": "H 연마량/치대", "pre_note": "S 호닝 전 매니저 노트",
-                "post_size": "T 호닝 후 치수", "post_note": "U 호닝 후 매니저 노트"}
+                "pre_size": "H 연마량/치대", "pre_note": "S 호닝 전 매니저 노트"}
 CONF_RANK = {"low": 0, "mid": 1, "high": 2}
 AI_PRESET_MAX = "mid"   # AI가 D열 숫자를 근거로 낸 사전단가의 confidence 상한
 

@@ -127,7 +127,7 @@ EXTRA_COLUMNS = {"work_end_state": "TEXT", "shipped_state": "TEXT", "work_end_fl
 # 어느 칸이 바뀌었는지 알려고 행마다 이 칸들의 마지막 값을 rows.watch_vals(JSON)에 둔다.
 WATCH_SPEC = ("main_msg", "spec_qty", "difficulty")   # D·E·F: 사양
 WATCH_STOCK = "stock_removal"                         # H: 연마량/치대
-WATCH_NOTES = {"pre_note": "호닝 전 노트", "post_size": "호닝 후 치수", "post_note": "호닝 후 노트"}  # S·T·U
+WATCH_NOTES = {"pre_note": "호닝 전 노트"}  # S (옛 T·U 호닝 후 칸은 시트에서 삭제)
 WATCH_FIELDS = (*WATCH_SPEC, WATCH_STOCK, *WATCH_NOTES)
 # 사람 단가를 유지한 채 재확인을 요청한 표시 (산출근거 맨 앞, 묶음 표시 뒤). 사람이 '확인'/비우면 pricer가
 # 견적완료(사람확인), 단가를 고치면 견적완료(사람수정) — 가견적 표시 '[가견적-…]'과 같은 대접
@@ -988,7 +988,7 @@ class Watcher:
                         e["author"] = human
                         self.con.execute("UPDATE rows SET author=? WHERE row_id=?", (human, e["row_id"]))
             block_last = max(e["last_change"] for e in entries)
-            # 견적완료 이후 변경 (임가공): 견적완료·명세표발행대기·발행완료 행의 D·E·F·H·S·T·U 변경은 재견적 없이
+            # 견적완료 이후 변경 (임가공): 견적완료·명세표발행대기·발행완료 행의 D·E·F·H·S 변경은 재견적 없이
             # 산출근거 끝에 '[변경 …]'만. 그 행의 변경은 그 행으로 끝 — 묶음 재견적 안 함
             for e in entries:
                 e["pq"] = None
@@ -1415,7 +1415,7 @@ class Watcher:
             bool(rules.get("post_quote_recheck")) and self.human_priced(status, basis))
 
     def post_quote_change(self, e: dict, cols: dict, price: str, rules: dict, stamp: str) -> dict | None:
-        """견적완료 이후 행(post_quote_final)의 D·E·F·H·S·T·U 변경 → 산출근거 끝에 '[변경 11/27 14:05: H -0.3 추가]'.
+        """견적완료 이후 행(post_quote_final)의 D·E·F·H·S 변경 → 산출근거 끝에 '[변경 11/27 14:05: H -0.3 추가]'.
         None = 해당 없음 (변경 없음, 또는 지문 변경이 이 칸들이 아님 — 거래처 칸 등 → 예전 규칙).
         dict: changes(바뀐 칸 설명), recheck(견적확인필요로), reasons(재확인 사유), body(산출근거 본문 → 새 본문).
         post_quote_recheck(기본 꺼짐)가 켜져 있으면 사람 단가 행만 예전 재확인 규칙도:

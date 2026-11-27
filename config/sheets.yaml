@@ -110,15 +110,14 @@ sheets:
       sms_status: 17              # Q
       sms_time: 18                # R
       pre_note: 19                # S 호닝 전 매니저 노트
-      post_size: 20               # T 호닝 후 치수
-      post_note: 21               # U 호닝 후 매니저 노트
-      work_start_time: 22         # V
-      work_duration: 23           # W
-      status: 24                  # X 상태
-      unit_price: 25              # Y 단가 (원 단위 정수)
-      basis: 26                   # Z 산출근거
-      statement_no: 27            # AA 명세표번호
-      row_id: 28                  # AB 행ID (에이전트가 최초 발견 시 기록)
+      # (옛 T 호닝 후 치수·U 호닝 후 매니저 노트는 2026-11 시트에서 삭제)
+      work_start_time: 20         # T
+      work_duration: 21           # U
+      status: 22                  # V 상태
+      unit_price: 23              # W 단가 (원 단위 정수)
+      basis: 24                   # X 산출근거
+      statement_no: 25            # Y 명세표번호
+      row_id: 26                  # Z 행ID (에이전트가 최초 발견 시 기록)
     hash_columns: [client, main_msg, spec_qty, difficulty, stock_removal]
     item_columns: [spec_qty, main_msg]   # 하나라도 있으면 품목 행, 없으면 메모 행
     issue_trigger: work_end

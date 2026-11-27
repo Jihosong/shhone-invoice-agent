@@ -46,11 +46,8 @@ HEADER_FIELDS = {
     "difficulty": ("난이도",),
     "pre_size": ("호닝전치수", "연마량/치대"),
     "pre_note": ("호닝전매니저노트",),
-    "post_size": ("호닝후치수",),
-    "post_note": ("호닝후매니저노트",),
 }
-RAW_LETTERS = {"main_msg": "D", "spec_qty": "E", "difficulty": "F", "pre_size": "H", "pre_note": "S",
-               "post_size": "T", "post_note": "U"}  # 콘솔 표시용 (11월 탭 기준 글자)
+RAW_LETTERS = {"main_msg": "D", "spec_qty": "E", "difficulty": "F", "pre_size": "H", "pre_note": "S"}  # 콘솔 표시용 (11월 탭 기준 글자)
 
 # ---------------------------------------------------------------- 날짜
 def parse_sheet_date(text, year: int, tab_month: int) -> date | None:
