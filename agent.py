@@ -146,7 +146,8 @@ def cmd_blocks(args: argparse.Namespace) -> None:
     import watcher
 
     w = watcher.Watcher(watcher.load_config(), dry_run=True)
-    w._first_done.update(w.cfg["sheets"])  # 목록만 (dry-run) — 재시작 보호 바퀴 없이 평소 판정으로 보여 줌
+    # 목록만 (dry-run) — 재시작 보호 바퀴 없이 평소 판정으로 보여 줌 (견적 탭 포함)
+    w._first_done.update(k + s for k in w.cfg["sheets"] for s in ("", watcher.QUOTE_SUFFIX))
     w.run_once()  # dry-run: 시트 쓰기 없음, DB 롤백
     for key, snap in w.snapshots.items():
         print(f"== {snap['label']} / {snap['ws'].title} ({len({r['block_id'] for r in snap['rows']})}묶음)")

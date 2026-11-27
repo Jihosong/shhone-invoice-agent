@@ -26,8 +26,8 @@ from pathlib import Path
 
 from loguru import logger
 
-from watcher import (QUOTED_STATES, RECHECK_RE, ST_HCHECK, ST_QUOTED_EDIT, ST_QUOTED_OK, ST_UNREG, SheetWriter,
-                     strip_block_tag, with_block_tag)
+from watcher import (QUOTE_SUFFIX, QUOTED_STATES, RECHECK_RE, ST_HCHECK, ST_QUOTED_EDIT, ST_QUOTED_OK, ST_UNREG,
+                     SheetWriter, strip_block_tag, with_block_tag)
 
 ROOT = Path(__file__).parent
 PRICE_SHEET = "삼화호닝"
@@ -288,6 +288,15 @@ class Pricer:
                     self.process_job(key, scfg, snapshots[key])
             except Exception:
                 logger.exception("pricer sheet={} 처리 실패", key)
+        for key, scfg in self.cfg["sheets"].items():
+            # 임가공 '견적' 탭 (watcher.QUOTE_SUFFIX 스냅샷): 견적·사람 확인·즉시 학습만 — 당월 탭과 같은 process_job
+            qsnap = snapshots.get(key + QUOTE_SUFFIX)
+            if scfg.get("kind") != "job" or qsnap is None:
+                continue
+            try:
+                self.process_job(key, scfg, qsnap)
+            except Exception:
+                logger.exception("pricer sheet={} 견적 탭 처리 실패", key)
         if not self.dry_run:
             self.con.commit()
 

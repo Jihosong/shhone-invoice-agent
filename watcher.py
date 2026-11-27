@@ -296,6 +296,13 @@ def fingerprint(values: list[str]) -> str:
 
 
 CURRENT_TAB = "당월"  # 이 이름의 탭이 있으면 위치·달과 무관하게 그것을 감시
+# 임가공 시트의 '견적' 탭 (sheets.yaml 시트 설정 quote_tab으로 이름 변경 가능): 당월 탭과 같은 열 배치로 견적만
+# (사다리·지시문·사람 확인·즉시 학습 동일, 작업완료·발행·명세표 처리 없음). 스냅샷 키는 '<시트>#견적'.
+QUOTE_TAB = "견적"
+QUOTE_SUFFIX = "#견적"
+QUOTE_TAB_SETTLE_MIN = 1      # common.quote_tab_settle_min 기본값 (분)
+QUOTE_FREEZE_DAYS = 30        # 행 날짜(없으면 처음 본 날)가 이만큼 지나면 '[견적만]' 붙이고 더는 안 건드림
+QUOTE_ONLY_TAG = "[견적만]"
 
 
 @dataclass
@@ -901,8 +908,10 @@ class Watcher:
 
     # ------------------------------------------------------------------
     def process_sheet(self, key: str, scfg: dict) -> None:
+        """시트 한 바퀴: (임가공이면) '견적' 탭을 먼저 견적 전용으로, 그다음 감시 월 탭.
+        견적 탭을 먼저 도는 이유: 견적 행을 행ID째 당월 탭에 복사하면 당월 쪽 복사본이 새 행ID를 받고
+        (견적 탭 원본이 DB 기록·견적을 그대로 가짐) 당월 행은 새 행으로 견적 — 즉시 학습된 견적 단가가 동일품으로 나옴."""
         label = scfg.get("label") or SHEET_LABELS.get(key, key)
-        cols = scfg["columns"]
         books = self.__dict__.setdefault("_books", {})
         sh = books.get(key)
         if sh is None:  # open_by_key = 메타데이터 읽기 1회 → 한 번만 열고, 탭 목록은 매 바퀴 worksheets()로 새로
@@ -913,6 +922,18 @@ class Watcher:
             books.pop(key, None)
             raise
         today = getattr(self, "today_fn", date.today)()
+        quote_ids: set[str] = set()
+        if scfg.get("kind") == "job":
+            qname = scfg.get("quote_tab") or QUOTE_TAB
+            qtabs = [ws for ws in tabs if ws.title.strip() == qname]
+            if len(qtabs) > 1:
+                self._log_on_change((key, "quote_tab"), "ERROR", "sheet={} '{}' 탭이 {}개 → 견적 탭 처리 안 함 "
+                                    "(하나만 남기세요)", label, qname, len(qtabs))
+            elif qtabs:
+                self._log_on_change((key, "quote_tab"), "INFO", "sheet={} 견적 탭 '{}' 감시 (견적만)", label, qname)
+                quote_ids = self.process_tab(key, scfg, qtabs[0], label, today, quote=True)
+            else:
+                self._log_on_change((key, "quote_tab"), None)
         pick = pick_active_tab(tabs, self.common["month_tab_pattern"], scfg.get("ignore_tabs") or [], today)
         if pick.error:
             self._log_on_change((key, "tab"), "ERROR", "sheet={} {}", label, pick.error)
@@ -929,12 +950,25 @@ class Watcher:
         else:
             self._log_on_change((key, "tab"), "INFO", "sheet={} 감시 탭 '{}'", label, ws.title)
             self.notify((key, "tab"), None)
+        self.process_tab(key, scfg, ws, label, today, reserved_ids=quote_ids)
 
+    def process_tab(self, key: str, scfg: dict, ws, label: str, today: date, quote: bool = False,
+                    reserved_ids: set[str] = frozenset()) -> set[str]:
+        """탭 하나 처리 → 이 탭의 행ID 집합. quote=True면 '견적' 탭 (견적만):
+        스냅샷 키 '<시트>#견적'(pricer는 견적·즉시 학습, 발행기는 안 봄), 확정 대기 common.quote_tab_settle_min(기본 1분),
+        작업완료·출고완료 칸 무시(기존건·발행 후보 없음), 월초 점검 없음. 행 날짜(없으면 처음 본 날)가
+        QUOTE_FREEZE_DAYS(30일) 지난 행은 산출근거 앞에 '[견적만]'을 붙이고 더는 건드리지 않음.
+        reserved_ids: 다른 탭(견적 탭)이 쓰는 행ID — 이 탭에 같은 ID가 있으면(복사) 새 ID 부여."""
+        cols = scfg["columns"]
+        snap_key = key + QUOTE_SUFFIX if quote else key
+        if quote:
+            label = f"{label}/{ws.title.strip()}"
         values = ws.get_all_values()
         # 재시작 첫 바퀴(보호 모드): 지문이 DB와 같은 행은 상태·쓰기 없음 (RESTART_GUARD 설명)
-        first = key not in self.__dict__.setdefault("_first_done", set())
+        first = snap_key not in self.__dict__.setdefault("_first_done", set())
         gid = None if getattr(ws, "id", None) is None else str(ws.id)  # 탭 정체성 (이름이 같아도 다른 탭 구분)
-        self.month_start_check(key, label, ws.title, values, scfg, today)
+        if not quote:
+            self.month_start_check(key, label, ws.title, values, scfg, today)
         width = max(cols.values())
         master = load_client_master(self.con, self.common.get("skip_clients") or [],
                                     rules=load_client_rules(getattr(self, "alias_path", None)))
@@ -949,7 +983,8 @@ class Watcher:
             except Exception:
                 pricing = self.cfg.get("pricing") or {}
             pq_rules.update({k: v for k, v in pricing.items() if k in CHIDAE_DEFAULTS})
-        settle = timedelta(minutes=float(self.common["quote_settle_min"]))
+        settle = timedelta(minutes=float(self.common.get("quote_tab_settle_min", QUOTE_TAB_SETTLE_MIN) if quote
+                                         else self.common["quote_settle_min"]))
         ai = self.common["author_ai_value"]
         skip_clients = [norm_text(c) for c in self.common.get("skip_clients") or []]
         now = datetime.now()
@@ -968,9 +1003,9 @@ class Watcher:
         seen_ids: set[str] = set()
         snap_rows: list[dict] = []
         guard_rows: list[dict] = []  # 재시작 첫 바퀴: 판정이 끝난 행 (대량 재견적 판정)
-        self.snapshots[key] = {"ws": ws, "values": values, "rows": snap_rows, "label": label}
+        self.snapshots[snap_key] = {"ws": ws, "values": values, "rows": snap_rows, "label": label, "quote": quote}
         if getattr(self, "defer_flush", False):
-            self.snapshots[key]["writer"] = writer  # pricer가 같은 writer에 더함 → flush_writes()
+            self.snapshots[snap_key]["writer"] = writer  # pricer가 같은 writer에 더함 → flush_writes()
 
         def cell(row: list[str], name: str) -> str:
             return row[cols[name] - 1].strip()
@@ -978,9 +1013,10 @@ class Watcher:
         def ensure_row_id(rownum: int, row: list[str]) -> str:
             row_id = cell(row, "row_id")
             # 비었거나, 형식이 아니거나(다른 값이 들어 있음), 행 복사로 중복된 경우 새로 부여
-            if not ROW_ID_RE.match(row_id) or row_id in seen_ids:
+            if not ROW_ID_RE.match(row_id) or row_id in seen_ids or row_id in reserved_ids:
                 if row_id:
-                    why = "중복" if row_id in seen_ids else "형식 아님"
+                    why = ("중복" if row_id in seen_ids else "견적 탭 행ID (복사된 행)" if row_id in reserved_ids
+                           else "형식 아님")
                     logger.warning("sheet={} row={} row_id={!r} {} → 새로 부여", label, rownum, row_id, why)
                 row_id = uuid.uuid4().hex[:8]
                 writer.mark_new_id(row_id)
@@ -1032,7 +1068,7 @@ class Watcher:
                 e["pq"] = None
                 e["final"] = watch_fields and self.post_quote_final(
                     e["status"], cell(e["row"], "basis") if "basis" in cols else "", pq_rules)
-                if e["final"] and not e["unknown_status"] and not e["protect"]:
+                if e["final"] and not e["unknown_status"] and not e["protect"] and not blk.get("frozen"):
                     e["pq"] = self.post_quote_change(e, cols, cell(e["row"], "unit_price") if "unit_price" in cols
                                                      else "", pq_rules, stamp)
                 if e["pq"]:
@@ -1152,6 +1188,21 @@ class Watcher:
                 tag_client += note if note.startswith("(") and note.endswith(")") else f"({note})"
             for pos, e in enumerate(entries, 1):
                 rownum, row_id, row = e["rownum"], e["row_id"], e["row"]
+                if blk.get("frozen"):
+                    # 견적 탭 30일 지난 행: 산출근거 앞에 '[견적만]' 한 번 붙이고 상태·단가·DB 상태는 그대로 (pricer도 건너뜀)
+                    basis = cell(row, "basis") if "basis" in cols else ""
+                    if "basis" in cols and not basis.startswith(QUOTE_ONLY_TAG):
+                        writer.add(rownum, "basis", f"{QUOTE_ONLY_TAG} {basis}".rstrip(), row, row_id=row_id,
+                                   expect_fp=e["fp"])
+                    counts["견적만"] += 1
+                    snap_rows.append({"rownum": rownum, "row_id": row_id, "row": row, "fp": e["fp"],
+                                      "status": e["status"], "author": e["author"], "legacy": e["legacy"],
+                                      "work_end_flipped_at": None, "block_id": blk["id"],
+                                      "client_resolved": blk["client"], "client_reg_no": blk["reg_no"],
+                                      "client_note": e["client_note"], "block_date": blk["date"],
+                                      "block_label": tag_client, "needs_quote": False, "unreg_quote": False,
+                                      "block_tag": "", "protected": True, "frozen": True})
+                    continue
                 if first:
                     guard_rows.append(e)
                 if e["protect"]:
@@ -1267,6 +1318,7 @@ class Watcher:
 
             if block["id"] is None:
                 block["id"] = ensure_row_id(block["rownum"], block["row"])
+                block["frozen"] = quote and self.quote_frozen(block["date"], block["id"], today)
             row_id = block["id"] if block["rownum"] == rownum else ensure_row_id(rownum, row)
             client = block["client"]
             client_log = client or client_text
@@ -1295,9 +1347,10 @@ class Watcher:
             if not unknown_status:
                 self._log_on_change(("unknown_status", key, row_id), None)
 
-            work_end = bool_state(cell(row, "work_end")) if "work_end" in cols else "FALSE"
+            # 견적 탭: 작업완료·출고완료 칸은 보지 않음 (기존건·발행 후보 판정 없음)
+            work_end = bool_state(cell(row, "work_end")) if "work_end" in cols and not quote else "FALSE"
             just_flipped = False
-            shipped = bool_state(cell(row, "shipped")) if "shipped" in cols else "FALSE"
+            shipped = bool_state(cell(row, "shipped")) if "shipped" in cols and not quote else "FALSE"
 
             # --- DB 갱신 ---
             rec = self.con.execute(
@@ -1377,7 +1430,7 @@ class Watcher:
             self.restart_check(key, label, guard_rows)
         self.mark_deleted(key, label, ws.title, values, cols, scfg["data_start_row"], seen_ids, gid)
 
-        self._first_done.add(key)
+        self._first_done.add(snap_key)
         deferred = getattr(self, "defer_flush", False)
         written = 0 if deferred else writer.flush(ws, self.dry_run)
 
@@ -1392,6 +1445,21 @@ class Watcher:
             else f" 쓰기 대기={len(writer)} (pricer와 함께 씀)" if deferred
             else f" 쓰기={written}" + (f" (보류 {len(writer) - written})" if written != len(writer) else ""),
         )
+        return seen_ids
+
+    def quote_frozen(self, date_text: str, row_id: str, today: date) -> bool:
+        """견적 탭 묶음이 QUOTE_FREEZE_DAYS를 넘었는지: 행 날짜 칸(issuer.block_date — 연도는 오늘 기준),
+        날짜를 못 읽으면 DB에서 처음 본 날(first_seen). 둘 다 없으면(새 행) 아님."""
+        from issuer.excel_upload import LineError, block_date
+
+        try:
+            day = block_date(date_text, "", today)
+        except LineError:
+            got = self.con.execute("SELECT first_seen FROM rows WHERE row_id=?", (row_id,)).fetchone()
+            if not got or not got[0]:
+                return False
+            day = datetime.fromisoformat(got[0]).date()
+        return (today - day).days > QUOTE_FREEZE_DAYS
 
     def restart_check(self, key, label, entries: list[dict]) -> None:
         """재시작 첫 바퀴 판정. 지문이 그대로인데 시트 상태 칸이 DB와 다른 행은 WARNING (이번 바퀴는 그대로 둠).

@@ -6,6 +6,10 @@ common:
   credentials_file: C:/dev/secrets/gcp-service-account.json
   poll_interval_sec: 15           # Sheets API 할당량 계산은 README '폴링 주기와 API 할당량'
   quote_settle_min: 5            # 마지막 수정 후 N분 무변화 → 가견적
+  # 임가공 시트의 '견적' 탭 (시트 설정 quote_tab으로 이름 변경 가능): 당월 탭과 같은 열 배치로 견적만
+  #   (사다리·지시문·사람 확인/수정 → 견적완료(사람확인/수정) + 즉시 학습(날짜 = 그 행 날짜)). 작업완료·발행·명세표 처리 없음.
+  #   행 날짜가 30일 지나면 산출근거 앞에 '[견적만]'을 붙이고 더는 건드리지 않음. 삭제되면 DB '삭제됨'만.
+  quote_tab_settle_min: 1        # 견적 탭 확정 대기 (분)
   # 재시작 첫 바퀴 보호 (watcher): 켠 뒤 시트마다 첫 바퀴는 지문(hash_columns)이 DB와 같은 행의 상태·단가·산출근거를
   #   바꾸지 않음 (시트 상태 칸이 DB와 다르면 WARNING만, 다음 바퀴부터 평소대로). 그 첫 바퀴에 견적 가진 행 중
   #   다시 견적 단계(입력중/확정)로 갈 행이 이 비율을 넘고 3행 이상이면 ERROR '재시작 후 대량 재견적 감지' + 중단
